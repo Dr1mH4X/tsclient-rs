@@ -399,7 +399,6 @@ impl PacketHandler {
         let mut core = self.core.lock().unwrap();
 
         let p_id = core.packet_counter[PacketType::Voice as usize];
-        let _p_gen = core.generation_counter[PacketType::Voice as usize];
         core.packet_counter[PacketType::Voice as usize] = (p_id + 1) & 0xffff;
         if core.packet_counter[PacketType::Voice as usize] == 0 {
             core.generation_counter[PacketType::Voice as usize] =
@@ -860,9 +859,14 @@ fn try_decompress(packet: &mut Packet) {
         return;
     }
     let mut qlz = Qlz::new();
-    if let Ok(data) = qlz.decompress(&packet.data) {
-        packet.data = data;
-        packet.type_flagged &= !PacketFlags::Compressed;
+    match qlz.decompress(&packet.data) {
+        Ok(data) => {
+            packet.data = data;
+            packet.type_flagged &= !PacketFlags::Compressed;
+        }
+        Err(err) => {
+            eprintln!("decompression failed: id={}, err={:?}", packet.id, err);
+        }
     }
 }
 

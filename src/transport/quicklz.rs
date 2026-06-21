@@ -24,7 +24,11 @@ impl Qlz {
         let mut dest = vec![0u8; decompressed_size];
 
         if flags & 0x01 == 0 {
-            dest.copy_from_slice(&data[header_len..header_len + decompressed_size]);
+            // 与 JS `dest.set(data.slice(headerLen, headerLen + decompressedSize))` 对应：
+            // slice 超出 data 长度时截断，set 只复制可用部分，剩余保持 0
+            let src = &data[header_len..];
+            let n = src.len().min(decompressed_size);
+            dest[..n].copy_from_slice(&src[..n]);
             return Ok(dest);
         }
 

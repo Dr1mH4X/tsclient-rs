@@ -236,7 +236,7 @@ impl ClientInner {
                 crate::handshake::handle_init_server(self, sender, &cmd.params);
             }
             "error" => {
-                self.handle_error(&cmd.params);
+                self.handle_error(sender, &cmd.params);
             }
             _ => {
                 let params = if cmd.name.contains('=') {
@@ -255,7 +255,7 @@ impl ClientInner {
         }
     }
 
-    fn handle_error(&mut self, params: &HashMap<String, String>) {
+    fn handle_error(&mut self, sender: &PacketSender, params: &HashMap<String, String>) {
         let (err, rc) = commands::parse_server_error(params);
         if rc.is_some() {
             self.cmd_track.resolve(rc.unwrap(), err);
@@ -265,7 +265,10 @@ impl ClientInner {
 
         let id = params.get("id").map(|s| s.as_str()).unwrap_or("0");
         if id == "3329" {
-            let _ = self.cmd_track.reset();
+            // 与 JS `setImmediate(() => this.disconnect().catch(() => {}))` 对应：
+            // 优雅发送 clientdisconnect 命令（best-effort），然后关闭连接
+            let cmd_sender = sender.create_command_sender();
+            cmd_sender(b"clientdisconnect reasonmsg=Shutdown".to_vec());
             let _ = self.close_tx.send(Some(Error::Teamspeak("invalid identity".into())));
         }
     }

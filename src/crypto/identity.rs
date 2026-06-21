@@ -32,10 +32,6 @@ struct IdentityCache {
 }
 
 impl Identity {
-    pub fn dummy() -> Self {
-        Self::new([0u8; P256_SCALAR_SIZE], 0)
-    }
-
     fn new(private_key: [u8; P256_SCALAR_SIZE], offset: i64) -> Self {
         Self {
             private_key,

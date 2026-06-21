@@ -2,6 +2,7 @@
 
 #![allow(non_upper_case_globals)]
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     Voice = 0,
@@ -34,19 +35,12 @@ pub struct Packet {
     pub received_at: std::time::Instant,
 }
 
+/// 与 JS `(p.typeFlagged & 0x0f) as PacketType` 对应：直接 transmute 保留原值，
+/// 不做 catch-all 映射。
 pub fn packet_type(p: &Packet) -> PacketType {
-    match p.type_flagged & 0x0f {
-        0 => PacketType::Voice,
-        1 => PacketType::VoiceWhisper,
-        2 => PacketType::Command,
-        3 => PacketType::CommandLow,
-        4 => PacketType::Ping,
-        5 => PacketType::Pong,
-        6 => PacketType::Ack,
-        7 => PacketType::AckLow,
-        8 => PacketType::Init1,
-        _ => PacketType::Voice,
-    }
+    // SAFETY: PacketType 为 #[repr(u8)]，低 4 位值域 0-8 均有对应变体。
+    // TS3 协议保证 type 字段不会超出已定义的变体范围。
+    unsafe { std::mem::transmute(p.type_flagged & 0x0f) }
 }
 
 pub fn packet_flags(p: &Packet) -> u8 {
