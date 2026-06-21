@@ -160,15 +160,21 @@ impl Resolver {
         }
     }
 
-    async fn query_tsdns(tsdns_addr: &str, query_host: &str) -> Option<String> {
+    async fn query_tsdns(tsdns_addr: &str, query_host: &str, signal: Option<&AbortSignal>) -> Option<String> {
         let (host, port) = split_host_port(tsdns_addr);
         let addr = join_host_port(host, port);
-        let mut stream = tokio::time::timeout(
+        let connect = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .ok()?
+        );
+
+        let mut stream = match signal {
+            Some(sig) => tokio::select! {
+                r = connect => r.ok()?,
+                _ = sig.wait_for_abort() => return None,
+            },
+            None => connect.await.ok()?,
+        }
         .ok()?;
 
         use tokio::io::AsyncWriteExt;
@@ -181,12 +187,18 @@ impl Resolver {
         use tokio::io::AsyncReadExt;
         let mut read_buf = [0u8; 1024];
         loop {
-            let n = tokio::time::timeout(
+            let read = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 stream.read(&mut read_buf),
-            )
-            .await
-            .ok()?
+            );
+
+            let n = match signal {
+                Some(sig) => tokio::select! {
+                    r = read => r.ok()?,
+                    _ = sig.wait_for_abort() => return None,
+                },
+                None => read.await.ok()?,
+            }
             .ok()?;
             if n == 0 {
                 break;
@@ -204,7 +216,7 @@ impl Resolver {
         None
     }
 
-    async fn resolve_tsdns_srv(&self, domains: &[String], query_host: &str) -> Option<String> {
+    async fn resolve_tsdns_srv(&self, domains: &[String], query_host: &str, signal: Option<&AbortSignal>) -> Option<String> {
         for domain in domains {
             let lookup_name = format!("_tsdns._tcp.{domain}");
             let response = self.dns.srv_lookup(lookup_name).await.ok();
@@ -215,7 +227,7 @@ impl Resolver {
             for srv in srvs.iter() {
                 let target = srv.target().to_string().trim_end_matches('.').to_string();
                 let tsdns_addr = join_host_port(&target, srv.port());
-                if let Some(result) = Self::query_tsdns(&tsdns_addr, query_host).await {
+                if let Some(result) = Self::query_tsdns(&tsdns_addr, query_host, signal).await {
                     return Some(result);
                 }
             }
@@ -223,10 +235,10 @@ impl Resolver {
         None
     }
 
-    async fn resolve_tsdns_direct(domains: &[String], query_host: &str) -> Option<String> {
+    async fn resolve_tsdns_direct(domains: &[String], query_host: &str, signal: Option<&AbortSignal>) -> Option<String> {
         for domain in domains {
             let tsdns_addr = join_host_port(domain, TS_DNS_DEFAULT_PORT);
-            if let Some(result) = Self::query_tsdns(&tsdns_addr, query_host).await {
+            if let Some(result) = Self::query_tsdns(&tsdns_addr, query_host, signal).await {
                 return Some(result);
             }
         }
@@ -271,7 +283,7 @@ impl AddrResolver for Resolver {
 
         let domain_list = get_domain_list(host);
 
-        if let Some(tsdns) = self.resolve_tsdns_srv(&domain_list, host).await {
+        if let Some(tsdns) = self.resolve_tsdns_srv(&domain_list, host, signal).await {
             return Ok(self.set_cache(
                 addr.to_string(),
                 vec![ResolvedAddr {
@@ -282,7 +294,7 @@ impl AddrResolver for Resolver {
             ));
         }
 
-        if let Some(tsdns) = Self::resolve_tsdns_direct(&domain_list, host).await {
+        if let Some(tsdns) = Self::resolve_tsdns_direct(&domain_list, host, signal).await {
             return Ok(self.set_cache(
                 addr.to_string(),
                 vec![ResolvedAddr {

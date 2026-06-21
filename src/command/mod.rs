@@ -44,7 +44,7 @@ pub fn unescape(s: &str) -> String {
                 Some('t') => result.push('\t'),
                 Some('v') => result.push('\x0B'),
                 Some(next) => { result.push('\\'); result.push(next); }
-                None => {}
+                None => { result.push('\\'); }
             }
         } else {
             result.push(c);

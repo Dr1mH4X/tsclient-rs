@@ -25,6 +25,7 @@ pub struct KeyNonce {
     pub r#gen: u32,
 }
 
+#[derive(Clone)]
 pub struct Crypt {
     pub identity: Identity,
     pub iv_struct: Vec<u8>,

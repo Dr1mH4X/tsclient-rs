@@ -43,7 +43,6 @@ struct HandlerCore {
     crypt: Crypt,
     client_id: u16,
     closed: bool,
-    crypto_init_complete: bool,
     last_message_received: Instant,
     packet_counter: [u16; 9],
     generation_counter: [u32; 9],
@@ -148,9 +147,14 @@ pub struct PacketSender {
 }
 
 impl PacketSender {
+    pub fn set_crypt(&self, crypt: Crypt) {
+        let mut core = self.core.lock().unwrap();
+        core.crypt = crypt;
+    }
+
     pub fn send_packet(&self, p_type: PacketType, data: Vec<u8>, flags: u8) {
         let mut core = self.core.lock().unwrap();
-        let dummy = !core.crypto_init_complete;
+        let dummy = !core.crypt.crypto_init_complete;
 
         let max_chunk = MAX_OUT_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
         if data.len() > max_chunk
@@ -223,7 +227,6 @@ impl PacketSender {
 
     pub fn set_crypto_init_complete(&self) {
         let mut core = self.core.lock().unwrap();
-        core.crypto_init_complete = true;
         core.crypt.crypto_init_complete = true;
     }
 
@@ -237,7 +240,7 @@ impl PacketSender {
         let send_tx = Arc::clone(&self.send_tx);
         Arc::new(move |data: Vec<u8>| {
             let mut core = core.lock().unwrap();
-            let dummy = !core.crypto_init_complete;
+            let dummy = !core.crypt.crypto_init_complete;
             let bytes = core.build_and_track_packet(PacketType::Command, data, 0, dummy);
             drop(core);
             if let Some(tx) = send_tx.lock().unwrap().as_ref() {
@@ -277,7 +280,6 @@ impl PacketHandler {
                 crypt,
                 client_id: 0,
                 closed: false,
-                crypto_init_complete: false,
                 last_message_received: Instant::now(),
                 packet_counter,
                 generation_counter: [0u32; 9],
@@ -306,7 +308,6 @@ impl PacketHandler {
 
     pub fn set_crypto_init_complete(&self) {
         let mut core = self.core.lock().unwrap();
-        core.crypto_init_complete = true;
         core.crypt.crypto_init_complete = true;
     }
 
@@ -357,7 +358,7 @@ impl PacketHandler {
 
     pub fn send_packet(&self, p_type: PacketType, data: Vec<u8>, flags: u8) {
         let mut core = self.core.lock().unwrap();
-        let dummy = !core.crypto_init_complete;
+        let dummy = !core.crypt.crypto_init_complete;
 
         let max_chunk = MAX_OUT_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
         if data.len() > max_chunk
@@ -429,7 +430,7 @@ impl PacketHandler {
         let send_tx = Arc::clone(&self.send_tx);
         Arc::new(move |data: Vec<u8>| {
             let mut core = core.lock().unwrap();
-            let dummy = !core.crypto_init_complete;
+            let dummy = !core.crypt.crypto_init_complete;
             let bytes = core.build_and_track_packet(PacketType::Command, data, 0, dummy);
             drop(core);
             if let Some(tx) = send_tx.lock().unwrap().as_ref() {
@@ -505,7 +506,11 @@ async fn bg_task(
             result = socket.recv(&mut recv_buf) => {
                 let n = match result {
                     Ok(n) => n,
-                    Err(_) => break,
+                    Err(e) => {
+                        let mut c = core.lock().unwrap();
+                        trigger_close(&mut *c, &on_close, Some(Error::from(format!("socket recv error: {e}"))));
+                        break;
+                    }
                 };
 
                 let (pending, was_closed) = {
@@ -534,7 +539,7 @@ async fn bg_task(
             _ = ping_interval.tick() => {
                 let should_ping = {
                     let c = core.lock().unwrap();
-                    c.crypto_init_complete && !c.closed
+                    c.crypt.crypto_init_complete && !c.closed
                 };
                 if should_ping {
                     let bytes = {
@@ -636,7 +641,7 @@ fn decrypt_packet_data(
     tag: &[u8],
 ) -> Option<(Vec<u8>, bool)> {
     let unencrypted = is_unencrypted(p);
-    let dummy = !c.crypto_init_complete;
+    let dummy = !c.crypt.crypto_init_complete;
     let dummy_used = dummy;
     let p_type_val = packet_type(p) as u8;
     let generation = p.generation_id;
@@ -894,7 +899,7 @@ fn check_resends_sync(
     }
 
     if let Some(ref mut rp) = c.init_packet_check {
-        do_resend_sync(&mut c.crypt, c.crypto_init_complete, rp, now, &mut c.pending_sends);
+        do_resend_sync(&mut c.crypt, rp, now, &mut c.pending_sends);
     }
 
     let timed_out_keys: Vec<i64> = c
@@ -911,13 +916,12 @@ fn check_resends_sync(
     }
 
     for (_, rp) in c.ack_manager.iter_mut() {
-        do_resend_sync(&mut c.crypt, c.crypto_init_complete, rp, now, &mut c.pending_sends);
+        do_resend_sync(&mut c.crypt, rp, now, &mut c.pending_sends);
     }
 }
 
 fn do_resend_sync(
     crypt: &mut Crypt,
-    crypto_init_complete: bool,
     rp: &mut ResendPacket,
     now: Instant,
     pending_sends: &mut Vec<Vec<u8>>,
@@ -930,7 +934,7 @@ fn do_resend_sync(
     rp.retry_count += 1;
     rp.next_interval = (rp.next_interval * 2).min(MAX_RETRY_INTERVAL_MS);
 
-    let dummy = !crypto_init_complete;
+    let dummy = !crypt.crypto_init_complete;
     let unencrypted = (packet_flags(&rp.packet) & PacketFlags::Unencrypted) != 0;
     let header = build_c2s_header(&rp.packet);
     let p_type = packet_type(&rp.packet);

@@ -3,6 +3,7 @@
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
 
+use crate::types::AbortSignal;
 use crate::Error;
 
 const P256_SCALAR_SIZE: usize = 32;
@@ -77,14 +78,22 @@ impl Identity {
         count_leading_zeros(&hash)
     }
 
-    pub fn upgrade_to_level(&mut self, target_level: i32) -> Result<(), Error> {
+    pub async fn upgrade_to_level(&mut self, target_level: i32, signal: Option<&AbortSignal>) -> Result<(), Error> {
         let prefix = self.public_key_base64().to_string();
         loop {
+            if let Some(sig) = signal {
+                if sig.is_aborted() {
+                    return Err(Error::Teamspeak("aborted".into()));
+                }
+            }
             let hash = sha1_hash(format!("{prefix}{}", self.offset));
             if count_leading_zeros(&hash) >= target_level {
                 return Ok(());
             }
             self.offset += 1;
+            if self.offset % 10000 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
     }
 }

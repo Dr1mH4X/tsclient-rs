@@ -141,7 +141,7 @@ pub trait CommandMiddleware: Send + Sync {
     fn wrap(&self, next: CommandHandler) -> CommandHandler;
 }
 
-pub type EventHandler = Box<dyn Fn(Event) + Send>;
+pub type EventHandler = Arc<dyn Fn(Event) + Send + Sync>;
 
 pub trait EventMiddleware: Send + Sync {
     fn wrap(&self, next: EventHandler) -> EventHandler;

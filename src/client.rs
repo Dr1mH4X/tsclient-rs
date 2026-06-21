@@ -18,6 +18,7 @@ use crate::notifications::{handle_notification, NotificationResult};
 use crate::throttle::CommandThrottle;
 use crate::transfer::{self, FileTransferTracker, FtNotification};
 use crate::transport::{Packet, PacketHandler, PacketSender, PacketType};
+pub use crate::types::AbortSignal;
 use crate::types::*;
 pub use crate::types::ClientStatus;
 use crate::Error;
@@ -50,7 +51,7 @@ struct EventHandlers {
     client_moved: Vec<EventHandler>,
     poked: Vec<EventHandler>,
     voice_data: Vec<EventHandler>,
-    connected: Vec<Box<dyn Fn() + Send>>,
+    connected: Vec<Arc<dyn Fn() + Send + Sync>>,
     disconnected: Vec<EventHandler>,
     kicked: Vec<EventHandler>,
 }
@@ -137,6 +138,7 @@ impl ClientInner {
         if p_type == 8 /* Init1 */ {
             match crate::handshake::process_init1(&mut self.crypt, Some(&p.data)) {
                 Ok(Some(response)) => {
+                    sender.set_crypt(self.crypt.clone());
                     sender.send_packet(PacketType::Init1, response, 0);
                 }
                 _ => {}
@@ -180,7 +182,11 @@ impl ClientInner {
         };
 
         for h in &self.event_handlers.voice_data {
-            h(Event::VoiceData(voice_data.clone()));
+            let h = Arc::clone(h);
+            let vd = voice_data.clone();
+            tokio::spawn(async move {
+                h(Event::VoiceData(vd));
+            });
         }
     }
 
@@ -220,9 +226,11 @@ impl ClientInner {
         match cmd.name.as_str() {
             "clientinitiv" => {
                 crate::handshake::handle_handshake_init_iv(self, sender, &cmd.params);
+                sender.set_crypt(self.crypt.clone());
             }
             "initivexpand2" => {
                 crate::handshake::handle_handshake_expand2(self, sender, &cmd.params);
+                sender.set_crypt(self.crypt.clone());
             }
             "initserver" => {
                 crate::handshake::handle_init_server(self, sender, &cmd.params);
@@ -281,7 +289,9 @@ impl ClientInner {
                 self.dispatch_event(Event::ClientLeave(event.clone()));
                 if is_self && (event.reason_id == 4 || event.reason_id == 5) {
                     for h in &self.event_handlers.kicked {
-                        h(Event::Kicked(event.reason_msg.clone()));
+                        let h = Arc::clone(h);
+                        let msg = event.reason_msg.clone();
+                        tokio::spawn(async move { h(Event::Kicked(msg)); });
                     }
                 }
             }
@@ -311,7 +321,7 @@ impl ClientInner {
         let dispatched = Arc::new(Mutex::new(None::<Event>));
         let base: EventHandler = {
             let d = Arc::clone(&dispatched);
-            Box::new(move |ev: Event| {
+            Arc::new(move |ev: Event| {
                 *d.lock().unwrap() = Some(ev);
             })
         };
@@ -321,47 +331,64 @@ impl ClientInner {
             match evt {
                 Event::TextMessage(msg) => {
                     for h in &self.event_handlers.text_message {
-                        h(Event::TextMessage(msg.clone()));
+                        let h = Arc::clone(h);
+                        let m = msg.clone();
+                        tokio::spawn(async move { h(Event::TextMessage(m)); });
                     }
                 }
                 Event::ClientEnter(info) => {
                     for h in &self.event_handlers.client_enter {
-                        h(Event::ClientEnter(info.clone()));
+                        let h = Arc::clone(h);
+                        let i = info.clone();
+                        tokio::spawn(async move { h(Event::ClientEnter(i)); });
                     }
                 }
                 Event::ClientLeave(evt) => {
                     for h in &self.event_handlers.client_leave {
-                        h(Event::ClientLeave(evt.clone()));
+                        let h = Arc::clone(h);
+                        let e = evt.clone();
+                        tokio::spawn(async move { h(Event::ClientLeave(e)); });
                     }
                 }
                 Event::ClientMoved(evt) => {
                     for h in &self.event_handlers.client_moved {
-                        h(Event::ClientMoved(evt.clone()));
+                        let h = Arc::clone(h);
+                        let e = evt.clone();
+                        tokio::spawn(async move { h(Event::ClientMoved(e)); });
                     }
                 }
                 Event::Poked(evt) => {
                     for h in &self.event_handlers.poked {
-                        h(Event::Poked(evt.clone()));
+                        let h = Arc::clone(h);
+                        let e = evt.clone();
+                        tokio::spawn(async move { h(Event::Poked(e)); });
                     }
                 }
                 Event::VoiceData(data) => {
                     for h in &self.event_handlers.voice_data {
-                        h(Event::VoiceData(data.clone()));
+                        let h = Arc::clone(h);
+                        let d = data.clone();
+                        tokio::spawn(async move { h(Event::VoiceData(d)); });
                     }
                 }
                 Event::Connected => {
                     for h in &self.event_handlers.connected {
-                        h();
+                        let h = Arc::clone(h);
+                        tokio::spawn(async move { h(); });
                     }
                 }
                 Event::Disconnected(err) => {
                     for h in &self.event_handlers.disconnected {
-                        h(Event::Disconnected(err.clone()));
+                        let h = Arc::clone(h);
+                        let e = err.clone();
+                        tokio::spawn(async move { h(Event::Disconnected(e)); });
                     }
                 }
                 Event::Kicked(msg) => {
                     for h in &self.event_handlers.kicked {
-                        h(Event::Kicked(msg.clone()));
+                        let h = Arc::clone(h);
+                        let m = msg.clone();
+                        tokio::spawn(async move { h(Event::Kicked(m)); });
                     }
                 }
             }
@@ -375,7 +402,8 @@ impl ClientInner {
         self.status = ClientStatus::Disconnected;
         let handlers = std::mem::take(&mut self.event_handlers.disconnected);
         for h in handlers {
-            h(Event::Disconnected(err.clone()));
+            let e = err.clone();
+            tokio::spawn(async move { h(Event::Disconnected(e)); });
         }
     }
 
@@ -386,7 +414,7 @@ impl ClientInner {
         }
         let handlers = std::mem::take(&mut self.event_handlers.connected);
         for h in handlers {
-            h();
+            tokio::spawn(async move { h(); });
         }
     }
 }
@@ -394,7 +422,7 @@ impl ClientInner {
 // ---- Client --------------------------------------------------------------------
 
 pub struct Client {
-    pub handler: PacketHandler,
+    pub handler: Mutex<PacketHandler>,
     pub logger: Arc<dyn Logger>,
     pub nickname: String,
     resolver: Box<dyn AddrResolver>,
@@ -418,7 +446,7 @@ impl Client {
         let event_middlewares = options.event_middleware;
 
         let crypt = Crypt::new(identity.clone());
-        let handler = PacketHandler::new(Crypt::new(identity.clone()), Arc::clone(&logger));
+        let handler = PacketHandler::new(crypt.clone(), Arc::clone(&logger));
         let packet_sender = handler.create_packet_sender();
 
         let final_cmd_handler = Self::build_cmd_handler_simple(&cmd_middlewares, &packet_sender);
@@ -437,7 +465,7 @@ impl Client {
         )));
 
         Self {
-            handler,
+            handler: Mutex::new(handler),
             logger,
             nickname,
             resolver,
@@ -484,7 +512,7 @@ impl Client {
 
     // ---- Connection -----------------------------------------------------------
 
-    pub async fn connect(&self) -> Result<(), Error> {
+    pub async fn connect(&mut self) -> Result<(), Error> {
         {
             let inner = self.inner.lock().unwrap();
             if inner.status != ClientStatus::Disconnected {
@@ -504,11 +532,17 @@ impl Client {
             resolve_addr_impl(&inner.addr, &*self.resolver).await
         };
         self.logger.info(&format!("connecting to server: {target_addr}"), &[]);
-        self.handler.connect(&target_addr).await?;
+        {
+            let handler = self.handler.lock().unwrap();
+            handler.connect(&target_addr).await?;
+        }
 
         // Spawn background packet processing task
         let inner = Arc::clone(&self.inner);
-        let sender = self.handler.create_packet_sender();
+        let sender = {
+            let handler = self.handler.lock().unwrap();
+            handler.create_packet_sender()
+        };
         let handle = tokio::spawn(async move {
             let (mut packet_rx, mut close_rx) = {
                 let mut i = inner.lock().unwrap();
@@ -556,21 +590,21 @@ impl Client {
             let _ = self.exec_command("clientdisconnect reasonmsg=Shutdown", 1000).await;
         }
 
-        self.handler.close();
+        self.handler.lock().unwrap().close();
 
         let handlers = {
             let mut inner = self.inner.lock().unwrap();
             std::mem::take(&mut inner.event_handlers.disconnected)
         };
         for h in handlers {
-            h(Event::Disconnected(None));
+            tokio::spawn(async move { h(Event::Disconnected(None)); });
         }
 
         Ok(())
     }
 
-    pub async fn wait_connected(&self) -> Result<(), Error> {
-        let rx = {
+    pub async fn wait_connected(&self, signal: Option<&AbortSignal>) -> Result<(), Error> {
+        let mut rx = {
             let mut inner = self.inner.lock().unwrap();
             if inner.status == ClientStatus::Connected {
                 return Ok(());
@@ -579,8 +613,21 @@ impl Client {
             inner.connected_wakers.push(tx);
             rx
         };
-        rx.await.map_err(|_| Error::Teamspeak("connection cancelled".into()))?;
-        Ok(())
+        match signal {
+            Some(sig) => {
+                let canceled = Error::Teamspeak("connection cancelled".into());
+                let aborted = Error::Teamspeak("aborted".into());
+                tokio::select! {
+                    r = &mut rx => r.map_err(|_| canceled)?,
+                    _ = sig.wait_for_abort() => return Err(aborted),
+                }
+                Ok(())
+            }
+            None => {
+                rx.await.map_err(|_| Error::Teamspeak("connection cancelled".into()))?;
+                Ok(())
+            }
+        }
     }
 
     // ---- Commands -------------------------------------------------------------
@@ -665,7 +712,7 @@ impl Client {
         self
     }
 
-    pub fn on_connected(&self, handler: Box<dyn Fn() + Send>) -> &Self {
+    pub fn on_connected(&self, handler: Arc<dyn Fn() + Send + Sync>) -> &Self {
         self.inner.lock().unwrap().event_handlers.connected.push(handler);
         self
     }
@@ -681,7 +728,7 @@ impl Client {
     }
 
     pub fn use_command_middleware(&self, mw: Vec<Box<dyn CommandMiddleware>>) -> &Self {
-        let sender = self.handler.create_packet_sender();
+        let sender = self.handler.lock().unwrap().create_packet_sender();
         let new_handler = {
             let mut inner = self.inner.lock().unwrap();
             inner.cmd_middlewares.extend(mw);
@@ -699,7 +746,7 @@ impl Client {
     // ---- API shorthand --------------------------------------------------------
 
     pub fn send_voice(&self, data: Vec<u8>, codec: i32) {
-        self.handler.send_voice_packet(data, codec);
+        self.handler.lock().unwrap().send_voice_packet(data, codec);
     }
 
     // ---- File Transfer --------------------------------------------------------
@@ -811,33 +858,36 @@ impl Client {
         let handlers = std::mem::take(&mut inner.event_handlers.connected);
         drop(inner);
         for h in handlers {
-            h();
+            tokio::spawn(async move { h(); });
         }
     }
 
     // ---- Private --------------------------------------------------------------
 
-    fn reset_for_connect(&self) {
-        self.handler.close();
+    fn reset_for_connect(&mut self) {
+        self.handler.lock().unwrap().close();
 
         let new_crypt = {
             let inner = self.inner.lock().unwrap();
             Crypt::new(inner.identity.clone())
         };
 
+        // Replace the PacketHandler entirely, matching JS resetForConnect
+        *self.handler.lock().unwrap() = PacketHandler::new(new_crypt.clone(), Arc::clone(&self.logger));
+
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = mpsc::unbounded_channel();
 
-        self.handler.set_on_packet(Box::new(move |p: Packet| {
+        self.handler.lock().unwrap().set_on_packet(Box::new(move |p: Packet| {
             let _ = packet_tx.send(p);
         }));
         let close_tx_for_inner = close_tx.clone();
-        self.handler.set_on_close(Box::new(move |err: Option<Error>| {
+        self.handler.lock().unwrap().set_on_close(Box::new(move |err: Option<Error>| {
             let _ = close_tx.send(err);
         }));
 
-        let sender = self.handler.create_packet_sender();
-        let new_handler = {
+        let sender = self.handler.lock().unwrap().create_packet_sender();
+        {
             let mut inner = self.inner.lock().unwrap();
             inner.crypt = new_crypt;
             inner.cmd_track.reset();
@@ -847,9 +897,11 @@ impl Client {
             inner.packet_rx = packet_rx;
             inner.close_rx = close_rx;
             inner.close_tx = close_tx_for_inner;
-            Self::build_cmd_handler_simple(&inner.cmd_middlewares, &sender)
-        };
-        *self.final_cmd_handler.lock().unwrap() = new_handler;
+        }
+        *self.final_cmd_handler.lock().unwrap() = Self::build_cmd_handler_simple(
+            &self.inner.lock().unwrap().cmd_middlewares,
+            &sender,
+        );
     }
 }
 
