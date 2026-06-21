@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 
-use tokio::io::AsyncWriteExt;
+use aes::Aes128;
+use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use cipher::generic_array::GenericArray;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
 use crate::command::build_command;
@@ -55,49 +58,123 @@ impl FileTransferTracker {
     }
 }
 
+/// Connect to the file transfer port.
+/// Mirrors JS `dialFileTransfer` — just connects, does NOT send the key.
 pub async fn dial_file_transfer(
     host: &str,
     port: u16,
-    key: &str,
 ) -> Result<tokio::net::TcpStream, crate::Error> {
     let addr = format!("{host}:{port}");
-    let mut stream = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(&addr),
     )
     .await
     .map_err(|_| crate::Error::FileTransfer("connection timeout".into()))?
     .map_err(|e| crate::Error::FileTransfer(format!("failed to connect: {e}")))?;
-
-    stream.write_all(key.as_bytes()).await
-        .map_err(|e| crate::Error::FileTransfer(format!("failed to send transfer key: {e}")))?;
-
     Ok(stream)
 }
 
-pub async fn upload_file_data(
+/// Upload file data with AES-128-ECB encryption.
+/// Mirrors JS `uploadFileData(host, info, data: Readable)`.
+/// `data` is an async reader — data is streamed and encrypted in 16-byte blocks.
+pub async fn upload_file_data<R: AsyncRead + Unpin>(
     host: &str,
     info: &FileUploadInfo,
-    data: Vec<u8>,
+    mut data: R,
 ) -> Result<(), crate::Error> {
-    let mut stream = dial_file_transfer(host, info.port as u16, &info.file_transfer_key).await?;
-    stream.write_all(&data).await
-        .map_err(|e| crate::Error::FileTransfer(format!("upload failed: {e}")))?;
-    stream.shutdown().await
-        .map_err(|e| crate::Error::FileTransfer(format!("upload shutdown failed: {e}")))?;
+    let mut stream = dial_file_transfer(host, info.port as u16).await?;
+
+    let key = base64_decode(&info.file_transfer_key);
+    let cipher = Aes128::new_from_slice(&key)
+        .map_err(|e| crate::Error::FileTransfer(format!("invalid AES key: {e}")))?;
+
+    let mut read_buf = vec![0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
+
+    loop {
+        let n = data
+            .read(&mut read_buf)
+            .await
+            .map_err(|e| crate::Error::FileTransfer(format!("read failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&read_buf[..n]);
+
+        // Encrypt complete 16-byte blocks
+        let num_blocks = pending.len() / 16;
+        for i in 0..num_blocks {
+            let mut block = GenericArray::clone_from_slice(&pending[i * 16..(i + 1) * 16]);
+            cipher.encrypt_block(&mut block);
+            stream
+                .write_all(&block)
+                .await
+                .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
+        }
+        pending = pending[num_blocks * 16..].to_vec();
+    }
+
+    // JS: cipher.final() with setAutoPadding(false) — any remaining bytes
+    // (< 16) are silently dropped, matching JS behavior.
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| crate::Error::FileTransfer(format!("shutdown failed: {e}")))?;
     Ok(())
 }
 
-pub async fn download_file_data(
+/// Download file data with AES-128-ECB decryption.
+/// Mirrors JS `downloadFileData(host, info, dest: Writable)`.
+/// `dest` is an async writer — decrypted data is streamed out.
+pub async fn download_file_data<W: AsyncWrite + Unpin>(
     host: &str,
     info: &FileDownloadInfo,
-) -> Result<Vec<u8>, crate::Error> {
-    use tokio::io::AsyncReadExt;
-    let mut stream = dial_file_transfer(host, info.port as u16, &info.file_transfer_key).await?;
-    let mut data = Vec::new();
-    stream.read_to_end(&mut data).await
-        .map_err(|e| crate::Error::FileTransfer(format!("download failed: {e}")))?;
-    Ok(data)
+    mut dest: W,
+) -> Result<(), crate::Error> {
+    let mut stream = dial_file_transfer(host, info.port as u16).await?;
+
+    let key = base64_decode(&info.file_transfer_key);
+    let cipher = Aes128::new_from_slice(&key)
+        .map_err(|e| crate::Error::FileTransfer(format!("invalid AES key: {e}")))?;
+
+    let mut read_buf = vec![0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
+
+    loop {
+        let n = stream
+            .read(&mut read_buf)
+            .await
+            .map_err(|e| crate::Error::FileTransfer(format!("read failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&read_buf[..n]);
+
+        // Decrypt complete 16-byte blocks
+        let num_blocks = pending.len() / 16;
+        for i in 0..num_blocks {
+            let mut block = GenericArray::clone_from_slice(&pending[i * 16..(i + 1) * 16]);
+            cipher.decrypt_block(&mut block);
+            dest.write_all(&block)
+                .await
+                .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
+        }
+        pending = pending[num_blocks * 16..].to_vec();
+    }
+
+    // JS: decipher.final() with setAutoPadding(false) — remaining bytes dropped.
+    dest.flush()
+        .await
+        .map_err(|e| crate::Error::FileTransfer(format!("flush failed: {e}")))?;
+    Ok(())
+}
+
+fn base64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .unwrap_or_default()
 }
 
 pub fn build_ft_init_upload(

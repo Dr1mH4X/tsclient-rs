@@ -93,6 +93,9 @@ pub(crate) struct ClientInner {
     pub(crate) packet_rx: mpsc::UnboundedReceiver<Packet>,
     pub(crate) close_rx: mpsc::UnboundedReceiver<Option<Error>>,
     pub(crate) close_tx: mpsc::UnboundedSender<Option<Error>>,
+    /// Set when error 3329 is received — signals the bg task to perform
+    /// a deferred disconnect, matching JS `setImmediate(() => this.disconnect())`.
+    pub(crate) pending_disconnect: bool,
 }
 
 impl ClientInner {
@@ -128,6 +131,7 @@ impl ClientInner {
             packet_rx,
             close_rx,
             close_tx,
+            pending_disconnect: false,
         }
     }
 
@@ -265,11 +269,10 @@ impl ClientInner {
 
         let id = params.get("id").map(|s| s.as_str()).unwrap_or("0");
         if id == "3329" {
-            // 与 JS `setImmediate(() => this.disconnect().catch(() => {}))` 对应：
-            // 优雅发送 clientdisconnect 命令（best-effort），然后关闭连接
-            let cmd_sender = sender.create_command_sender();
-            cmd_sender(b"clientdisconnect reasonmsg=Shutdown".to_vec());
-            let _ = self.close_tx.send(Some(Error::Teamspeak("invalid identity".into())));
+            // JS: `setImmediate(() => this.disconnect().catch(() => {}))`
+            // Defer the disconnect to after process_packet returns and the
+            // inner lock is released. The bg task checks this flag.
+            self.pending_disconnect = true;
         }
     }
 
@@ -559,8 +562,45 @@ impl Client {
             loop {
                 tokio::select! {
                     Some(packet) = packet_rx.recv() => {
-                        let mut i = inner.lock().unwrap();
-                        i.process_packet(&sender, packet);
+                        let pending = {
+                            let mut i = inner.lock().unwrap();
+                            i.process_packet(&sender, packet);
+                            if i.pending_disconnect {
+                                i.pending_disconnect = false;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if pending {
+                            // Deferred disconnect — mirrors JS `disconnect()`:
+                            // 1. Check if already disconnected → skip
+                            // 2. Set status to Disconnected
+                            // 3. If was Connected, send `clientdisconnect` (best-effort)
+                            // 4. Close handler
+                            // 5. Call disconnected handlers with None
+                            let (was_connected, handlers) = {
+                                let mut i = inner.lock().unwrap();
+                                if i.status == ClientStatus::Disconnected {
+                                    break;
+                                }
+                                let was_connected = i.status == ClientStatus::Connected;
+                                i.status = ClientStatus::Disconnected;
+                                let handlers = std::mem::take(&mut i.event_handlers.disconnected);
+                                (was_connected, handlers)
+                            };
+                            if was_connected {
+                                let cmd_sender = sender.create_command_sender();
+                                cmd_sender(b"clientdisconnect reasonmsg=Shutdown".to_vec());
+                            }
+                            sender.close();
+                            for h in handlers {
+                                tokio::spawn(async move {
+                                    h(Event::Disconnected(None));
+                                });
+                            }
+                            break;
+                        }
                     }
                     Some(err) = close_rx.recv() => {
                         let mut i = inner.lock().unwrap();
@@ -832,21 +872,22 @@ impl Client {
         }
     }
 
-    pub async fn upload_file_data(
+    pub async fn upload_file_data<R: tokio::io::AsyncRead + Unpin>(
         &self,
         host: &str,
         info: &FileUploadInfo,
-        data: Vec<u8>,
+        data: R,
     ) -> Result<(), Error> {
         transfer::upload_file_data(host, info, data).await
     }
 
-    pub async fn download_file_data(
+    pub async fn download_file_data<W: tokio::io::AsyncWrite + Unpin>(
         &self,
         host: &str,
         info: &FileDownloadInfo,
-    ) -> Result<Vec<u8>, Error> {
-        transfer::download_file_data(host, info).await
+        dest: W,
+    ) -> Result<(), Error> {
+        transfer::download_file_data(host, info, dest).await
     }
 
     // ---- Internal (package-visible) -------------------------------------------

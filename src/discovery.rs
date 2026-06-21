@@ -19,17 +19,12 @@ fn is_ip_address(host: &str) -> bool {
     if host.starts_with('[') {
         return true;
     }
+    // Match JS `/^\d{1,3}(\.\d{1,3}){3}$/` — does NOT validate octet ranges.
     let octets: Vec<&str> = host.split('.').collect();
-    if octets.len() == 4 && octets.iter().all(|o| !o.is_empty() && o.bytes().all(|b| b.is_ascii_digit())) {
-        return octets.iter().all(|o| {
-            if let Ok(v) = o.parse::<u16>() {
-                v <= 255
-            } else {
-                false
-            }
-        });
-    }
-    false
+    octets.len() == 4
+        && octets.iter().all(|o| {
+            !o.is_empty() && o.len() <= 3 && o.bytes().all(|b| b.is_ascii_digit())
+        })
 }
 
 fn split_host_port(addr: &str) -> (&str, u16) {
@@ -164,7 +159,7 @@ impl Resolver {
         let (host, port) = split_host_port(tsdns_addr);
         let addr = join_host_port(host, port);
         let connect = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(2),
             tokio::net::TcpStream::connect(&addr),
         );
 
@@ -188,7 +183,7 @@ impl Resolver {
         let mut read_buf = [0u8; 1024];
         loop {
             let read = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(2),
                 stream.read(&mut read_buf),
             );
 

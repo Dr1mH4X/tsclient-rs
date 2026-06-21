@@ -24,7 +24,9 @@ pub fn is_auto_nickname_match(expected: &str, actual: &str) -> bool {
     if !actual.starts_with(expected) {
         return false;
     }
-    let suffix = &actual[expected.len()..];
+    // Use .get() for char-safe slicing — avoids panic if expected.len()
+    // falls on a non-char boundary (defensive; starts_with guarantees validity).
+    let suffix = actual.get(expected.len()..).unwrap_or("");
     suffix.chars().all(|c| c.is_ascii_digit()) && !suffix.is_empty()
 }
 

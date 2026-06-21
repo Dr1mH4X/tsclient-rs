@@ -144,6 +144,7 @@ impl HandlerCore {
 pub struct PacketSender {
     core: Arc<Mutex<HandlerCore>>,
     send_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
 impl PacketSender {
@@ -248,6 +249,22 @@ impl PacketSender {
             }
         })
     }
+
+    /// Close the handler — mirrors `PacketHandler::close()`.
+    /// Sets closed flag, signals shutdown, and drops the send channel.
+    pub fn close(&self) {
+        let mut core = self.core.lock().unwrap();
+        if core.closed {
+            return;
+        }
+        core.closed = true;
+        drop(core);
+
+        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+            let _ = tx.send(true);
+        }
+        self.send_tx.lock().unwrap().take();
+    }
 }
 
 pub struct PacketHandler {
@@ -256,7 +273,7 @@ pub struct PacketHandler {
     core: Arc<Mutex<HandlerCore>>,
     logger: Arc<dyn Logger>,
     send_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
-    shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
+    shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
 impl PacketHandler {
@@ -297,7 +314,7 @@ impl PacketHandler {
             })),
             logger,
             send_tx: Arc::new(Mutex::new(None)),
-            shutdown_tx: Mutex::new(None),
+            shutdown_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -443,6 +460,7 @@ impl PacketHandler {
         PacketSender {
             core: Arc::clone(&self.core),
             send_tx: Arc::clone(&self.send_tx),
+            shutdown_tx: Arc::clone(&self.shutdown_tx),
         }
     }
 }
