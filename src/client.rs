@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -92,6 +91,7 @@ pub(crate) struct ClientInner {
     pub(crate) event_middlewares: Vec<Box<dyn EventMiddleware>>,
     pub(crate) packet_rx: mpsc::UnboundedReceiver<Packet>,
     pub(crate) close_rx: mpsc::UnboundedReceiver<Option<Error>>,
+    pub(crate) close_tx: mpsc::UnboundedSender<Option<Error>>,
 }
 
 impl ClientInner {
@@ -104,6 +104,7 @@ impl ClientInner {
         client_init_options: ClientInitOptions,
         cmd_middlewares: Vec<Box<dyn CommandMiddleware>>,
         event_middlewares: Vec<Box<dyn EventMiddleware>>,
+        close_tx: mpsc::UnboundedSender<Option<Error>>,
     ) -> Self {
         let (_, packet_rx) = mpsc::unbounded_channel();
         let (_, close_rx) = mpsc::unbounded_channel();
@@ -125,6 +126,7 @@ impl ClientInner {
             event_middlewares,
             packet_rx,
             close_rx,
+            close_tx,
         }
     }
 
@@ -256,6 +258,7 @@ impl ClientInner {
         let id = params.get("id").map(|s| s.as_str()).unwrap_or("0");
         if id == "3329" {
             let _ = self.cmd_track.reset();
+            let _ = self.close_tx.send(Some(Error::Teamspeak("invalid identity".into())));
         }
     }
 
@@ -305,17 +308,17 @@ impl ClientInner {
     }
 
     fn dispatch_event(&mut self, event: Event) {
-        let should_dispatch = Arc::new(AtomicBool::new(false));
+        let dispatched = Arc::new(Mutex::new(None::<Event>));
         let base: EventHandler = {
-            let flag = Arc::clone(&should_dispatch);
-            Box::new(move |_: Event| {
-                flag.store(true, Ordering::SeqCst);
+            let d = Arc::clone(&dispatched);
+            Box::new(move |ev: Event| {
+                *d.lock().unwrap() = Some(ev);
             })
         };
         let chain = build_event_chain(&self.event_middlewares, base);
-        chain(event.clone());
-        if should_dispatch.load(Ordering::SeqCst) {
-            match event {
+        chain(event);
+        if let Some(evt) = dispatched.lock().unwrap().take() {
+            match evt {
                 Event::TextMessage(msg) => {
                     for h in &self.event_handlers.text_message {
                         h(Event::TextMessage(msg.clone()));
@@ -420,6 +423,7 @@ impl Client {
 
         let final_cmd_handler = Self::build_cmd_handler_simple(&cmd_middlewares, &packet_sender);
 
+        let (close_tx, _close_rx_dummy) = mpsc::unbounded_channel();
         let inner = Arc::new(Mutex::new(ClientInner::new(
             crypt,
             Arc::clone(&logger),
@@ -429,6 +433,7 @@ impl Client {
             client_init_options,
             cmd_middlewares,
             event_middlewares,
+            close_tx,
         )));
 
         Self {
@@ -826,6 +831,7 @@ impl Client {
         self.handler.set_on_packet(Box::new(move |p: Packet| {
             let _ = packet_tx.send(p);
         }));
+        let close_tx_for_inner = close_tx.clone();
         self.handler.set_on_close(Box::new(move |err: Option<Error>| {
             let _ = close_tx.send(err);
         }));
@@ -840,6 +846,7 @@ impl Client {
             inner.clid = 0;
             inner.packet_rx = packet_rx;
             inner.close_rx = close_rx;
+            inner.close_tx = close_tx_for_inner;
             Self::build_cmd_handler_simple(&inner.cmd_middlewares, &sender)
         };
         *self.final_cmd_handler.lock().unwrap() = new_handler;

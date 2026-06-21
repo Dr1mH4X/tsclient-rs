@@ -93,7 +93,7 @@ pub fn get_shared_secret2(public_key_bytes: &[u8], private_key_bytes: &[u8]) -> 
 }
 
 /// Multiply an Ed25519 point by a scalar that may be >= curve order n.
-fn scalar_mult_full(
+pub(crate) fn scalar_mult_full(
     point: &curve25519_dalek::edwards::EdwardsPoint,
     scalar: &num_bigint::BigUint,
     n: &num_bigint::BigUint,
@@ -133,42 +133,7 @@ fn scalar_mult_full(
     main_part + cofactor_part
 }
 
-/// License key derivation — mirrors `license.ts` `deriveKeyFromBlock`.
-/// Performs: negPub * scalar + negPar, then XOR byte 31 ^ 0x80.
-pub fn derive_license_key(block_key: &[u8], hash: &[u8], parent: &[u8]) -> Vec<u8> {
-    use curve25519_dalek::edwards::CompressedEdwardsY;
-    use curve25519_dalek::edwards::EdwardsPoint;
-
-    let mut scalar_bytes = [0u8; 32];
-    scalar_bytes.copy_from_slice(&hash[..32]);
-    clamp_scalar(&mut scalar_bytes);
-    let raw_scalar = num_bigint::BigUint::from_bytes_le(&scalar_bytes);
-
-    #[allow(deprecated)]
-    let n = curve25519_dalek::constants::BASEPOINT_ORDER;
-    let n_biguint = num_bigint::BigUint::from_bytes_le(&n.to_bytes());
-
-    let pub_bytes: [u8; 32] = block_key.try_into().expect("block_key len != 32");
-    let pub_point = CompressedEdwardsY(pub_bytes)
-        .decompress()
-        .expect("invalid edwards point in block_key");
-    let neg_pub = -pub_point;
-
-    let res1 = scalar_mult_full(&neg_pub, &raw_scalar, &n_biguint);
-
-    let par_bytes: [u8; 32] = parent.try_into().expect("parent len != 32");
-    let par_point = CompressedEdwardsY(par_bytes)
-        .decompress()
-        .expect("invalid edwards point in parent");
-    let neg_par = -par_point;
-
-    let result = res1 + neg_par;
-    let mut raw = result.compress().to_bytes();
-    raw[31] ^= 0x80;
-    raw.to_vec()
-}
-
-fn to_le_bytes(bigint: &num_bigint::BigUint) -> [u8; 32] {
+pub(crate) fn to_le_bytes(bigint: &num_bigint::BigUint) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     let le = bigint.to_bytes_le();
     let len = le.len().min(32);

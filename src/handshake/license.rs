@@ -1,6 +1,5 @@
 //! License chain parsing & key derivation — mirrors `teamspeak-js/src/handshake/license.ts`
 
-use crate::crypto::primitives::derive_license_key;
 use crate::crypto::hash512;
 use crate::Error;
 
@@ -160,5 +159,35 @@ fn read_null_string(data: &[u8]) -> Result<(String, usize), Error> {
 }
 
 fn derive_key_from_block(block: &LicenseBlock, parent: &[u8]) -> Vec<u8> {
-    derive_license_key(&block.key, &block.hash, parent)
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+
+    let hash = &block.hash;
+    let block_key = &block.key;
+    let mut scalar_bytes = [0u8; 32];
+    scalar_bytes.copy_from_slice(&hash[..32]);
+    crate::crypto::primitives::clamp_scalar(&mut scalar_bytes);
+    let raw_scalar = num_bigint::BigUint::from_bytes_le(&scalar_bytes);
+
+    #[allow(deprecated)]
+    let n = curve25519_dalek::constants::BASEPOINT_ORDER;
+    let n_biguint = num_bigint::BigUint::from_bytes_le(&n.to_bytes());
+
+    let pub_bytes: [u8; 32] = block_key.as_slice().try_into().expect("block_key len != 32");
+    let pub_point = CompressedEdwardsY(pub_bytes)
+        .decompress()
+        .expect("invalid edwards point in block_key");
+    let neg_pub = -pub_point;
+
+    let res1 = crate::crypto::primitives::scalar_mult_full(&neg_pub, &raw_scalar, &n_biguint);
+
+    let par_bytes: [u8; 32] = parent.try_into().expect("parent len != 32");
+    let par_point = CompressedEdwardsY(par_bytes)
+        .decompress()
+        .expect("invalid edwards point in parent");
+    let neg_par = -par_point;
+
+    let result = res1 + neg_par;
+    let mut raw = result.compress().to_bytes();
+    raw[31] ^= 0x80;
+    raw.to_vec()
 }

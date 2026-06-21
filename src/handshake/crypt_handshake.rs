@@ -16,7 +16,8 @@ const INIT_STEP_LEN: usize = 21;
 /// Returns the response bytes to send, or None if nothing should be sent.
 pub fn process_init1(crypt: &mut Crypt, data: Option<&[u8]>) -> Result<Option<Vec<u8>>, Error> {
     let data = match data {
-        Some(d) if d.is_empty() || d[0] == 0x7f => return Ok(Some(build_init1_start_packet())),
+        Some(d) if d[0] == 0x7f => return Ok(Some(build_init1_start_packet())),
+        Some(d) if d.is_empty() => return Ok(None),
         Some(d) => d,
         None => return Ok(Some(build_init1_start_packet())),
     };
@@ -38,7 +39,8 @@ fn build_init1_start_packet() -> Vec<u8> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as u32;
+        .as_secs();
+    let now = if now > 0xffff_ffff { 0xffff_ffff } else { now as u32 };
     buf[5..9].copy_from_slice(&now.to_be_bytes());
 
     let rng: [u8; 4] = rand::rngs::OsRng.r#gen();

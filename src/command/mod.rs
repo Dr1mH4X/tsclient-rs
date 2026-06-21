@@ -43,7 +43,7 @@ pub fn unescape(s: &str) -> String {
                 Some('r') => result.push('\r'),
                 Some('t') => result.push('\t'),
                 Some('v') => result.push('\x0B'),
-                Some(next) => { result.push(next); }
+                Some(next) => { result.push('\\'); result.push(next); }
                 None => {}
             }
         } else {
@@ -81,7 +81,7 @@ pub fn parse_command(s: &str) -> Option<Command> {
     }
 
     // Skip leading non-printable bytes (< 0x20 or > 0x7E)
-    let start = s.find(|c: char| c as u32 >= 0x20 && c as u32 <= 0x7E)?;
+    let start = s.find(|c: char| c as u32 >= 0x20 && c as u32 <= 0x7E).unwrap_or(0);
     let s = &s[start..];
 
     let parts: Vec<&str> = s.split(' ').collect();

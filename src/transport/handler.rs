@@ -614,8 +614,8 @@ fn handle_raw_packet(
         return;
     }
 
+    handle_packet_queue(c, p.clone(), on_packet);
     update_post_receive_state(c, &p);
-    handle_packet_queue(c, p, on_packet);
 }
 
 fn resolve_generation(c: &HandlerCore, id: u16, p_type: u8) -> u32 {

@@ -171,31 +171,48 @@ impl Resolver {
         .ok()?
         .ok()?;
 
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let query = format!("{query_host}\n");
         if stream.write_all(query.as_bytes()).await.is_err() {
             return None;
         }
-        let mut buf = [0u8; 1024];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf))
+
+        let mut buf = String::new();
+        use tokio::io::AsyncReadExt;
+        let mut read_buf = [0u8; 1024];
+        loop {
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                stream.read(&mut read_buf),
+            )
             .await
             .ok()?
             .ok()?;
-
-        let response = std::str::from_utf8(&buf[..n]).ok()?;
-        let line = response.lines().next()?.trim();
-        if line.is_empty() || line == "404" || line == "errors" {
-            None
-        } else {
-            Some(line.to_string())
+            if n == 0 {
+                break;
+            }
+            buf.push_str(&String::from_utf8_lossy(&read_buf[..n]));
+            if let Some(idx) = buf.find('\n') {
+                let line = buf[..idx].trim();
+                if line.is_empty() || line == "404" || line == "errors" {
+                    return None;
+                } else {
+                    return Some(line.to_string());
+                }
+            }
         }
+        None
     }
 
     async fn resolve_tsdns_srv(&self, domains: &[String], query_host: &str) -> Option<String> {
         for domain in domains {
             let lookup_name = format!("_tsdns._tcp.{domain}");
-            let response = self.dns.srv_lookup(lookup_name).await.ok()?;
-            for srv in response.iter() {
+            let response = self.dns.srv_lookup(lookup_name).await.ok();
+            let srvs = match response {
+                Some(s) => s,
+                None => continue,
+            };
+            for srv in srvs.iter() {
                 let target = srv.target().to_string().trim_end_matches('.').to_string();
                 let tsdns_addr = join_host_port(&target, srv.port());
                 if let Some(result) = Self::query_tsdns(&tsdns_addr, query_host).await {
