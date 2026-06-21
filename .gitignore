@@ -1,8 +1,4 @@
 teamspeak-js/
-
-
-# Added by cargo
-
 /target
-
 AGENTS.md
+.DS_Store
