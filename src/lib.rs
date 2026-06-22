@@ -71,6 +71,7 @@ pub use types::{
     ClientOptions,
     ResolvedAddr,
     EscapedString,
+    KickReason,
     AbortSignal,
     Event,
     NoopLogger as noopLogger,
