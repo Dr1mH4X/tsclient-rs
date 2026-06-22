@@ -71,6 +71,7 @@ pub use types::{
     ClientOptions,
     ResolvedAddr,
     EscapedString,
+    KickReason,
     AbortSignal,
     Event,
     NoopLogger as noopLogger,
@@ -99,12 +100,17 @@ pub use errors::{
 pub use api::{
     send_text_message as sendTextMessage,
     client_move as clientMove,
+    client_kick as clientKick,
+    ban_client as banClient,
+    client_update as clientUpdate,
     poke,
     get_client_info as getClientInfo,
     list_channels as listChannels,
     list_clients as listClients,
     file_transfer_delete_file as fileTransferDeleteFile,
 };
+
+pub use command::escape;
 
 // ---- File transfer -------------------------------------------------------------
 

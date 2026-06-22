@@ -11,6 +11,22 @@ use crate::errors::Error;
 #[derive(Debug, Clone)]
 pub struct EscapedString(pub String);
 
+/// Reason code for [`client_kick`](crate::clientKick).
+///
+/// - `Channel` — remove the client from the current channel only (reasonid=4).
+/// - `Server` — kick the client from the entire server (reasonid=5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickReason {
+    Channel = 4,
+    Server = 5,
+}
+
+impl From<KickReason> for i32 {
+    fn from(r: KickReason) -> Self {
+        r as i32
+    }
+}
+
 // ---- Event data structs ------------------------------------------------------
 
 #[derive(Debug, Clone)]
