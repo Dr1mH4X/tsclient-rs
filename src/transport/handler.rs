@@ -57,6 +57,7 @@ struct HandlerCore {
     next_command_id: u16,
     next_command_low_id: u16,
     pending_sends: Vec<Vec<u8>>,
+    logger: Arc<dyn Logger>,
 }
 
 impl HandlerCore {
@@ -271,7 +272,6 @@ pub struct PacketHandler {
     on_packet: Mutex<Option<OnPacket>>,
     on_close: Mutex<Option<OnClose>>,
     core: Arc<Mutex<HandlerCore>>,
-    logger: Arc<dyn Logger>,
     send_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
@@ -311,8 +311,8 @@ impl PacketHandler {
                 next_command_id: 0,
                 next_command_low_id: 0,
                 pending_sends: Vec::new(),
+                logger: logger.clone(),
             })),
-            logger,
             send_tx: Arc::new(Mutex::new(None)),
             shutdown_tx: Arc::new(Mutex::new(None)),
         }
@@ -360,11 +360,10 @@ impl PacketHandler {
         let on_close = Arc::new(Mutex::new(self.on_close.lock().unwrap().take()));
 
         let core = Arc::clone(&self.core);
-        let logger = Arc::clone(&self.logger);
         let bg_socket = Arc::clone(&socket);
 
         tokio::spawn(async move {
-            bg_task(core, logger, bg_socket, send_rx, shutdown_rx, on_packet, on_close).await;
+            bg_task(core, bg_socket, send_rx, shutdown_rx, on_packet, on_close).await;
         });
 
         *self.send_tx.lock().unwrap() = Some(send_tx);
@@ -475,7 +474,6 @@ impl Drop for PacketHandler {
 
 async fn bg_task(
     core: Arc<Mutex<HandlerCore>>,
-    _logger: Arc<dyn Logger>,
     socket: Arc<UdpSocket>,
     mut send_rx: UnboundedReceiver<Vec<u8>>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -776,22 +774,7 @@ fn handle_packet_queue(
             None => break,
         };
 
-        if packet_flags(packet) & PacketFlags::Fragmented == 0 {
-            let pkt = queue.remove(&current).unwrap();
-            win.advance(1);
-            *next_id = current.wrapping_add(1);
-
-            let mut assembled = pkt;
-            try_decompress(&mut assembled);
-
-            let mut cb = on_packet.lock().unwrap();
-            if let Some(ref mut f) = *cb {
-                f(assembled);
-            }
-            continue;
-        }
-
-        let result = try_reassemble_fragments(queue, win, current);
+        let result = try_reassemble(queue, win, current);
         let (reassembled, new_next) = match result {
             Some(v) => v,
             None => break,
@@ -800,7 +783,7 @@ fn handle_packet_queue(
         *next_id = new_next;
 
         let mut assembled = reassembled;
-        try_decompress(&mut assembled);
+        try_decompress(&c.logger, &mut assembled);
 
         let mut cb = on_packet.lock().unwrap();
         if let Some(ref mut f) = *cb {
@@ -820,11 +803,23 @@ fn fast_forward_missing_packets(
     }
 }
 
-fn try_reassemble_fragments(
+fn try_reassemble(
     queue: &mut HashMap<u16, Packet>,
     win: &mut GenerationWindow,
     next_id: u16,
 ) -> Option<(Packet, u16)> {
+    // Standalone (non-fragmented) packet — matches JS #tryReassemble fast path.
+    let is_standalone = queue
+        .get(&next_id)
+        .map(|p| packet_flags(p) & PacketFlags::Fragmented == 0)
+        .unwrap_or(false);
+    if is_standalone {
+        let pkt = queue.remove(&next_id)?;
+        win.advance(1);
+        return Some((pkt, next_id.wrapping_add(1)));
+    }
+
+    // Fragmented sequence — collect fragment IDs until we find the terminator.
     let mut fragment_ids: Vec<u16> = Vec::new();
     let mut total_size = 0;
     let mut curr_id = next_id;
@@ -872,7 +867,7 @@ fn try_reassemble_fragments(
     Some((reassembled, new_next))
 }
 
-fn try_decompress(packet: &mut Packet) {
+fn try_decompress(logger: &Arc<dyn Logger>, packet: &mut Packet) {
     if packet_flags(packet) & PacketFlags::Compressed == 0 {
         return;
     }
@@ -883,7 +878,10 @@ fn try_decompress(packet: &mut Packet) {
             packet.type_flagged &= !PacketFlags::Compressed;
         }
         Err(err) => {
-            eprintln!("decompression failed: id={}, err={:?}", packet.id, err);
+            logger.debug(
+                "decompression failed",
+                &[&packet.id, &format!("{err:?}")],
+            );
         }
     }
 }
@@ -924,21 +922,22 @@ fn check_resends_sync(
         do_resend_sync(&mut c.crypt, rp, now, &mut c.pending_sends);
     }
 
-    let timed_out_keys: Vec<i64> = c
-        .ack_manager
-        .iter()
-        .filter(|(_, rp)| now.duration_since(rp.first_send).as_millis() as u64 > PACKET_TIMEOUT_MS)
-        .map(|(k, _)| *k)
-        .collect();
+    // Iterate in insertion order (matching JS Map iteration).
+    // Remove each entry, check timeout, do resend, then reinsert.
+    let keys: Vec<i64> = c.ack_manager.keys().cloned().collect();
+    for key in keys {
+        let mut rp = match c.ack_manager.remove(&key) {
+            Some(rp) => rp,
+            None => continue,
+        };
 
-    for key in timed_out_keys {
-        c.ack_manager.remove(&key);
-        trigger_close(c, on_close, Some(Error::from("packet ack timeout")));
-        return;
-    }
+        if now.duration_since(rp.first_send).as_millis() as u64 > PACKET_TIMEOUT_MS {
+            trigger_close(c, on_close, Some(Error::from("packet ack timeout")));
+            return;
+        }
 
-    for (_, rp) in c.ack_manager.iter_mut() {
-        do_resend_sync(&mut c.crypt, rp, now, &mut c.pending_sends);
+        do_resend_sync(&mut c.crypt, &mut rp, now, &mut c.pending_sends);
+        c.ack_manager.insert(key, rp);
     }
 }
 
