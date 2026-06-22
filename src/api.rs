@@ -104,6 +104,47 @@ pub async fn list_clients(client: &Client) -> Result<Vec<ClientInfo>, Error> {
         .collect())
 }
 
+/// Kick a client from the server.
+pub async fn client_kick(
+    client: &Client,
+    clid: i32,
+    reasonid: i32,
+    reasonmsg: &str,
+) -> Result<(), Error> {
+    let cmd = build_command_ordered("clientkick", &[
+        ("clid", &clid.to_string()),
+        ("reasonid", &reasonid.to_string()),
+        ("reasonmsg", reasonmsg),
+    ]);
+    client.exec_command(&cmd, 10_000).await
+}
+
+/// Ban a client with a given duration (seconds) and reason.
+pub async fn ban_client(
+    client: &Client,
+    clid: i32,
+    time: u64,
+    banreason: &str,
+) -> Result<(), Error> {
+    let cmd = build_command_ordered("banclient", &[
+        ("clid", &clid.to_string()),
+        ("time", &time.to_string()),
+        ("banreason", banreason),
+    ]);
+    client.exec_command(&cmd, 10_000).await
+}
+
+/// Update client properties via `clientupdate`.
+///
+/// Example: `client_update(client, &[("client_description", "hello world")]).await`
+pub async fn client_update(
+    client: &Client,
+    params: &[(&str, &str)],
+) -> Result<(), Error> {
+    let cmd = build_command_ordered("clientupdate", params);
+    client.exec_command(&cmd, 10_000).await
+}
+
 /// Delete files on the server.
 pub async fn file_transfer_delete_file(
     client: &Client,
