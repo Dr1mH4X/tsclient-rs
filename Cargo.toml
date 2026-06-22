@@ -3,6 +3,7 @@ name = "tsclient-rs"
 version = "0.1.0"
 description = "TeamSpeak 3/5/6 client protocol library"
 license = "MIT"
+repository = "https://github.com/dreamhax/tsclient-rs"
 edition = "2024"
 
 [dependencies]
