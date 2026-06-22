@@ -167,10 +167,9 @@ fn derive_p256_public_key(private_key: &[u8; P256_SCALAR_SIZE]) -> [u8; P256_UNC
     let secret = p256::SecretKey::from_slice(private_key).unwrap();
     let public_key = secret.public_key();
     let encoded = p256::EncodedPoint::from(public_key);
-    let mut point = [0u8; P256_UNCOMPRESSED_KEY_SIZE];
-    point[0] = 0x04;
     let bytes = encoded.as_bytes();
-    point[1..1 + bytes.len()].copy_from_slice(bytes);
+    let mut point = [0u8; P256_UNCOMPRESSED_KEY_SIZE];
+    point.copy_from_slice(bytes);
     point
 }
 

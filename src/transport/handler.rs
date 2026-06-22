@@ -274,6 +274,7 @@ pub struct PacketHandler {
     core: Arc<Mutex<HandlerCore>>,
     send_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
+    bg_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl PacketHandler {
@@ -315,6 +316,7 @@ impl PacketHandler {
             })),
             send_tx: Arc::new(Mutex::new(None)),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            bg_handle: Mutex::new(None),
         }
     }
 
@@ -347,6 +349,11 @@ impl PacketHandler {
         self.send_tx.lock().unwrap().take();
     }
 
+    /// Take the background task handle (must call `close()` first).
+    pub fn take_handle(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.bg_handle.lock().unwrap().take()
+    }
+
     pub async fn connect(&self, addr: &str) -> Result<(), crate::Error> {
         let (host, port) = parse_addr(addr);
 
@@ -362,10 +369,11 @@ impl PacketHandler {
         let core = Arc::clone(&self.core);
         let bg_socket = Arc::clone(&socket);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             bg_task(core, bg_socket, send_rx, shutdown_rx, on_packet, on_close).await;
         });
 
+        *self.bg_handle.lock().unwrap() = Some(handle);
         *self.send_tx.lock().unwrap() = Some(send_tx);
         *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
 

@@ -2,8 +2,7 @@
 
 use std::collections::HashMap;
 
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha1::{Digest, Sha1};
 
 use crate::client::ClientInner;
 use crate::command::{build_command, build_command_ordered};
@@ -34,6 +33,7 @@ pub fn handle_handshake_init_iv(
         return;
     }
     inner.logger.info("crypto initialized (P-256 path), sending clientinit", &[]);
+    sender.set_crypt(inner.crypt.clone());
     send_client_init(inner, sender);
 }
 
@@ -56,6 +56,7 @@ pub fn handle_handshake_expand2(
         inner.logger.error(&format!("crypto_init2 failed: {e}"), &[]);
         return;
     }
+    sender.set_crypt(inner.crypt.clone());
     send_client_init(inner, sender);
 }
 
@@ -104,8 +105,7 @@ fn send_client_ek_packet(inner: &mut ClientInner, sender: &PacketSender, beta: &
 fn build_client_ek_proof(inner: &ClientInner, public_key: &[u8], beta: &str) -> String {
     let beta_bytes = base64_decode(beta);
     let mut to_sign = vec![0u8; 86];
-    let pk_len = public_key.len().min(32);
-    to_sign[..pk_len].copy_from_slice(&public_key[..pk_len]);
+    to_sign[..32].copy_from_slice(&public_key[..public_key.len().min(32)]);
     let bb_len = beta_bytes.len().min(54);
     to_sign[32..32 + bb_len].copy_from_slice(&beta_bytes[..bb_len]);
 

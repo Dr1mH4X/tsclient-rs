@@ -157,7 +157,18 @@ impl Resolver {
 
     async fn query_tsdns(tsdns_addr: &str, query_host: &str, signal: Option<&AbortSignal>) -> Option<String> {
         let (host, port) = split_host_port(tsdns_addr);
-        let addr = join_host_port(host, port);
+        // Resolve TSDNS hostname via DNS first (TcpStream may fail on SRV-style names)
+        let addr = if is_ip_address(host) {
+            join_host_port(host, port)
+        } else {
+            let dns = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+            let lookup = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                dns.ipv4_lookup(host),
+            ).await.ok()?.ok()?;
+            let ip = lookup.iter().next()?.to_string();
+            join_host_port(&ip, port)
+        };
         let connect = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             tokio::net::TcpStream::connect(&addr),
@@ -196,6 +207,9 @@ impl Resolver {
             }
             .ok()?;
             if n == 0 {
+                if !buf.is_empty() {
+                    return Some(buf.trim().to_string());
+                }
                 break;
             }
             buf.push_str(&String::from_utf8_lossy(&read_buf[..n]));

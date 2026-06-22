@@ -634,13 +634,21 @@ impl Client {
         }
 
         self.handler.lock().unwrap().close();
+        let handler_handle = self.handler.lock().unwrap().take_handle();
+        if let Some(h) = handler_handle {
+            let _ = h.await;
+        }
+
+        if let Some(handle) = self._bg_task.lock().unwrap().take() {
+            let _ = handle.await;
+        }
 
         let handlers = {
             let mut inner = self.inner.lock().unwrap();
             std::mem::take(&mut inner.event_handlers.disconnected)
         };
         for h in handlers {
-            tokio::spawn(async move { h(Event::Disconnected(None)); });
+            h(Event::Disconnected(None));
         }
 
         Ok(())
