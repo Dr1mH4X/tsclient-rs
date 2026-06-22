@@ -16,6 +16,7 @@ impl GenerationWindow {
         }
     }
 
+    #[allow(dead_code)]
     pub fn generation(&self) -> u32 {
         self.generation
     }
@@ -41,6 +42,7 @@ impl GenerationWindow {
         self.advance(move_dist + 1);
     }
 
+    #[allow(dead_code)]
     pub fn sync_to(&mut self, mapped_value: u32) {
         let move_dist = if mapped_value >= self.mapped_base_offset {
             mapped_value - self.mapped_base_offset
@@ -71,6 +73,7 @@ impl GenerationWindow {
         self.mapped_to_index(mapped_value) < 0
     }
 
+    #[allow(dead_code)]
     pub fn is_future_packet(&self, mapped_value: u32) -> bool {
         self.mapped_to_index(mapped_value) >= self.receive_window as i64
     }
@@ -88,6 +91,7 @@ impl GenerationWindow {
         }
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.mapped_base_offset = 0;
         self.generation = 0;

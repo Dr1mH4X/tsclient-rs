@@ -777,7 +777,7 @@ fn handle_packet_queue(
     loop {
         let current = *next_id;
 
-        let packet = match queue.get(&current) {
+        let _packet = match queue.get(&current) {
             Some(p) => p,
             None => break,
         };

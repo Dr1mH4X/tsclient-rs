@@ -22,6 +22,7 @@ const DUMMY_NONCE: &[u8] = b"m\\firewall32.cpl";
 pub struct KeyNonce {
     pub key: Vec<u8>,
     pub nonce: Vec<u8>,
+    #[allow(dead_code)]
     pub r#gen: u32,
 }
 

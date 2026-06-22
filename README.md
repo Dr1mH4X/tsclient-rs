@@ -205,6 +205,27 @@ tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
 tracing = "0.1"
 ```
 
+## Known Dead Code
+
+The following items are unused but kept for API completeness
+(they match re-exports in the JS reference and may be used by external consumers):
+
+| Module | Item | Reason |
+|--------|------|--------|
+| `crypto` | `KeyNonce` (re-export) | Exported type, no internal consumer |
+| `crypto` | `EAX`, `aes_cmac` (re-exports) | Exported for downstream use |
+| `crypto` | `clamp_scalar`, `generate_temporary_key`, `get_shared_secret2`, `sign`, `verify_sign` (re-exports) | Primitives exported for downstream |
+| `handshake` | `INIT_VERSION` (re-export) | Published constant |
+| `handshake` | `LicenseChain`, `parse_licenses` (re-exports) | Published types/functions |
+| `transport` | Packet function camelCase aliases (re-exports) | JS-compatible naming exports |
+| `transport` | `GenerationWindow`, `Qlz`, `OnClose`, `OnPacket` (re-exports) | Published types |
+| `crypto/crypt` | `KeyNonce::gen` | Stored but not read; same as JS |
+| `handshake/license` | `not_valid_before`, `not_valid_after` | Parsed but not read after construction; same as JS |
+| `transport/packet` | `parse_c2s_header` | Never called; same as JS |
+| `transport/generation_window` | `generation()`, `sync_to()`, `is_future_packet()`, `reset()` | Unused convenience methods; same as JS |
+
+Items marked `#[allow(dead_code)]` or `#[allow(unused_imports)]` in the source.
+
 ## Related
 
 - **[teamspeak-js](https://github.com/honeybbq/teamspeak-js)** — The TypeScript reference implementation this library is ported from

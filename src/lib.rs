@@ -1,3 +1,29 @@
+// Clippy style nags that don't affect correctness
+// (most have no equivalent in the JS reference)
+#![allow(
+    clippy::collapsible_if,
+    clippy::too_many_arguments,
+    clippy::await_holding_lock,
+    clippy::single_match,
+    clippy::unnecessary_unwrap,
+    clippy::manual_range_contains,
+    clippy::needless_range_loop,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of,
+    clippy::upper_case_acronyms,
+    clippy::inherent_to_string,
+    clippy::never_loop,
+    clippy::needless_borrow,
+    clippy::clone_on_copy,
+    clippy::needless_borrows_for_generic_args,
+    clippy::redundant_guards,
+    clippy::collapsible_else_if,
+    clippy::identity_op,
+    clippy::explicit_auto_deref,
+    clippy::question_mark,
+    clippy::new_without_default,
+)]
+
 // Modules (private to crate, selectively re-exported below)
 mod api;
 mod client;

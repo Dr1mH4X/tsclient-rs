@@ -65,6 +65,7 @@ pub fn parse_s2c_header(raw: &[u8]) -> (u16, u8) {
     (id, type_flagged)
 }
 
+#[allow(dead_code)]
 pub fn parse_c2s_header(raw: &[u8]) -> (u16, u16, u8) {
     let id = u16::from_be_bytes([raw[0], raw[1]]);
     let client_id = u16::from_be_bytes([raw[2], raw[3]]);

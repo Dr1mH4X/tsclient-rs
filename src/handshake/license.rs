@@ -16,7 +16,9 @@ struct LicenseBlock {
     _issuer: String,
     _block_type: u8,
     _server_type: u8,
+    #[allow(dead_code)]
     not_valid_before: u32,
+    #[allow(dead_code)]
     not_valid_after: u32,
 }
 

@@ -249,6 +249,26 @@ tracing = "0.1"
 
 使用 `current_thread` runtime（不启用 `rt-multi-thread`）时，`disconnect()` 会等待所有后台任务结束后再返回，确保干净退出。
 
+## 已知死代码
+
+以下项未使用但保留以保持 API 完整性（与 JS 参考实现的导出方式一致）：
+
+| 模块 | 项 | 原因 |
+|--------|------|------|
+| `crypto` | `KeyNonce`（再导出） | 导出的类型，无内部使用者 |
+| `crypto` | `EAX`, `aes_cmac`（再导出） | 为下游使用者导出 |
+| `crypto` | `clamp_scalar`, `generate_temporary_key`, `get_shared_secret2`, `sign`, `verify_sign`（再导出） | 为下游导出原语 |
+| `handshake` | `INIT_VERSION`（再导出） | 公开常量 |
+| `handshake` | `LicenseChain`, `parse_licenses`（再导出） | 公开类型与函数 |
+| `transport` | 包函数 camelCase 别名（再导出） | 兼容 JS 命名的导出 |
+| `transport` | `GenerationWindow`, `Qlz`, `OnClose`, `OnPacket`（再导出） | 公开类型 |
+| `crypto/crypt` | `KeyNonce::gen` | 存储但未读取；与 JS 相同 |
+| `handshake/license` | `not_valid_before`, `not_valid_after` | 解析后未再读取；与 JS 相同 |
+| `transport/packet` | `parse_c2s_header` | 从未被调用；与 JS 相同 |
+| `transport/generation_window` | `generation()`, `sync_to()`, `is_future_packet()`, `reset()` | 便捷方法未使用；与 JS 相同 |
+
+源码中标记为 `#[allow(dead_code)]` 或 `#[allow(unused_imports)]`。
+
 ## 相关项目
 
 - **[teamspeak-js](https://github.com/honeybbq/teamspeak-js)** — 此库移植自的 TypeScript 参考实现

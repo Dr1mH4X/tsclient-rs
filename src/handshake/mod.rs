@@ -14,8 +14,10 @@ pub mod crypt_init2;
 pub mod license;
 
 pub use crypt_handshake::process_init1;
+#[allow(unused_imports)]
 pub use crypt_handshake::INIT_VERSION;
 pub use crypt_init2::crypto_init2;
+#[allow(unused_imports)]
 pub use license::{parse_licenses, LicenseChain};
 
 /// Handle the `clientinitiv` message (P-256 based crypto path).
