@@ -6,7 +6,6 @@
 
 兼容 TeamSpeak 3、5 和 6。从 [teamspeak-js](https://github.com/honeybbq/teamspeak-js) 移植。
 
-[![CI](https://github.com/anomalyco/tsclient-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/tsclient-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 </div>

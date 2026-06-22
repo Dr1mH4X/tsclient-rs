@@ -6,7 +6,6 @@
 
 Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.com/honeybbq/teamspeak-js).
 
-[![CI](https://github.com/Dr1mH4X/tsclient-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Dr1mH4X/tsclient-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 </div>
