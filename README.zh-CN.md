@@ -66,6 +66,42 @@ async fn main() -> Result<(), tsclient_rs::Error> {
 }
 ```
 
+## 语音输入输出
+
+```rust
+use std::sync::Arc;
+use tsclient_rs::*;
+
+#[tokio::main]
+async fn main() -> Result<(), tsclient_rs::Error> {
+    let identity = generateIdentity(8);
+    let client = Client::new(
+        identity,
+        "127.0.0.1:9987".to_string(),
+        "MyBot".to_string(),
+        ClientOptions::default(),
+    );
+
+    // 接收语音数据
+    client.on_voice_data(Arc::new(|event| {
+        if let Event::VoiceData(ref vd) = event {
+            println!("收到来自客户端 {} 的语音数据，编码: {}", vd.client_id, vd.codec);
+            // vd.data 是 Opus 编码的语音帧
+        }
+    }));
+
+    client.connect().await?;
+    client.wait_connected(None).await?;
+
+    // 发送语音数据（Opus 编码）
+    let opus_frame: Vec<u8> = vec![/* Opus 编码的音频数据 */];
+    client.send_voice(opus_frame, 4); // codec 4 = Speex, 5 = Opus
+
+    client.disconnect().await?;
+    Ok(())
+}
+```
+
 ## API 概览
 
 ### 客户端生命周期
@@ -135,6 +171,77 @@ let restored = identityFromString(&exported);
 
 // 从公钥获取 UID
 let uid = getUidFromPublicKey(&identity.public_key);
+```
+
+### 命令示例
+
+```rust
+use tsclient_rs::*;
+
+// 发送文本消息（target_mode: 1=私聊, 2=频道, 3=服务器）
+sendTextMessage(&client, 1, target_client_id, "Hello!").await?;
+
+// 移动客户端到指定频道
+clientMove(&client, clid, channel_id, "").await?;
+
+// 戳客户端
+poke(&client, clid, "Wake up!").await?;
+
+// 踢出客户端
+clientKick(&client, clid, KickReason::Server, "Goodbye").await?;
+
+// 封禁客户端（time_secs=0 为永久）
+banClient(&client, clid, 3600, "Spamming").await?;
+
+// 列出所有频道
+let channels = listChannels(&client).await?;
+
+// 列出所有在线客户端
+let clients = listClients(&client).await?;
+
+// 获取客户端详细信息
+let info = getClientInfo(&client, clid).await?;
+
+// 执行原始命令并获取响应
+let response = client.exec_command_with_response("serverconnectinfo", 5000).await?;
+
+// 发送后不等待响应
+client.send_command_no_wait("clientupdate").await?;
+```
+
+### 文件传输示例
+
+```rust
+use tsclient_rs::*;
+use std::io::Cursor;
+
+// 初始化文件上传
+let upload_info = client.file_transfer_init_upload(
+    channel_id,      // 频道 ID
+    "/path/to/file", // 服务器上的路径
+    "",              // 密码（无密码留空）
+    file_size,       // 文件大小
+    true,            // 是否覆盖已存在文件
+).await?;
+
+// 上传文件数据
+let file_data = std::fs::read("local_file.txt")?;
+let cursor = Cursor::new(file_data);
+uploadFileData(&upload_info.server_password, &upload_info, cursor).await?;
+
+// 初始化文件下载
+let download_info = client.file_transfer_init_download(
+    channel_id,
+    "/path/to/file",
+    "",
+).await?;
+
+// 下载文件数据
+let mut output = Vec::new();
+downloadFileData(&download_info.server_password, &download_info, &mut output).await?;
+
+// 删除服务器文件
+fileTransferDeleteFile(&client, channel_id, "/path/to/file", "").await?;
 ```
 
 ## 客户端选项
