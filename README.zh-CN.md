@@ -27,41 +27,39 @@
 ## 快速开始
 
 ```rust
-use std::sync::Arc;
+ jiuse std::sync::Arc;
 use tsclient_rs::*;
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
-    tracing_subscriber::fmt().init();
-
-    // 生成身份
+async fn main() -> Result<(), tsclient_rs::Error> {
+    // 生成身份（安全等级 8）
     let identity = generateIdentity(8);
 
     // 创建客户端
-    let mut client = Client::new(
+    let client = Client::new(
         identity,
         "127.0.0.1:9987".to_string(),
         "MyBot".to_string(),
-        ClientOptions {
-            logger: Arc::new(noopLogger),
-            ..Default::default()
-        },
+        ClientOptions::default(),
     );
 
-    // 注册事件
-    client.on_connected(Arc::new(|| println!("已连接")));
-    client.on_disconnected(Arc::new(|ev| println!("断开: {:?}", ev)));
+    // 注册事件处理
+    client.on_text_message(Arc::new(|event| {
+        if let Event::TextMessage(ref msg) = event {
+            println!("收到消息: {}", msg.message);
+        }
+    }));
 
-    // 连接
+    // 连接服务器
     client.connect().await?;
     client.wait_connected(None).await?;
-    println!("CLID: {}", client.client_id());
+    println!("已连接，CLID: {}", client.client_id());
 
-    // 获取列表
+    // 获取频道和客户端列表
     let channels = listChannels(&client).await?;
     let clients = listClients(&client).await?;
 
-    // 优雅断开
+    // 断开连接
     client.disconnect().await?;
 
     Ok(())
@@ -139,18 +137,19 @@ let restored = identityFromString(&exported);
 let uid = getUidFromPublicKey(&identity.public_key);
 ```
 
-### 客户端选项
+## 客户端选项
 
 ```rust
-let client = Client::new(identity, "ts.example.com", "MyBot", ClientOptions {
-    logger: Arc::new(consoleLogger),
-    resolver: None,
-    command_middleware: vec![],
-    event_middleware: vec![],
-    server_password: Some("密码".into()),
-    default_channel: Some("大厅".into()),
-    default_channel_password: Some("".into()),
-});
+let client = Client::new(
+    identity,
+    "ts.example.com".to_string(),
+    "MyBot".to_string(),
+    ClientOptions {
+        server_password: Some("密码".into()),
+        default_channel: Some("大厅".into()),
+        ..Default::default()
+    },
+);
 ```
 
 ## 中间件
@@ -190,26 +189,6 @@ impl EventMiddleware for DropPrivateMessages {
 client.use_event_middleware(vec![Box::new(DropPrivateMessages)]);
 ```
 
-## 自定义日志
-
-```rust
-use std::fmt::Display;
-use tsclient_rs::*;
-
-struct MyLogger;
-impl Logger for MyLogger {
-    fn debug(&self, msg: &str, _args: &[&dyn Display]) { eprintln!("[DEBUG] {msg}"); }
-    fn info(&self, msg: &str, _args: &[&dyn Display])  { eprintln!("[INFO] {msg}"); }
-    fn warn(&self, msg: &str, _args: &[&dyn Display])  { eprintln!("[WARN] {msg}"); }
-    fn error(&self, msg: &str, _args: &[&dyn Display]) { eprintln!("[ERROR] {msg}"); }
-}
-
-Client::new(identity, addr, nickname, ClientOptions {
-    logger: Arc::new(MyLogger),
-    ..Default::default()
-});
-```
-
 ## 项目结构
 
 ```
@@ -230,10 +209,6 @@ tsclient-rs/
 │   ├── transport/         # UDP 包封装、ACK、压缩
 │   ├── command/           # 命令构建与解析
 │   └── discovery/         # SRV / TSDNS / 地址解析
-├── test_tsclient/         # 集成测试客户端
-│   └── src/main.rs
-├── teamspeak-js/          # 原始 JS 参考实现（子模块）
-├── teamspeak-music-bot/   # 基于 teamspeak-js 的音乐机器人（子模块）
 ├── Cargo.toml
 └── LICENSE
 ```

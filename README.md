@@ -31,28 +31,25 @@ use std::sync::Arc;
 use tsclient_rs::*;
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
-    tracing_subscriber::fmt().init();
-
+async fn main() -> Result<(), tsclient_rs::Error> {
     let identity = generateIdentity(8);
 
-    let mut client = Client::new(
+    let client = Client::new(
         identity,
         "127.0.0.1:9987".to_string(),
         "MyBot".to_string(),
-        ClientOptions {
-            logger: Arc::new(noopLogger),
-            ..Default::default()
-        },
+        ClientOptions::default(),
     );
 
-    client.on_connected(Arc::new(|| println!("connected")));
-    client.on_disconnected(Arc::new(|ev| println!("disconnected: {:?}", ev)));
+    client.on_text_message(Arc::new(|event| {
+        if let Event::TextMessage(ref msg) = event {
+            println!("Received: {}", msg.message);
+        }
+    }));
 
     client.connect().await?;
     client.wait_connected(None).await?;
-
-    println!("CLID: {}", client.client_id());
+    println!("Connected, CLID: {}", client.client_id());
 
     let channels = listChannels(&client).await?;
     let clients = listClients(&client).await?;
@@ -134,18 +131,19 @@ let restored = identityFromString(&exported);
 let uid = getUidFromPublicKey(&identity.public_key);
 ```
 
-### Options
+## Options
 
 ```rust
-let client = Client::new(identity, "ts.example.com", "MyBot", ClientOptions {
-    logger: Arc::new(consoleLogger),
-    resolver: None,                               // custom resolver
-    command_middleware: vec![],                    // command middleware
-    event_middleware: vec![],                      // event middleware
-    server_password: Some("secret".into()),
-    default_channel: Some("Lobby".into()),
-    default_channel_password: Some("".into()),
-});
+let client = Client::new(
+    identity,
+    "ts.example.com".to_string(),
+    "MyBot".to_string(),
+    ClientOptions {
+        server_password: Some("secret".into()),
+        default_channel: Some("Lobby".into()),
+        ..Default::default()
+    },
+);
 ```
 
 ## Middleware
@@ -188,10 +186,6 @@ tsclient-rs/
 │   ├── transport/         # UDP packet framing, ACK, compression
 │   ├── command/           # Command builder and parser
 │   └── discovery/         # SRV / TSDNS / direct address resolution
-├── test_tsclient/         # Integration test client
-│   └── src/main.rs
-├── teamspeak-js/          # Original JS reference implementation (submodule)
-├── teamspeak-music-bot/   # Music bot using teamspeak-js (submodule)
 ├── Cargo.toml
 └── LICENSE
 ```
