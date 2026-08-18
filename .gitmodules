@@ -1,0 +1,6 @@
+[submodule "teamspeak-js"]
+	path = teamspeak-js
+	url = https://github.com/HoneyBBQ/teamspeak-js.git
+[submodule "teamspeak-go"]
+	path = teamspeak-go
+	url = https://github.com/HoneyBBQ/teamspeak-go.git
