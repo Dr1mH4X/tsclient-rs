@@ -28,7 +28,7 @@ README 的 "Known Dead Code" 表列出了与 JS 参考对齐、刻意保留的 d
 ## 文档
 
 - `docs/api.md`、`docs/examples.md` 是手工维护的公共 API 文档，公共 API 变更需同步更新。
-- README 中的 showcase 图（`docs/used_by/*.svg`）由 `scripts/generate_used_by.py` 生成（workflow 手动触发），不要手改。
+- README 中的 showcase 图由个人仓库 [Dr1mH4X/Dr1mH4X](https://github.com/Dr1mH4X/Dr1mH4X) 的 `scripts/generate_used_by.py` 生成（该仓库 workflow 手动触发），产物在 `used_by/tsclient-rs/`，不要手改。
 
 ## 规范来源
 
