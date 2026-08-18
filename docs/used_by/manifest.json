@@ -1,0 +1,30 @@
+{
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "repository_count": 1,
+  "public_dependents": 1,
+  "total_stars": 6,
+  "total_forks": 2,
+  "generated_at": "2026-08-18T20:12:08",
+  "svg_count": 6,
+  "files": [
+    "cards/Dr1mH4X--TeamSpeakClaw-dark.svg",
+    "cards/Dr1mH4X--TeamSpeakClaw-light.svg",
+    "showcase-dark.svg",
+    "showcase-light.svg",
+    "summary-dark.svg",
+    "summary-light.svg"
+  ],
+  "repositories": [
+    {
+      "owner": "Dr1mH4X",
+      "repo": "TeamSpeakClaw",
+      "slug": "Dr1mH4X--TeamSpeakClaw",
+      "stars": 6,
+      "forks": 2,
+      "pushed_at": "2026-08-16T15:46:21Z"
+    }
+  ]
+}

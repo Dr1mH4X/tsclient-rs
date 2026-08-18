@@ -10,6 +10,11 @@ Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.co
 
 </div>
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Dr1mH4X/tsclient-rs/master/docs/used_by/showcase-dark.svg">
+  <img width="100%" alt="Projects using tsclient-rs" src="https://raw.githubusercontent.com/Dr1mH4X/tsclient-rs/master/docs/used_by/showcase-light.svg">
+</picture>
+
 ## Features
 
 - **Full protocol handshake** — ECDH key exchange, RSA puzzle, EAX-encrypted transport
