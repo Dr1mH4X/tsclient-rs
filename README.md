@@ -58,15 +58,6 @@ tsclient-rs/
 └── LICENSE
 ```
 
-## Dependencies
-
-```toml
-[dependencies]
-tsclient-rs = { git = "https://github.com/anomalyco/tsclient-rs" }
-tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
-tracing = "0.1"
-```
-
 ## Known Dead Code
 
 The following items are unused but kept for API completeness
