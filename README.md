@@ -34,30 +34,6 @@ Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.co
 - [API Reference](docs/api.md)
 - [Examples](docs/examples.md)
 
-## Architecture
-
-```
-tsclient-rs/
-├── src/
-│   ├── client.rs          # Client lifecycle, connection management
-│   ├── api.rs             # High-level API (messages, channels, clients)
-│   ├── commands.rs        # Command sending and response tracking
-│   ├── events.rs          # Event handler registration and middleware
-│   ├── notifications.rs   # Server notification parsing and dispatch
-│   ├── handshake.rs       # Protocol handshake orchestration
-│   ├── transfer.rs        # File transfer operations
-│   ├── throttle.rs        # Token-bucket rate limiter
-│   ├── types.rs           # Public type definitions
-│   ├── errors.rs          # Error types
-│   ├── crypto/            # ECDH, EAX encryption, identity management
-│   ├── handshake/         # Crypto handshake and license verification
-│   ├── transport/         # UDP packet framing, ACK, compression
-│   ├── command/           # Command builder and parser
-│   └── discovery/         # SRV / TSDNS / direct address resolution
-├── Cargo.toml
-└── LICENSE
-```
-
 ## Known Dead Code
 
 The following items are unused but kept for API completeness
