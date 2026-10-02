@@ -261,10 +261,11 @@ impl ClientInner {
 
     fn handle_error(&mut self, params: &HashMap<String, String>) {
         let (err, rc) = commands::parse_server_error(params);
-        if rc.is_some() {
-            self.cmd_track.resolve(rc.unwrap(), err);
-        } else {
-            self.cmd_track.discard_buffer();
+        match rc {
+            Some(rc) => self.cmd_track.resolve(rc, err),
+            // Reply to a command sent without `return_code`: it contributed no
+            // rows, so this must not drop a live command's rows.
+            None => self.cmd_track.on_untracked_reply(),
         }
 
         let id = params.get("id").map(|s| s.as_str()).unwrap_or("0");
@@ -714,13 +715,28 @@ impl Client {
             return Err(err);
         }
 
-        let result = tokio::time::timeout(
+        let result = match tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
             &mut rx,
         )
         .await
-        .map_err(|_| Error::CommandTimeout { command: cmd.to_string() })?
-        .map_err(|_| Error::Teamspeak("command channel closed".into()))?;
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                let mut inner = self.inner.lock().unwrap();
+                inner.cmd_track.unregister(rc);
+                return Err(Error::Teamspeak("command channel closed".into()));
+            }
+            Err(_) => {
+                // Give up on this return_code: leaving it registered would let
+                // its late reply drop the rows of a later command.
+                let mut inner = self.inner.lock().unwrap();
+                inner.cmd_track.unregister(rc);
+                return Err(Error::CommandTimeout {
+                    command: cmd.to_string(),
+                });
+            }
+        };
 
         let mut inner = self.inner.lock().unwrap();
         inner.cmd_track.unregister(rc);

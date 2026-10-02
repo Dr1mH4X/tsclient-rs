@@ -545,7 +545,7 @@ async fn bg_task(
 
                     handle_raw_packet(&mut c, &recv_buf[..n], &on_packet);
 
-                    let p = c.pending_sends.drain(..).collect::<Vec<Vec<u8>>>();
+                    let p = std::mem::take(&mut c.pending_sends);
                     let wc = c.closed;
                     (p, wc)
                 };
@@ -580,7 +580,7 @@ async fn bg_task(
                     if c.closed { break; }
                     let now = Instant::now();
                     check_resends_sync(&mut c, now, &on_close);
-                    c.pending_sends.drain(..).collect()
+                    std::mem::take(&mut c.pending_sends)
                 };
                 for bytes in pending {
                     let _ = socket.send(&bytes).await;
