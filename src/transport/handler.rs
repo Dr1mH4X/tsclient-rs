@@ -139,6 +139,66 @@ impl HandlerCore {
     }
 }
 
+/// 出站分包计划：`(offset, len, 是否带 Fragmented 标志)`。
+///
+/// 语音不分片（实时媒体，单帧必然装得下）。其余类型一律切到
+/// `MAX_OUT_PACKET_SIZE` 以内：超长数据报服务端会直接丢弃，被丢的命令包
+/// 拿不到 ack，60 秒后就会把整条连接按 ack 超时掐掉。
+fn plan_fragments(
+    p_type: PacketType,
+    data_len: usize,
+    max_chunk: usize,
+) -> Vec<(usize, usize, bool)> {
+    let fragmentable = p_type != PacketType::Voice && p_type != PacketType::VoiceWhisper;
+    if !fragmentable || data_len <= max_chunk {
+        return vec![(0, data_len, false)];
+    }
+
+    let mut plan = Vec::with_capacity(data_len / max_chunk + 1);
+    let mut pos = 0;
+    let mut first = true;
+    while pos < data_len {
+        let end = (pos + max_chunk).min(data_len);
+        let last = end == data_len;
+        plan.push((pos, end - pos, first != last));
+        pos = end;
+        first = false;
+    }
+    plan
+}
+
+fn send_fragmented(
+    core: &Arc<Mutex<HandlerCore>>,
+    send_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    p_type: PacketType,
+    data: Vec<u8>,
+    flags: u8,
+) {
+    let max_chunk = MAX_OUT_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
+    let plan = plan_fragments(p_type, data.len(), max_chunk);
+
+    let packets = {
+        let mut core = core.lock().unwrap();
+        let dummy = !core.crypt.crypto_init_complete;
+        plan.into_iter()
+            .map(|(offset, len, fragmented)| {
+                let mut p_flags = flags;
+                if fragmented {
+                    p_flags |= PacketFlags::Fragmented;
+                }
+                let chunk = data[offset..offset + len].to_vec();
+                core.build_and_track_packet(p_type, chunk, p_flags, dummy)
+            })
+            .collect::<Vec<Vec<u8>>>()
+    };
+
+    if let Some(tx) = send_tx.lock().unwrap().as_ref() {
+        for bytes in packets {
+            let _ = tx.send(bytes);
+        }
+    }
+}
+
 // ---- PacketSender (lightweight handle for bg tasks) --------------------------
 
 /// A lightweight handle that can send packets, cloned for background tasks.
@@ -155,42 +215,7 @@ impl PacketSender {
     }
 
     pub fn send_packet(&self, p_type: PacketType, data: Vec<u8>, flags: u8) {
-        let mut core = self.core.lock().unwrap();
-        let dummy = !core.crypt.crypto_init_complete;
-
-        let max_chunk = MAX_OUT_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
-        if data.len() > max_chunk
-            && p_type != PacketType::Voice
-            && p_type != PacketType::VoiceWhisper
-        {
-            let mut pos = 0;
-            let mut first = true;
-
-            while pos < data.len() {
-                let end = (pos + max_chunk).min(data.len());
-                let last = end == data.len();
-
-                let mut p_flags = flags;
-                if first != last {
-                    p_flags |= PacketFlags::Fragmented;
-                }
-
-                let chunk = data[pos..end].to_vec();
-                let bytes = core.build_and_track_packet(p_type, chunk, p_flags, dummy);
-                if let Some(tx) = self.send_tx.lock().unwrap().as_ref() {
-                    let _ = tx.send(bytes);
-                }
-
-                pos = end;
-                first = false;
-            }
-            return;
-        }
-
-        let bytes = core.build_and_track_packet(p_type, data, flags, dummy);
-        if let Some(tx) = self.send_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(bytes);
-        }
+        send_fragmented(&self.core, &self.send_tx, p_type, data, flags);
     }
 
     pub fn send_voice_packet(&self, data: Vec<u8>, codec: i32) {
@@ -241,13 +266,7 @@ impl PacketSender {
         let core = Arc::clone(&self.core);
         let send_tx = Arc::clone(&self.send_tx);
         Arc::new(move |data: Vec<u8>| {
-            let mut core = core.lock().unwrap();
-            let dummy = !core.crypt.crypto_init_complete;
-            let bytes = core.build_and_track_packet(PacketType::Command, data, 0, dummy);
-            drop(core);
-            if let Some(tx) = send_tx.lock().unwrap().as_ref() {
-                let _ = tx.send(bytes);
-            }
+            send_fragmented(&core, &send_tx, PacketType::Command, data, 0);
         })
     }
 
@@ -381,42 +400,7 @@ impl PacketHandler {
     }
 
     pub fn send_packet(&self, p_type: PacketType, data: Vec<u8>, flags: u8) {
-        let mut core = self.core.lock().unwrap();
-        let dummy = !core.crypt.crypto_init_complete;
-
-        let max_chunk = MAX_OUT_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
-        if data.len() > max_chunk
-            && p_type != PacketType::Voice
-            && p_type != PacketType::VoiceWhisper
-        {
-            let mut pos = 0;
-            let mut first = true;
-
-            while pos < data.len() {
-                let end = (pos + max_chunk).min(data.len());
-                let last = end == data.len();
-
-                let mut p_flags = flags;
-                if first != last {
-                    p_flags |= PacketFlags::Fragmented;
-                }
-
-                let chunk = data[pos..end].to_vec();
-                let bytes = core.build_and_track_packet(p_type, chunk, p_flags, dummy);
-                if let Some(tx) = self.send_tx.lock().unwrap().as_ref() {
-                    let _ = tx.send(bytes);
-                }
-
-                pos = end;
-                first = false;
-            }
-            return;
-        }
-
-        let bytes = core.build_and_track_packet(p_type, data, flags, dummy);
-        if let Some(tx) = self.send_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(bytes);
-        }
+        send_fragmented(&self.core, &self.send_tx, p_type, data, flags);
     }
 
     pub fn send_voice_packet(&self, data: Vec<u8>, codec: i32) {
@@ -452,13 +436,7 @@ impl PacketHandler {
         let core = Arc::clone(&self.core);
         let send_tx = Arc::clone(&self.send_tx);
         Arc::new(move |data: Vec<u8>| {
-            let mut core = core.lock().unwrap();
-            let dummy = !core.crypt.crypto_init_complete;
-            let bytes = core.build_and_track_packet(PacketType::Command, data, 0, dummy);
-            drop(core);
-            if let Some(tx) = send_tx.lock().unwrap().as_ref() {
-                let _ = tx.send(bytes);
-            }
+            send_fragmented(&core, &send_tx, PacketType::Command, data, 0);
         })
     }
 
@@ -1042,4 +1020,44 @@ fn build_c2s_header_raw(id: u16, client_id: u16, type_flagged: u8) -> Vec<u8> {
     header[2..4].copy_from_slice(&client_id.to_be_bytes());
     header[4] = type_flagged;
     header
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX_CHUNK: usize = MAX_OUT_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
+
+    #[test]
+    fn oversized_command_is_split_within_the_packet_limit() {
+        let plan = plan_fragments(PacketType::Command, 2000, MAX_CHUNK);
+        assert!(plan.len() > 1);
+        assert!(plan.iter().all(|(_, len, _)| *len <= MAX_CHUNK));
+        assert_eq!(plan.iter().map(|(_, len, _)| len).sum::<usize>(), 2000);
+        assert_eq!(plan[0].0, 0);
+        assert!(plan.iter().all(|(offset, len, _)| offset + len <= 2000));
+    }
+
+    #[test]
+    fn only_the_first_and_last_fragment_carry_the_fragmented_flag() {
+        let plan = plan_fragments(PacketType::Command, 2000, MAX_CHUNK);
+        let flags: Vec<bool> = plan.iter().map(|(_, _, fragmented)| *fragmented).collect();
+        assert_eq!(flags, vec![true, false, false, false, true]);
+    }
+
+    #[test]
+    fn payload_within_one_packet_is_not_fragmented() {
+        assert_eq!(
+            plan_fragments(PacketType::Command, MAX_CHUNK, MAX_CHUNK),
+            vec![(0, MAX_CHUNK, false)]
+        );
+    }
+
+    #[test]
+    fn voice_is_never_fragmented() {
+        assert_eq!(
+            plan_fragments(PacketType::Voice, MAX_CHUNK * 4, MAX_CHUNK),
+            vec![(0, MAX_CHUNK * 4, false)]
+        );
+    }
 }
