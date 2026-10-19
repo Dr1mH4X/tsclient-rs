@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
 
 use crate::types::*;
 use crate::Error;
@@ -92,14 +94,26 @@ async fn resolve_nickname(nickname: &str, signal: Option<&AbortSignal>) -> Optio
 
 pub struct Resolver {
     cache: Mutex<HashMap<String, CachedResult>>,
-    dns: TokioAsyncResolver,
+    dns: TokioResolver,
 }
 
 impl Resolver {
+    fn new_dns_resolver() -> TokioResolver {
+        // hickory 0.26 changed ResolverConfig::default() to an empty config;
+        // keep the Google nameservers that 0.24 used by default.
+        TokioResolver::builder_with_config(
+            ResolverConfig::udp_and_tcp(&GOOGLE),
+            TokioRuntimeProvider::default(),
+        )
+        .with_options(ResolverOpts::default())
+        .build()
+        .expect("default DNS resolver configuration must be valid")
+    }
+
     pub fn new() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
-            dns: TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default()),
+            dns: Self::new_dns_resolver(),
         }
     }
 
@@ -138,14 +152,18 @@ impl Resolver {
         let lookup_name = format!("_ts3._udp.{host}");
         let response = self.dns.srv_lookup(lookup_name).await.ok()?;
         let addrs: Vec<ResolvedAddr> = response
+            .answers()
             .iter()
-            .map(|srv| {
-                let target = srv.target().to_string().trim_end_matches('.').to_string();
-                ResolvedAddr {
-                    addr: join_host_port(&target, srv.port()),
+            .filter_map(|record| {
+                let RData::SRV(srv) = &record.data else {
+                    return None;
+                };
+                let target = srv.target.to_string().trim_end_matches('.').to_string();
+                Some(ResolvedAddr {
+                    addr: join_host_port(&target, srv.port),
                     source: "SRV".into(),
                     expiry: Instant::now() + CACHE_TTL,
-                }
+                })
             })
             .collect();
         if addrs.is_empty() {
@@ -161,12 +179,15 @@ impl Resolver {
         let addr = if is_ip_address(host) {
             join_host_port(host, port)
         } else {
-            let dns = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+            let dns = Self::new_dns_resolver();
             let lookup = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 dns.ipv4_lookup(host),
             ).await.ok()?.ok()?;
-            let ip = lookup.iter().next()?.to_string();
+            let ip = lookup.answers().iter().find_map(|record| match &record.data {
+                RData::A(addr) => Some(addr.to_string()),
+                _ => None,
+            })?;
             join_host_port(&ip, port)
         };
         let connect = tokio::time::timeout(
@@ -233,9 +254,12 @@ impl Resolver {
                 Some(s) => s,
                 None => continue,
             };
-            for srv in srvs.iter() {
-                let target = srv.target().to_string().trim_end_matches('.').to_string();
-                let tsdns_addr = join_host_port(&target, srv.port());
+            for record in srvs.answers() {
+                let RData::SRV(srv) = &record.data else {
+                    continue;
+                };
+                let target = srv.target.to_string().trim_end_matches('.').to_string();
+                let tsdns_addr = join_host_port(&target, srv.port);
                 if let Some(result) = Self::query_tsdns(&tsdns_addr, query_host, signal).await {
                     return Some(result);
                 }
