@@ -488,6 +488,11 @@ pub fn parse_client(params: &HashMap<String, String>) -> Option<ClientInfo> {
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or(0),
         server_groups,
+        away: parse_bool(params.get("client_away")),
+        away_message: params.get("client_away_message").cloned(),
+        input_muted: parse_bool(params.get("client_input_muted")),
+        output_muted: parse_bool(params.get("client_output_muted")),
+        channel_commander: parse_bool(params.get("client_is_channel_commander")),
     })
 }
 
@@ -574,6 +579,36 @@ pub(crate) fn apply_client_notification(
                 changed = true;
             }
         }
+        if let Some(value) = parse_bool(params.get("client_away")) {
+            if current.away != Some(value) {
+                current.away = Some(value);
+                changed = true;
+            }
+        }
+        if let Some(value) = params.get("client_away_message") {
+            if current.away_message.as_deref() != Some(value.as_str()) {
+                current.away_message = Some(value.clone());
+                changed = true;
+            }
+        }
+        if let Some(value) = parse_bool(params.get("client_input_muted")) {
+            if current.input_muted != Some(value) {
+                current.input_muted = Some(value);
+                changed = true;
+            }
+        }
+        if let Some(value) = parse_bool(params.get("client_output_muted")) {
+            if current.output_muted != Some(value) {
+                current.output_muted = Some(value);
+                changed = true;
+            }
+        }
+        if let Some(value) = parse_bool(params.get("client_is_channel_commander")) {
+            if current.channel_commander != Some(value) {
+                current.channel_commander = Some(value);
+                changed = true;
+            }
+        }
         changed
     })
 }
@@ -597,7 +632,7 @@ fn parse_server_groups(value: &str) -> Vec<String> {
     value.split(',').map(ToOwned::to_owned).collect()
 }
 
-fn parse_bool(value: Option<&String>) -> Option<bool> {
+pub(crate) fn parse_bool(value: Option<&String>) -> Option<bool> {
     match value.map(String::as_str) {
         Some("0") => Some(false),
         Some("1") => Some(true),
@@ -618,6 +653,7 @@ fn client_size(client: &ClientInfo) -> usize {
             .iter()
             .map(|group| size_of::<String>() + group.len())
             .sum::<usize>()
+        + client.away_message.as_deref().map_or(0, str::len)
 }
 
 fn ordered_channels_from_index(
@@ -879,6 +915,29 @@ mod tests {
         assert_eq!(client.uid, "uid");
         assert_eq!(client.channel_id, 42);
         assert_eq!(client.server_groups, vec!["6", "9"]);
+        assert_eq!(client.away, None);
+        assert_eq!(client.input_muted, None);
+
+        assert!(apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_input_muted", "1")]),
+            &mut directory,
+        ));
+        let client = directory.client(7).expect("client");
+        assert_eq!(client.input_muted, Some(true));
+        assert_eq!(client.output_muted, None);
+        assert_eq!(client.nickname, "Alicia");
+        assert_eq!(client.channel_id, 42);
+
+        assert!(apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_input_muted", "0")]),
+            &mut directory,
+        ));
+        assert_eq!(
+            directory.client(7).expect("client").input_muted,
+            Some(false)
+        );
 
         assert!(apply_client_notification(
             "notifyclientupdated",
@@ -937,6 +996,11 @@ mod tests {
                 channel_id: 1,
                 r#type: 0,
                 server_groups: Vec::new(),
+                away: None,
+                away_message: None,
+                input_muted: None,
+                output_muted: None,
+                channel_commander: None,
             }));
         }
         directory.finish_welcome();

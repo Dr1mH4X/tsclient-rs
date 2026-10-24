@@ -36,6 +36,12 @@ is true when a row was rejected by those limits. `directory_snapshot()` returns
 `None` until the welcome stream finishes; use `wait_directory_ready()` first to
 wait for a complete snapshot.
 
+`ClientInfo` carries live client state alongside identity: `away`,
+`away_message`, `input_muted`, `output_muted` and `channel_commander`.
+Each is `Option`-typed: `None` means the server has not reported the flag
+yet, which is distinct from a reported `Some(false)`. Mute and away toggles
+arrive through `notifyclientupdated` and are reflected in later snapshots.
+
 ## Commands
 
 | Function                                               | Description                                |
