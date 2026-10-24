@@ -7,6 +7,8 @@
 | `Client::new(identity, addr, name, opts?)` | Create a new client                      |
 | `client.connect()`                         | Initiate connection to the server        |
 | `client.wait_connected(signal?)`           | Block until the handshake completes      |
+| `client.wait_directory_ready(signal?)`     | Block until the welcome directory is complete |
+| `client.directory_ready()`                 | Whether the welcome directory is complete |
 | `client.disconnect()`                      | Gracefully disconnect (awaits bg tasks)  |
 | `client.status()`                          | Get current `ClientStatus`               |
 | `client.client_id()`                       | Get assigned client ID on the server     |
@@ -22,9 +24,17 @@
 | `client.on_client_enter(handler)`         | Fires when a client joins          |
 | `client.on_client_leave(handler)`         | Fires when a client leaves         |
 | `client.on_client_moved(handler)`         | Fires when a client moves channels |
+| `client.on_directory_snapshot(handler)`   | Fires with the live channel/client directory |
 | `client.on_kicked(handler)`               | Fires when the bot is kicked       |
 | `client.on_poked(handler)`                | Fires when poked by a client       |
 | `client.on_voice_data(handler)`           | Fires on incoming voice data       |
+
+Directory snapshots are coalesced and delivered serially per handler. A slow
+handler retains only the newest pending state. The live directory cache is
+bounded in both entry count and total text storage. `DirectorySnapshot.truncated`
+is true when a row was rejected by those limits. `directory_snapshot()` returns
+`None` until the welcome stream finishes; use `wait_directory_ready()` first to
+wait for a complete snapshot.
 
 ## Commands
 
@@ -36,6 +46,7 @@
 | `client.send_voice(data, codec)`                       | Send Opus voice data                       |
 | `listChannels(client)`                                 | List all channels                          |
 | `listClients(client)`                                  | List all connected clients                 |
+| `client.directory_snapshot()`                          | Read the complete channel/client directory |
 | `getClientInfo(client, clid)`                          | Get detailed client information            |
 | `client.exec_command(cmd, timeout?)`                   | Execute a raw command                      |
 | `client.exec_command_with_response(cmd, timeout?)`     | Execute a command and return response data |

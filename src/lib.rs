@@ -30,6 +30,7 @@ mod client;
 mod command;
 mod commands;
 mod crypto;
+mod directory;
 mod discovery;
 mod events;
 mod handshake;
@@ -59,6 +60,7 @@ pub use types::{
     ClientLeftViewEvent,
     ClientInfo,
     ChannelInfo,
+    DirectorySnapshot,
     PokeEvent,
     VoiceData,
     FileUploadInfo,

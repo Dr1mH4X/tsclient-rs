@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::command::{build_command, build_command_ordered, unescape};
+use crate::directory::parse_channel;
 use crate::helpers;
 use crate::types::*;
 use crate::Client;
@@ -71,19 +72,7 @@ pub async fn get_client_info(
 /// List all channels on the server.
 pub async fn list_channels(client: &Client) -> Result<Vec<ChannelInfo>, Error> {
     let data = client.exec_command_with_response("channellist", QUERY_TIMEOUT_MS).await?;
-    Ok(data
-        .into_iter()
-        .map(|item| {
-            let id = helpers::parse_u64(item.get("cid").map(|s| s.as_str()).unwrap_or("0"));
-            let parent_id = helpers::parse_u64(item.get("pid").map(|s| s.as_str()).unwrap_or("0"));
-            ChannelInfo {
-                id,
-                parent_id,
-                name: unescape(item.get("channel_name").map(|s| s.as_str()).unwrap_or("")),
-                description: String::new(),
-            }
-        })
-        .collect())
+    Ok(data.iter().filter_map(parse_channel).collect())
 }
 
 /// List all clients currently connected to the server.

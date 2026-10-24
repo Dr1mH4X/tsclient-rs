@@ -23,6 +23,7 @@ Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.co
 - **Full protocol handshake** — ECDH key exchange, RSA puzzle, EAX-encrypted transport
 - **Command & notification system** — Send commands, receive server events
 - **Event-driven API** — Register handlers for text messages, client enter/leave, channel moves, kicks, etc.
+- **Live directory** — Read the channel tree and visible clients from the welcome stream and channel/client events
 - **Voice data** — Send Opus voice packets (codec 4 & 5)
 - **File transfers** — Upload, download, and delete files on the server
 - **Address resolution** — SRV records, TSDNS, and direct address support
