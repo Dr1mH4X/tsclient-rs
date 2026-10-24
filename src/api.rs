@@ -94,6 +94,11 @@ pub async fn list_clients(client: &Client) -> Result<Vec<ClientInfo>, Error> {
                 channel_id: helpers::parse_u64(item.get("cid").map(|s| s.as_str()).unwrap_or("0")),
                 r#type: helpers::parse_i10(item.get("client_type").map(|s| s.as_str()).unwrap_or("0")),
                 server_groups,
+                away: item.get("client_away").map(|v| v == "1"),
+                away_message: item.get("client_away_message").cloned(),
+                input_muted: item.get("client_input_muted").map(|v| v == "1"),
+                output_muted: item.get("client_output_muted").map(|v| v == "1"),
+                channel_commander: item.get("client_is_channel_commander").map(|v| v == "1"),
             }
         })
         .collect())

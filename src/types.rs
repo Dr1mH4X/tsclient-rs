@@ -66,6 +66,17 @@ pub struct ClientInfo {
     pub channel_id: u64,
     pub r#type: i32,
     pub id: i32,
+    /// Whether the client is marked away (`client_away`); `None` when the row
+    /// did not carry the flag, which is not the same as not being away.
+    pub away: Option<bool>,
+    pub away_message: Option<String>,
+    /// Whether the client's microphone is muted (`client_input_muted`).
+    pub input_muted: Option<bool>,
+    /// Whether the client's speakers are muted (`client_output_muted`).
+    pub output_muted: Option<bool>,
+    /// Whether the client speaks as channel commander
+    /// (`client_is_channel_commander`).
+    pub channel_commander: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
