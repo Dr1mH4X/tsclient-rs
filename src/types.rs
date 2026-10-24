@@ -58,7 +58,7 @@ pub struct ClientLeftViewEvent {
     pub target_id: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfo {
     pub nickname: String,
     pub uid: String,
@@ -68,12 +68,24 @@ pub struct ClientInfo {
     pub id: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelInfo {
     pub name: String,
     pub description: String,
     pub id: u64,
     pub parent_id: u64,
+    pub order: u64,
+    /// Whether joining requires a password. The password itself is never exposed.
+    pub password_protected: Option<bool>,
+    pub max_clients: Option<u16>,
+    pub max_clients_limited: Option<bool>,
+    pub codec: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectorySnapshot {
+    pub channels: Vec<ChannelInfo>,
+    pub clients: Vec<ClientInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +136,7 @@ pub enum Event {
     ClientEnter(ClientInfo),
     ClientLeave(ClientLeftViewEvent),
     ClientMoved(ClientMovedEvent),
+    DirectorySnapshot(DirectorySnapshot),
     Poked(PokeEvent),
     VoiceData(VoiceData),
     Connected,

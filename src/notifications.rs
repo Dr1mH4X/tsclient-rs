@@ -54,26 +54,17 @@ fn handle_client_enter_view(
     clients: &mut HashMap<i32, ClientInfo>,
     _nickname: &str,
 ) -> NotificationResult {
-    let clid = parse_u16(params.get("clid").map(|s| s.as_str()).unwrap_or(""));
-    let cid = parse_u64(params.get("cid").map(|s| s.as_str()).unwrap_or(""));
-    let client_type = parse_i10(params.get("client_type").map(|s| s.as_str()).unwrap_or(""));
-    let groups_str = params.get("client_servergroups").cloned().unwrap_or_default();
+    let info = crate::directory::parse_client(params).unwrap_or_else(|| ClientInfo {
+        id: 0,
+        nickname: String::new(),
+        uid: String::new(),
+        channel_id: 0,
+        r#type: 0,
+        server_groups: Vec::new(),
+    });
 
-    let info = ClientInfo {
-        id: clid,
-        nickname: params.get("client_nickname").cloned().unwrap_or_default(),
-        uid: params.get("client_unique_identifier").cloned().unwrap_or_default(),
-        channel_id: cid,
-        r#type: client_type,
-        server_groups: if groups_str.is_empty() {
-            Vec::new()
-        } else {
-            groups_str.split(',').map(|s| s.to_string()).collect()
-        },
-    };
-
-    if clid != 0 {
-        clients.insert(clid, info.clone());
+    if info.id != 0 {
+        clients.insert(info.id, info.clone());
     }
 
     NotificationResult::ClientEnter { info }
@@ -217,7 +208,7 @@ mod tests {
         let mut clients = HashMap::new();
         let params = make_params(&[
             ("clid", "42"),
-            ("cid", "100"),
+            ("ctid", "100"),
             ("client_nickname", "testuser"),
             ("client_unique_identifier", "abc123"),
             ("client_type", "0"),
@@ -227,6 +218,7 @@ mod tests {
         match result {
             NotificationResult::ClientEnter { info } => {
                 assert_eq!(info.id, 42);
+                assert_eq!(info.channel_id, 100);
                 assert_eq!(info.nickname, "testuser");
                 assert_eq!(info.server_groups, vec!["1", "2", "3"]);
                 assert!(clients.contains_key(&42));

@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use crate::command::parse_command;
 use crate::commands::{self, CommandTracker};
 use crate::crypto::{Crypt, Identity};
+use crate::directory as server_directory;
 use crate::discovery::Resolver;
 use crate::events::{build_command_chain, build_event_chain};
 use crate::helpers::{is_auto_nickname_match, split_command_rows};
@@ -49,6 +50,7 @@ struct EventHandlers {
     client_enter: Vec<EventHandler>,
     client_leave: Vec<EventHandler>,
     client_moved: Vec<EventHandler>,
+    directory_snapshot: Vec<EventHandler>,
     poked: Vec<EventHandler>,
     voice_data: Vec<EventHandler>,
     connected: Vec<Arc<dyn Fn() + Send + Sync>>,
@@ -63,6 +65,7 @@ impl EventHandlers {
             client_enter: Vec::new(),
             client_leave: Vec::new(),
             client_moved: Vec::new(),
+            directory_snapshot: Vec::new(),
             poked: Vec::new(),
             voice_data: Vec::new(),
             connected: Vec::new(),
@@ -85,7 +88,9 @@ pub(crate) struct ClientInner {
     pub(crate) status: ClientStatus,
     pub(crate) cmd_track: CommandTracker,
     pub(crate) ft_track: FileTransferTracker,
+    pub(crate) channels: HashMap<u64, ChannelInfo>,
     pub(crate) clients: HashMap<i32, ClientInfo>,
+    pub(crate) directory_ready: bool,
     pub(crate) connected_wakers: Vec<oneshot::Sender<()>>,
     event_handlers: EventHandlers,
     pub(crate) cmd_middlewares: Vec<Box<dyn CommandMiddleware>>,
@@ -123,7 +128,9 @@ impl ClientInner {
             status: ClientStatus::Disconnected,
             cmd_track: CommandTracker::new(),
             ft_track: FileTransferTracker::new(),
+            channels: HashMap::new(),
             clients: HashMap::new(),
+            directory_ready: false,
             connected_wakers: Vec::new(),
             event_handlers: EventHandlers::new(),
             cmd_middlewares,
@@ -216,6 +223,11 @@ impl ClientInner {
         };
 
         if cmd.name.starts_with("notify") {
+            let channel_changed = server_directory::apply_channel_notification(
+                &cmd.name,
+                &cmd.params,
+                &mut self.channels,
+            );
             let result = handle_notification(
                 &cmd.name,
                 &cmd.params,
@@ -224,6 +236,9 @@ impl ClientInner {
                 &self.nickname,
             );
             self.process_notification_result(result, &cmd.params, sender);
+            if channel_changed {
+                self.publish_directory();
+            }
             return;
         }
 
@@ -238,6 +253,22 @@ impl ClientInner {
             }
             "initserver" => {
                 crate::handshake::handle_init_server(self, sender, &cmd.params);
+            }
+            "channellist" => {
+                if let Some(channel) = server_directory::parse_channel(&cmd.params) {
+                    self.channels.insert(channel.id, channel);
+                }
+                self.cmd_track.buffer(cmd.params.clone());
+            }
+            "channelclientlist" => {
+                if let Some(client) = server_directory::parse_client(&cmd.params) {
+                    self.clients.insert(client.id, client);
+                }
+                self.cmd_track.buffer(cmd.params.clone());
+            }
+            "channellistfinished" => {
+                self.directory_ready = true;
+                self.publish_directory();
             }
             "error" => {
                 self.handle_error(&cmd.params);
@@ -285,12 +316,16 @@ impl ClientInner {
     ) {
         match result {
             NotificationResult::ClientEnter { info } => {
-                if info.id != 0 && is_auto_nickname_match(&self.nickname, &info.nickname) {
+                let is_self =
+                    info.id != 0 && is_auto_nickname_match(&self.nickname, &info.nickname);
+                if is_self {
                     self.clid = info.id;
                     sender.set_client_id(info.id);
                     self.cmd_track.signal_welcome_complete();
+                    self.directory_ready = true;
                 }
                 self.dispatch_event(Event::ClientEnter(info));
+                self.publish_directory();
             }
             NotificationResult::ClientLeave { event, is_self } => {
                 self.dispatch_event(Event::ClientLeave(event.clone()));
@@ -301,9 +336,11 @@ impl ClientInner {
                         tokio::spawn(async move { h(Event::Kicked(msg)); });
                     }
                 }
+                self.publish_directory();
             }
             NotificationResult::ClientMoved { event } => {
                 self.dispatch_event(Event::ClientMoved(event));
+                self.publish_directory();
             }
             NotificationResult::TextMessage { message } => {
                 self.dispatch_event(Event::TextMessage(message));
@@ -322,6 +359,14 @@ impl ClientInner {
             }
             NotificationResult::Unknown => {}
         }
+    }
+
+    fn publish_directory(&mut self) {
+        if !self.directory_ready {
+            return;
+        }
+        let snapshot = server_directory::snapshot(&self.channels, &self.clients);
+        self.dispatch_event(Event::DirectorySnapshot(snapshot));
     }
 
     fn dispatch_event(&mut self, event: Event) {
@@ -362,6 +407,15 @@ impl ClientInner {
                         let h = Arc::clone(h);
                         let e = evt.clone();
                         tokio::spawn(async move { h(Event::ClientMoved(e)); });
+                    }
+                }
+                Event::DirectorySnapshot(snapshot) => {
+                    for h in &self.event_handlers.directory_snapshot {
+                        let h = Arc::clone(h);
+                        let snapshot = snapshot.clone();
+                        tokio::spawn(async move {
+                            h(Event::DirectorySnapshot(snapshot));
+                        });
                     }
                 }
                 Event::Poked(evt) => {
@@ -769,6 +823,16 @@ impl Client {
         self
     }
 
+    pub fn on_directory_snapshot(&self, handler: EventHandler) -> &Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .directory_snapshot
+            .push(handler);
+        self
+    }
+
     pub fn on_poked(&self, handler: EventHandler) -> &Self {
         self.inner.lock().unwrap().event_handlers.poked.push(handler);
         self
@@ -792,6 +856,12 @@ impl Client {
     pub fn on_kicked(&self, handler: EventHandler) -> &Self {
         self.inner.lock().unwrap().event_handlers.kicked.push(handler);
         self
+    }
+
+    /// The channel tree and clients collected from the welcome stream and notifications.
+    pub fn directory_snapshot(&self) -> DirectorySnapshot {
+        let inner = self.inner.lock().unwrap();
+        server_directory::snapshot(&inner.channels, &inner.clients)
     }
 
     pub fn use_command_middleware(&self, mw: Vec<Box<dyn CommandMiddleware>>) -> &Self {
@@ -960,7 +1030,9 @@ impl Client {
             inner.crypt = new_crypt;
             inner.cmd_track.reset();
             inner.ft_track.reset();
+            inner.channels.clear();
             inner.clients.clear();
+            inner.directory_ready = false;
             inner.clid = 0;
             inner.packet_rx = packet_rx;
             inner.close_rx = close_rx;

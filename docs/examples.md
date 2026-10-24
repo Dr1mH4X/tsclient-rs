@@ -27,8 +27,14 @@ async fn main() -> Result<(), tsclient_rs::Error> {
     client.wait_connected(None).await?;
     println!("Connected, CLID: {}", client.client_id());
 
-    let channels = listChannels(&client).await?;
-    let clients = listClients(&client).await?;
+    // The welcome stream is available even when the server denies an explicit
+    // channellist or clientlist command to a guest.
+    let directory = client.directory_snapshot();
+    println!(
+        "{} channels, {} visible clients",
+        directory.channels.len(),
+        directory.clients.len()
+    );
 
     client.disconnect().await?;
 

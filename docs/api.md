@@ -22,6 +22,7 @@
 | `client.on_client_enter(handler)`         | Fires when a client joins          |
 | `client.on_client_leave(handler)`         | Fires when a client leaves         |
 | `client.on_client_moved(handler)`         | Fires when a client moves channels |
+| `client.on_directory_snapshot(handler)`   | Fires with the live channel/client directory |
 | `client.on_kicked(handler)`               | Fires when the bot is kicked       |
 | `client.on_poked(handler)`                | Fires when poked by a client       |
 | `client.on_voice_data(handler)`           | Fires on incoming voice data       |
@@ -36,6 +37,7 @@
 | `client.send_voice(data, codec)`                       | Send Opus voice data                       |
 | `listChannels(client)`                                 | List all channels                          |
 | `listClients(client)`                                  | List all connected clients                 |
+| `client.directory_snapshot()`                          | Read the channel tree and known clients    |
 | `getClientInfo(client, clid)`                          | Get detailed client information            |
 | `client.exec_command(cmd, timeout?)`                   | Execute a raw command                      |
 | `client.exec_command_with_response(cmd, timeout?)`     | Execute a command and return response data |
