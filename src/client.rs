@@ -173,8 +173,9 @@ pub(crate) struct ClientInner {
     pub(crate) directory: server_directory::DirectoryCache,
     pub(crate) directory_ready: bool,
     directory_publication: DirectoryPublication,
-    pub(crate) connected_wakers: Vec<oneshot::Sender<()>>,
-    directory_wakers: Vec<oneshot::Sender<()>>,
+    pub(crate) connected_wakers: Vec<(u64, oneshot::Sender<()>)>,
+    directory_wakers: Vec<(u64, oneshot::Sender<()>)>,
+    next_waker_id: u64,
     event_handlers: EventHandlers,
     pub(crate) cmd_middlewares: Vec<Box<dyn CommandMiddleware>>,
     pub(crate) event_middlewares: Vec<Box<dyn EventMiddleware>>,
@@ -216,6 +217,7 @@ impl ClientInner {
             directory_publication: DirectoryPublication::default(),
             connected_wakers: Vec::new(),
             directory_wakers: Vec::new(),
+            next_waker_id: 0,
             event_handlers: EventHandlers::new(),
             cmd_middlewares,
             event_middlewares,
@@ -368,7 +370,7 @@ impl ClientInner {
             "channellistfinished" => {
                 self.directory.finish_welcome();
                 self.directory_ready = true;
-                for waker in self.directory_wakers.drain(..) {
+                for (_, waker) in self.directory_wakers.drain(..) {
                     let _ = waker.send(());
                 }
                 self.mark_directory_changed();
@@ -587,7 +589,7 @@ impl ClientInner {
 
     pub(crate) fn mark_connected(&mut self) {
         self.status = ClientStatus::Connected;
-        for waker in self.connected_wakers.drain(..) {
+        for (_, waker) in self.connected_wakers.drain(..) {
             let _ = waker.send(());
         }
         let handlers = std::mem::take(&mut self.event_handlers.connected);
@@ -600,6 +602,44 @@ impl ClientInner {
         self.directory_ready = false;
         self.directory_wakers.clear();
         self.directory_publication = DirectoryPublication::default();
+    }
+
+    /// Register a oneshot waker for `wait_connected` (`directory = false`) or
+    /// `wait_directory_ready`. The id lets a cancelled wait take its entry
+    /// back out; see [`WakerGuard`].
+    fn register_waker(&mut self, directory: bool) -> (u64, oneshot::Receiver<()>) {
+        let id = self.next_waker_id;
+        self.next_waker_id += 1;
+        let (tx, rx) = oneshot::channel();
+        if directory {
+            self.directory_wakers.push((id, tx));
+        } else {
+            self.connected_wakers.push((id, tx));
+        }
+        (id, rx)
+    }
+}
+
+/// Cleans up a waiter registered by `wait_connected`/`wait_directory_ready`
+/// when the wait ends without the awaited state arriving — aborted, or its
+/// future dropped. Registered senders are only drained when the state arrives
+/// or the connection ends, so a cancelled wait must remove its own entry or
+/// the list grows by one per cancellation. After a real wakeup the id is
+/// already gone from the (drained) list, making the retain a no-op.
+struct WakerGuard {
+    inner: Arc<Mutex<ClientInner>>,
+    id: u64,
+}
+
+impl Drop for WakerGuard {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .connected_wakers
+            .retain(|(waker_id, _)| *waker_id != self.id);
+        inner
+            .directory_wakers
+            .retain(|(waker_id, _)| *waker_id != self.id);
     }
 }
 
@@ -843,14 +883,17 @@ impl Client {
     }
 
     pub async fn wait_connected(&self, signal: Option<&AbortSignal>) -> Result<(), Error> {
-        let mut rx = {
+        let (mut rx, _guard) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.status == ClientStatus::Connected {
                 return Ok(());
             }
-            let (tx, rx) = oneshot::channel();
-            inner.connected_wakers.push(tx);
-            rx
+            let (id, rx) = inner.register_waker(false);
+            let guard = WakerGuard {
+                inner: Arc::clone(&self.inner),
+                id,
+            };
+            (rx, guard)
         };
         match signal {
             Some(sig) => {
@@ -874,7 +917,7 @@ impl Client {
         &self,
         signal: Option<&AbortSignal>,
     ) -> Result<(), Error> {
-        let mut rx = {
+        let (mut rx, _guard) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.directory_ready {
                 return Ok(());
@@ -882,9 +925,12 @@ impl Client {
             if inner.status == ClientStatus::Disconnected {
                 return Err(Error::Teamspeak("directory is not available".into()));
             }
-            let (tx, rx) = oneshot::channel();
-            inner.directory_wakers.push(tx);
-            rx
+            let (id, rx) = inner.register_waker(true);
+            let guard = WakerGuard {
+                inner: Arc::clone(&self.inner),
+                id,
+            };
+            (rx, guard)
         };
         match signal {
             Some(sig) => {
@@ -1167,7 +1213,7 @@ impl Client {
     pub fn mark_connected(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.status = ClientStatus::Connected;
-        for waker in inner.connected_wakers.drain(..) {
+        for (_, waker) in inner.connected_wakers.drain(..) {
             let _ = waker.send(());
         }
         let handlers = std::mem::take(&mut inner.event_handlers.connected);
@@ -1370,6 +1416,49 @@ mod tests {
 
         assert!(client.directory_ready());
         assert!(client.directory_snapshot().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_waits_take_their_wakers_back() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        client.inner.lock().unwrap().status = ClientStatus::Connecting;
+        let directory_wakers =
+            || client.inner.lock().unwrap().directory_wakers.len();
+
+        let signal = AbortSignal::new();
+        let mut fut = Box::pin(client.wait_directory_ready(Some(&signal)));
+        poll_once(fut.as_mut()).await;
+        assert_eq!(directory_wakers(), 1);
+        signal.abort();
+        fut.await.expect_err("aborted");
+        assert_eq!(directory_wakers(), 0);
+
+        let mut fut = Box::pin(client.wait_directory_ready(None));
+        poll_once(fut.as_mut()).await;
+        assert_eq!(directory_wakers(), 1);
+        drop(fut);
+        assert_eq!(directory_wakers(), 0);
+
+        let mut fut = Box::pin(client.wait_connected(None));
+        poll_once(fut.as_mut()).await;
+        assert_eq!(client.inner.lock().unwrap().connected_wakers.len(), 1);
+        drop(fut);
+        assert_eq!(client.inner.lock().unwrap().connected_wakers.len(), 0);
+    }
+
+    /// Poll `fut` exactly once, so a wait registers its waker without being
+    /// driven to completion.
+    async fn poll_once<F: Future>(mut fut: Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            let _ = fut.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
     }
 
     #[tokio::test]
