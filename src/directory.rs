@@ -579,8 +579,7 @@ pub(crate) fn apply_client_notification(
                 changed = true;
             }
         }
-        if let Some(value) = params.get("client_away") {
-            let value = value == "1";
+        if let Some(value) = parse_bool(params.get("client_away")) {
             if current.away != Some(value) {
                 current.away = Some(value);
                 changed = true;
@@ -592,22 +591,19 @@ pub(crate) fn apply_client_notification(
                 changed = true;
             }
         }
-        if let Some(value) = params.get("client_input_muted") {
-            let value = value == "1";
+        if let Some(value) = parse_bool(params.get("client_input_muted")) {
             if current.input_muted != Some(value) {
                 current.input_muted = Some(value);
                 changed = true;
             }
         }
-        if let Some(value) = params.get("client_output_muted") {
-            let value = value == "1";
+        if let Some(value) = parse_bool(params.get("client_output_muted")) {
             if current.output_muted != Some(value) {
                 current.output_muted = Some(value);
                 changed = true;
             }
         }
-        if let Some(value) = params.get("client_is_channel_commander") {
-            let value = value == "1";
+        if let Some(value) = parse_bool(params.get("client_is_channel_commander")) {
             if current.channel_commander != Some(value) {
                 current.channel_commander = Some(value);
                 changed = true;
@@ -636,7 +632,7 @@ fn parse_server_groups(value: &str) -> Vec<String> {
     value.split(',').map(ToOwned::to_owned).collect()
 }
 
-fn parse_bool(value: Option<&String>) -> Option<bool> {
+pub(crate) fn parse_bool(value: Option<&String>) -> Option<bool> {
     match value.map(String::as_str) {
         Some("0") => Some(false),
         Some("1") => Some(true),

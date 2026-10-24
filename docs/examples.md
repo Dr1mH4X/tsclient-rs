@@ -37,6 +37,16 @@ async fn main() -> Result<(), tsclient_rs::Error> {
         directory.clients.len()
     );
 
+    // Live client state: `None` means the server has not reported the flag
+    // yet, `Some(false)` means it reported the flag as off.
+    for client in &directory.clients {
+        match client.input_muted {
+            Some(true) => println!("{} has their microphone muted", client.nickname),
+            Some(false) => println!("{} can speak", client.nickname),
+            None => {}
+        }
+    }
+
     client.disconnect().await?;
 
     Ok(())
