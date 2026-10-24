@@ -4,9 +4,11 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::Notify;
 
 use crate::command::parse_command;
 use crate::commands::{self, CommandTracker};
@@ -43,6 +45,83 @@ impl From<&ClientOptions> for ClientInitOptions {
     }
 }
 
+const DIRECTORY_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct DirectoryPublication {
+    dirty: bool,
+    next_publish: Option<tokio::time::Instant>,
+}
+
+impl DirectoryPublication {
+    fn mark(&mut self) {
+        self.dirty = true;
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.dirty
+            .then(|| self.next_publish.unwrap_or_else(tokio::time::Instant::now))
+    }
+
+    fn take_due(&mut self, now: tokio::time::Instant) -> bool {
+        if !self.dirty || self.next_publish.is_some_and(|next| now < next) {
+            return false;
+        }
+        self.dirty = false;
+        self.next_publish = Some(now + DIRECTORY_PUBLISH_INTERVAL);
+        true
+    }
+}
+
+struct OrderedDirectoryHandler {
+    handler: EventHandler,
+    pending: Arc<Mutex<Option<DirectorySnapshot>>>,
+    wake: Arc<Notify>,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl OrderedDirectoryHandler {
+    fn new(handler: EventHandler) -> Self {
+        Self {
+            handler,
+            pending: Arc::new(Mutex::new(None)),
+            wake: Arc::new(Notify::new()),
+            shutdown: None,
+        }
+    }
+
+    fn enqueue(&mut self, snapshot: DirectorySnapshot) {
+        if self.shutdown.is_none() {
+            self.start();
+        }
+        {
+            // Full snapshots are state: a slow handler keeps only the newest one.
+            *self.pending.lock().unwrap() = Some(snapshot);
+        }
+        self.wake.notify_one();
+    }
+
+    fn start(&mut self) {
+        let handler = Arc::clone(&self.handler);
+        let pending = Arc::clone(&self.pending);
+        let wake = Arc::clone(&self.wake);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    _ = wake.notified() => {}
+                }
+                let snapshot = { pending.lock().unwrap().take() };
+                if let Some(snapshot) = snapshot {
+                    handler(Event::DirectorySnapshot(snapshot));
+                }
+            }
+        });
+        self.shutdown = Some(shutdown_tx);
+    }
+}
+
 // ---- Event handler storage ------------------------------------------------------
 
 struct EventHandlers {
@@ -50,7 +129,7 @@ struct EventHandlers {
     client_enter: Vec<EventHandler>,
     client_leave: Vec<EventHandler>,
     client_moved: Vec<EventHandler>,
-    directory_snapshot: Vec<EventHandler>,
+    directory_snapshot: Vec<OrderedDirectoryHandler>,
     poked: Vec<EventHandler>,
     voice_data: Vec<EventHandler>,
     connected: Vec<Arc<dyn Fn() + Send + Sync>>,
@@ -88,9 +167,9 @@ pub(crate) struct ClientInner {
     pub(crate) status: ClientStatus,
     pub(crate) cmd_track: CommandTracker,
     pub(crate) ft_track: FileTransferTracker,
-    pub(crate) channels: HashMap<u64, ChannelInfo>,
-    pub(crate) clients: HashMap<i32, ClientInfo>,
+    pub(crate) directory: server_directory::DirectoryCache,
     pub(crate) directory_ready: bool,
+    directory_publication: DirectoryPublication,
     pub(crate) connected_wakers: Vec<oneshot::Sender<()>>,
     event_handlers: EventHandlers,
     pub(crate) cmd_middlewares: Vec<Box<dyn CommandMiddleware>>,
@@ -128,9 +207,9 @@ impl ClientInner {
             status: ClientStatus::Disconnected,
             cmd_track: CommandTracker::new(),
             ft_track: FileTransferTracker::new(),
-            channels: HashMap::new(),
-            clients: HashMap::new(),
+            directory: server_directory::DirectoryCache::default(),
             directory_ready: false,
+            directory_publication: DirectoryPublication::default(),
             connected_wakers: Vec::new(),
             event_handlers: EventHandlers::new(),
             cmd_middlewares,
@@ -226,18 +305,23 @@ impl ClientInner {
             let channel_changed = server_directory::apply_channel_notification(
                 &cmd.name,
                 &cmd.params,
-                &mut self.channels,
+                &mut self.directory,
+            );
+            let client_changed = server_directory::apply_client_notification(
+                &cmd.name,
+                &cmd.params,
+                &mut self.directory,
             );
             let result = handle_notification(
                 &cmd.name,
                 &cmd.params,
                 self.clid,
-                &mut self.clients,
+                &mut self.directory,
                 &self.nickname,
             );
             self.process_notification_result(result, &cmd.params, sender);
-            if channel_changed {
-                self.publish_directory();
+            if channel_changed || client_changed {
+                self.mark_directory_changed();
             }
             return;
         }
@@ -256,19 +340,22 @@ impl ClientInner {
             }
             "channellist" => {
                 if let Some(channel) = server_directory::parse_channel(&cmd.params) {
-                    self.channels.insert(channel.id, channel);
+                    self.directory.insert_channel(channel);
                 }
                 self.cmd_track.buffer(cmd.params.clone());
             }
             "channelclientlist" => {
                 if let Some(client) = server_directory::parse_client(&cmd.params) {
-                    self.clients.insert(client.id, client);
+                    if self.directory.insert_client(client) && self.directory_ready {
+                        self.mark_directory_changed();
+                    }
                 }
                 self.cmd_track.buffer(cmd.params.clone());
             }
             "channellistfinished" => {
+                self.directory.finish_welcome();
                 self.directory_ready = true;
-                self.publish_directory();
+                self.mark_directory_changed();
             }
             "error" => {
                 self.handle_error(&cmd.params);
@@ -322,10 +409,9 @@ impl ClientInner {
                     self.clid = info.id;
                     sender.set_client_id(info.id);
                     self.cmd_track.signal_welcome_complete();
-                    self.directory_ready = true;
                 }
                 self.dispatch_event(Event::ClientEnter(info));
-                self.publish_directory();
+                self.mark_directory_changed();
             }
             NotificationResult::ClientLeave { event, is_self } => {
                 self.dispatch_event(Event::ClientLeave(event.clone()));
@@ -336,11 +422,11 @@ impl ClientInner {
                         tokio::spawn(async move { h(Event::Kicked(msg)); });
                     }
                 }
-                self.publish_directory();
+                self.mark_directory_changed();
             }
             NotificationResult::ClientMoved { event } => {
                 self.dispatch_event(Event::ClientMoved(event));
-                self.publish_directory();
+                self.mark_directory_changed();
             }
             NotificationResult::TextMessage { message } => {
                 self.dispatch_event(Event::TextMessage(message));
@@ -361,12 +447,30 @@ impl ClientInner {
         }
     }
 
-    fn publish_directory(&mut self) {
-        if !self.directory_ready {
+    fn mark_directory_changed(&mut self) {
+        if self.directory_ready {
+            self.directory_publication.mark();
+        }
+    }
+
+    fn flush_directory_if_due(&mut self) {
+        if !self.directory_ready
+            || !self
+                .directory_publication
+                .take_due(tokio::time::Instant::now())
+        {
             return;
         }
-        let snapshot = server_directory::snapshot(&self.channels, &self.clients);
+        let snapshot = self.directory.snapshot();
         self.dispatch_event(Event::DirectorySnapshot(snapshot));
+    }
+
+    fn directory_deadline(&self) -> Option<tokio::time::Instant> {
+        if self.directory_ready {
+            self.directory_publication.deadline()
+        } else {
+            None
+        }
     }
 
     fn dispatch_event(&mut self, event: Event) {
@@ -410,12 +514,8 @@ impl ClientInner {
                     }
                 }
                 Event::DirectorySnapshot(snapshot) => {
-                    for h in &self.event_handlers.directory_snapshot {
-                        let h = Arc::clone(h);
-                        let snapshot = snapshot.clone();
-                        tokio::spawn(async move {
-                            h(Event::DirectorySnapshot(snapshot));
-                        });
+                    for handler in &mut self.event_handlers.directory_snapshot {
+                        handler.enqueue(snapshot.clone());
                     }
                 }
                 Event::Poked(evt) => {
@@ -565,8 +665,8 @@ impl Client {
     pub fn channel_id(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner
-            .clients
-            .get(&inner.clid)
+            .directory
+            .client(inner.clid)
             .map(|info| info.channel_id)
             .unwrap_or(0)
     }
@@ -615,6 +715,11 @@ impl Client {
             };
 
             loop {
+                let directory_deadline = {
+                    let mut i = inner.lock().unwrap();
+                    i.flush_directory_if_due();
+                    i.directory_deadline()
+                };
                 tokio::select! {
                     Some(packet) = packet_rx.recv() => {
                         let pending = {
@@ -656,6 +761,9 @@ impl Client {
                             }
                             break;
                         }
+                    }
+                    _ = wait_for_directory_deadline(directory_deadline) => {
+                        inner.lock().unwrap().flush_directory_if_due();
                     }
                     Some(err) = close_rx.recv() => {
                         let mut i = inner.lock().unwrap();
@@ -823,13 +931,15 @@ impl Client {
         self
     }
 
+    /// Receive coalesced directory snapshots serially. A slow handler may miss
+    /// older snapshots, but the newest pending state is retained.
     pub fn on_directory_snapshot(&self, handler: EventHandler) -> &Self {
         self.inner
             .lock()
             .unwrap()
             .event_handlers
             .directory_snapshot
-            .push(handler);
+            .push(OrderedDirectoryHandler::new(handler));
         self
     }
 
@@ -858,10 +968,11 @@ impl Client {
         self
     }
 
-    /// The channel tree and clients collected from the welcome stream and notifications.
+    /// The bounded channel tree and clients collected from the welcome stream
+    /// and notifications.
     pub fn directory_snapshot(&self) -> DirectorySnapshot {
         let inner = self.inner.lock().unwrap();
-        server_directory::snapshot(&inner.channels, &inner.clients)
+        inner.directory.snapshot()
     }
 
     pub fn use_command_middleware(&self, mw: Vec<Box<dyn CommandMiddleware>>) -> &Self {
@@ -1030,9 +1141,9 @@ impl Client {
             inner.crypt = new_crypt;
             inner.cmd_track.reset();
             inner.ft_track.reset();
-            inner.channels.clear();
-            inner.clients.clear();
+            inner.directory.clear();
             inner.directory_ready = false;
+            inner.directory_publication = DirectoryPublication::default();
             inner.clid = 0;
             inner.packet_rx = packet_rx;
             inner.close_rx = close_rx;
@@ -1056,5 +1167,129 @@ async fn resolve_addr_impl(addr: &str, resolver: &dyn AddrResolver) -> String {
     match resolver.resolve(addr, None).await {
         Ok(addrs) => addrs.first().map(|a| a.addr.clone()).unwrap_or(addr_with_port),
         Err(_) => addr_with_port,
+    }
+}
+
+async fn wait_for_directory_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    fn snapshot(channel_id: u64) -> DirectorySnapshot {
+        DirectorySnapshot {
+            channels: vec![ChannelInfo {
+                id: channel_id,
+                parent_id: 0,
+                order: 0,
+                name: channel_id.to_string(),
+                description: String::new(),
+                password_protected: None,
+                max_clients: None,
+                max_clients_limited: None,
+                codec: None,
+            }],
+            clients: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn directory_updates_are_coalesced_to_the_publish_interval() {
+        let start = tokio::time::Instant::now();
+        let mut publication = DirectoryPublication::default();
+        publication.mark();
+        assert!(publication.deadline().is_some());
+        assert!(publication.take_due(start));
+
+        publication.mark();
+        assert!(!publication.take_due(start + Duration::from_millis(50)));
+        assert!(publication.take_due(start + DIRECTORY_PUBLISH_INTERVAL));
+    }
+
+    #[test]
+    fn late_client_rows_and_updates_mark_the_live_directory() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        );
+        let sender = client
+            .handler
+            .lock()
+            .unwrap()
+            .create_packet_sender();
+        let mut inner = client.inner.lock().unwrap();
+        inner.directory_ready = true;
+
+        inner.handle_command_str(
+            "channelclientlist clid=7 cid=42 client_nickname=Alice \
+             client_unique_identifier=uid client_type=0",
+            &sender,
+        );
+        assert_eq!(inner.directory.client(7).expect("client").nickname, "Alice");
+        assert!(inner.directory_publication.dirty);
+
+        inner.directory_publication.dirty = false;
+        inner.handle_command_str(
+            "notifyclientupdated clid=7 client_nickname=Alicia",
+            &sender,
+        );
+        assert_eq!(
+            inner.directory.client(7).expect("client").nickname,
+            "Alicia"
+        );
+        assert!(inner.directory_publication.dirty);
+    }
+
+    #[tokio::test]
+    async fn directory_snapshot_handlers_run_serially_with_the_newest_state() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicBool::new(false));
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        let handler: EventHandler = {
+            let seen = Arc::clone(&seen);
+            let active = Arc::clone(&active);
+            let overlapped = Arc::clone(&overlapped);
+            let done_tx = Arc::clone(&done_tx);
+            Arc::new(move |event| {
+                if active.swap(true, Ordering::SeqCst) {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                let Event::DirectorySnapshot(snapshot) = event else {
+                    return;
+                };
+                std::thread::sleep(Duration::from_millis(2));
+                seen.lock().unwrap().push(snapshot.channels[0].id);
+                active.store(false, Ordering::SeqCst);
+                if seen.lock().unwrap().len() == 1 {
+                    if let Some(done) = done_tx.lock().unwrap().take() {
+                        let _ = done.send(());
+                    }
+                }
+            })
+        };
+
+        let mut handler = OrderedDirectoryHandler::new(handler);
+        for channel_id in 1..=3 {
+            handler.enqueue(snapshot(channel_id));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("directory handlers did not finish")
+            .expect("directory handler");
+        assert!(!overlapped.load(Ordering::SeqCst));
+        assert_eq!(*seen.lock().unwrap(), vec![3]);
     }
 }

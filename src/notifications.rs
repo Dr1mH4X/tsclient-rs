@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::command::unescape;
+use crate::directory::DirectoryCache;
 use crate::helpers::{parse_i10, parse_u16, parse_u64};
 use crate::types::*;
 
@@ -24,7 +25,7 @@ pub fn handle_notification(
     cmd_name: &str,
     params: &HashMap<String, String>,
     self_clid: i32,
-    clients: &mut HashMap<i32, ClientInfo>,
+    clients: &mut DirectoryCache,
     nickname: &str,
 ) -> NotificationResult {
     match cmd_name {
@@ -51,7 +52,7 @@ pub fn handle_notification(
 
 fn handle_client_enter_view(
     params: &HashMap<String, String>,
-    clients: &mut HashMap<i32, ClientInfo>,
+    clients: &mut DirectoryCache,
     _nickname: &str,
 ) -> NotificationResult {
     let info = crate::directory::parse_client(params).unwrap_or_else(|| ClientInfo {
@@ -64,7 +65,7 @@ fn handle_client_enter_view(
     });
 
     if info.id != 0 {
-        clients.insert(info.id, info.clone());
+        clients.insert_client(info.clone());
     }
 
     NotificationResult::ClientEnter { info }
@@ -73,14 +74,14 @@ fn handle_client_enter_view(
 fn handle_client_left_view(
     params: &HashMap<String, String>,
     self_clid: i32,
-    clients: &mut HashMap<i32, ClientInfo>,
+    clients: &mut DirectoryCache,
 ) -> NotificationResult {
     let clid = parse_u16(params.get("clid").map(|s| s.as_str()).unwrap_or(""));
     let reason_id = parse_i10(params.get("reasonid").map(|s| s.as_str()).unwrap_or(""));
 
     let is_self = clid == self_clid;
     if clid != 0 {
-        clients.remove(&clid);
+        clients.remove_client(clid);
     }
 
     let event = ClientLeftViewEvent {
@@ -95,17 +96,13 @@ fn handle_client_left_view(
 
 fn handle_client_moved(
     params: &HashMap<String, String>,
-    clients: &mut HashMap<i32, ClientInfo>,
+    clients: &mut DirectoryCache,
 ) -> NotificationResult {
     let clid = parse_u16(params.get("clid").map(|s| s.as_str()).unwrap_or(""));
     let ctid = parse_u64(params.get("ctid").map(|s| s.as_str()).unwrap_or(""));
 
     if clid != 0 {
-        if let Some(existing) = clients.get(&clid) {
-            let mut updated = existing.clone();
-            updated.channel_id = ctid;
-            clients.insert(clid, updated);
-        }
+        clients.move_client(clid, ctid);
     }
 
     NotificationResult::ClientMoved {
@@ -122,10 +119,10 @@ fn handle_client_moved(
 
 fn handle_text_message(
     params: &HashMap<String, String>,
-    clients: &mut HashMap<i32, ClientInfo>,
+    clients: &mut DirectoryCache,
 ) -> NotificationResult {
     let invoker_id = parse_u16(params.get("invokerid").map(|s| s.as_str()).unwrap_or(""));
-    let invoker_info = clients.get(&invoker_id).cloned();
+    let invoker_info = clients.client(invoker_id).cloned();
 
     let message = TextMessage {
         target_mode: parse_i10(params.get("targetmode").map(|s| s.as_str()).unwrap_or("")),
@@ -205,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_client_enter_view() {
-        let mut clients = HashMap::new();
+        let mut clients = DirectoryCache::default();
         let params = make_params(&[
             ("clid", "42"),
             ("ctid", "100"),
@@ -221,7 +218,7 @@ mod tests {
                 assert_eq!(info.channel_id, 100);
                 assert_eq!(info.nickname, "testuser");
                 assert_eq!(info.server_groups, vec!["1", "2", "3"]);
-                assert!(clients.contains_key(&42));
+                assert_eq!(clients.client(42).expect("client").nickname, "testuser");
             }
             _ => panic!("expected ClientEnter"),
         }
@@ -229,15 +226,15 @@ mod tests {
 
     #[test]
     fn test_client_left_view() {
-        let mut clients = HashMap::new();
-        clients.insert(42, ClientInfo {
+        let mut clients = DirectoryCache::default();
+        assert!(clients.insert_client(ClientInfo {
             id: 42,
             nickname: "testuser".into(),
             uid: "abc".into(),
             server_groups: vec![],
             channel_id: 100,
             r#type: 0,
-        });
+        }));
         let params = make_params(&[
             ("clid", "42"),
             ("reasonid", "1"),
@@ -248,7 +245,7 @@ mod tests {
             NotificationResult::ClientLeave { event, is_self } => {
                 assert_eq!(event.id, 42);
                 assert!(!is_self);
-                assert!(!clients.contains_key(&42));
+                assert!(clients.client(42).is_none());
             }
             _ => panic!("expected ClientLeave"),
         }
@@ -256,15 +253,15 @@ mod tests {
 
     #[test]
     fn test_text_message() {
-        let mut clients = HashMap::new();
-        clients.insert(10, ClientInfo {
+        let mut clients = DirectoryCache::default();
+        assert!(clients.insert_client(ClientInfo {
             id: 10,
             nickname: "sender".into(),
             uid: "uid123".into(),
             server_groups: vec!["1".into()],
             channel_id: 0,
             r#type: 0,
-        });
+        }));
         let params = make_params(&[
             ("invokerid", "10"),
             ("invokername", "sender"),

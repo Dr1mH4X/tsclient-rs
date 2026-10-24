@@ -27,6 +27,10 @@
 | `client.on_poked(handler)`                | Fires when poked by a client       |
 | `client.on_voice_data(handler)`           | Fires on incoming voice data       |
 
+Directory snapshots are coalesced and delivered serially per handler. A slow
+handler retains only the newest pending state. The live directory cache is
+bounded in both entry count and total text storage.
+
 ## Commands
 
 | Function                                               | Description                                |
