@@ -86,6 +86,8 @@ pub struct ChannelInfo {
 pub struct DirectorySnapshot {
     pub channels: Vec<ChannelInfo>,
     pub clients: Vec<ClientInfo>,
+    /// Whether a directory row or update was rejected by the cache limits.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone)]

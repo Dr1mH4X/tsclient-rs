@@ -17,11 +17,16 @@ pub(crate) struct DirectoryCache {
     channel_bytes: usize,
     client_bytes: usize,
     welcome_complete: bool,
+    truncated: bool,
 }
 
 impl DirectoryCache {
     pub(crate) fn client(&self, id: i32) -> Option<&ClientInfo> {
         self.clients.get(&id)
+    }
+
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
     }
 
     pub(crate) fn insert_channel(&mut self, mut channel: ChannelInfo) -> bool {
@@ -35,11 +40,16 @@ impl DirectoryCache {
         }
         let previous = self.channels.get(&channel.id);
         if previous.is_none() && self.channels.len() >= MAX_DIRECTORY_ENTRIES {
+            self.truncated = true;
             return false;
         }
         let previous_bytes = previous.map_or(0, channel_size);
         let next_bytes = self.channel_bytes - previous_bytes + channel_size(&channel);
-        if next_bytes > MAX_DIRECTORY_BYTES || previous == Some(&channel) {
+        if next_bytes > MAX_DIRECTORY_BYTES {
+            self.truncated = true;
+            return false;
+        }
+        if previous == Some(&channel) {
             return false;
         }
         let previous_parent = previous.map(|channel| channel.parent_id);
@@ -58,11 +68,16 @@ impl DirectoryCache {
     pub(crate) fn insert_client(&mut self, client: ClientInfo) -> bool {
         let previous = self.clients.get(&client.id);
         if previous.is_none() && self.clients.len() >= MAX_DIRECTORY_ENTRIES {
+            self.truncated = true;
             return false;
         }
         let previous_bytes = previous.map_or(0, client_size);
         let next_bytes = self.client_bytes - previous_bytes + client_size(&client);
-        if next_bytes > MAX_DIRECTORY_BYTES || previous == Some(&client) {
+        if next_bytes > MAX_DIRECTORY_BYTES {
+            self.truncated = true;
+            return false;
+        }
+        if previous == Some(&client) {
             return false;
         }
         self.client_bytes = next_bytes;
@@ -102,6 +117,7 @@ impl DirectoryCache {
         }
         let next_bytes = self.channel_bytes - current_bytes + channel_size(&next);
         if next_bytes > MAX_DIRECTORY_BYTES {
+            self.truncated = true;
             return false;
         }
         let mut parent_id = next.parent_id;
@@ -135,6 +151,7 @@ impl DirectoryCache {
         }
         let next_bytes = self.client_bytes - client_size(current) + client_size(&next);
         if next_bytes > MAX_DIRECTORY_BYTES {
+            self.truncated = true;
             return false;
         }
         self.client_bytes = next_bytes;
@@ -175,6 +192,7 @@ impl DirectoryCache {
         DirectorySnapshot {
             channels: ordered_channels_from_index(&self.channels, &self.children),
             clients,
+            truncated: self.truncated,
         }
     }
 
@@ -185,6 +203,7 @@ impl DirectoryCache {
         self.channel_bytes = 0;
         self.client_bytes = 0;
         self.welcome_complete = false;
+        self.truncated = false;
     }
 
     pub(crate) fn finish_welcome(&mut self) {
@@ -289,13 +308,28 @@ impl DirectoryCache {
 
 /// Parse one `channellist` row. Command values have already been unescaped.
 pub fn parse_channel(params: &HashMap<String, String>) -> Option<ChannelInfo> {
+    parse_channel_row(params, false)
+}
+
+fn parse_channel_notification(params: &HashMap<String, String>) -> Option<ChannelInfo> {
+    parse_channel_row(params, true)
+}
+
+fn parse_channel_row(
+    params: &HashMap<String, String>,
+    require_parent: bool,
+) -> Option<ChannelInfo> {
     let id = parse_u64(params.get("cid")?);
     if id == 0 {
         return None;
     }
+    let parent = params.get("pid").or_else(|| params.get("cpid"));
+    if require_parent && parent.is_none() {
+        return None;
+    }
     Some(ChannelInfo {
         id,
-        parent_id: parse_u64(params.get("pid").or_else(|| params.get("cpid"))?),
+        parent_id: parent.map(|value| parse_u64(value)).unwrap_or(0),
         order: params
             .get("channel_order")
             .or_else(|| params.get("order"))
@@ -334,7 +368,7 @@ pub fn apply_channel_notification(
 
     match name {
         "notifychannelcreated" => {
-            let Some(channel) = parse_channel(params) else {
+            let Some(channel) = parse_channel_notification(params) else {
                 return false;
             };
             directory.insert_channel(channel)
@@ -463,13 +497,38 @@ pub(crate) fn apply_client_notification(
     params: &HashMap<String, String>,
     directory: &mut DirectoryCache,
 ) -> bool {
-    if name != "notifyclientupdated" {
-        return false;
-    }
     let Some(id) = parse_client_id(params) else {
         return false;
     };
     if directory.client(id).is_none() {
+        return false;
+    }
+    if name == "notifyservergroupclientadded" || name == "notifyservergroupclientdeleted" {
+        let Some(group_id) = params.get("sgid").filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        let add = name == "notifyservergroupclientadded";
+        return directory.update_client(id, |current| {
+            if add {
+                if current
+                    .server_groups
+                    .iter()
+                    .any(|group| group == group_id)
+                {
+                    return false;
+                }
+                current.server_groups.push(group_id.clone());
+            } else {
+                let before = current.server_groups.len();
+                current.server_groups.retain(|group| group != group_id);
+                if current.server_groups.len() == before {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+    if name != "notifyclientupdated" {
         return false;
     }
     let server_groups = params
@@ -680,6 +739,20 @@ mod tests {
     }
 
     #[test]
+    fn channellist_row_defaults_a_missing_parent_but_notifications_do_not() {
+        let row = row(&[("cid", "42"), ("channel_name", "Lobby")]);
+        assert_eq!(parse_channel(&row).expect("channel").parent_id, 0);
+
+        let mut directory = DirectoryCache::default();
+        assert!(!apply_channel_notification(
+            "notifychannelcreated",
+            &row,
+            &mut directory,
+        ));
+        assert!(directory.snapshot().channels.is_empty());
+    }
+
+    #[test]
     fn channel_notifications_update_and_delete_live_rows() {
         let mut directory = DirectoryCache::default();
         assert!(directory.insert_channel(
@@ -813,6 +886,27 @@ mod tests {
             &mut directory,
         ));
         assert!(directory.client(7).expect("client").server_groups.is_empty());
+
+        assert!(apply_client_notification(
+            "notifyservergroupclientadded",
+            &row(&[("clid", "7"), ("sgid", "8")]),
+            &mut directory,
+        ));
+        assert!(!apply_client_notification(
+            "notifyservergroupclientadded",
+            &row(&[("clid", "7"), ("sgid", "8")]),
+            &mut directory,
+        ));
+        assert_eq!(
+            directory.client(7).expect("client").server_groups,
+            vec!["8"]
+        );
+        assert!(apply_client_notification(
+            "notifyservergroupclientdeleted",
+            &row(&[("clid", "7"), ("sgid", "8")]),
+            &mut directory,
+        ));
+        assert!(directory.client(7).expect("client").server_groups.is_empty());
     }
 
     #[test]
@@ -923,6 +1017,8 @@ mod tests {
         };
 
         assert!(!directory.insert_channel(channel));
-        assert!(directory.snapshot().channels.is_empty());
+        let snapshot = directory.snapshot();
+        assert!(snapshot.channels.is_empty());
+        assert!(snapshot.truncated);
     }
 }

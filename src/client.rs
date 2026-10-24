@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -114,7 +115,9 @@ impl OrderedDirectoryHandler {
                 }
                 let snapshot = { pending.lock().unwrap().take() };
                 if let Some(snapshot) = snapshot {
-                    handler(Event::DirectorySnapshot(snapshot));
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        handler(Event::DirectorySnapshot(snapshot));
+                    }));
                 }
             }
         });
@@ -171,6 +174,7 @@ pub(crate) struct ClientInner {
     pub(crate) directory_ready: bool,
     directory_publication: DirectoryPublication,
     pub(crate) connected_wakers: Vec<oneshot::Sender<()>>,
+    directory_wakers: Vec<oneshot::Sender<()>>,
     event_handlers: EventHandlers,
     pub(crate) cmd_middlewares: Vec<Box<dyn CommandMiddleware>>,
     pub(crate) event_middlewares: Vec<Box<dyn EventMiddleware>>,
@@ -211,6 +215,7 @@ impl ClientInner {
             directory_ready: false,
             directory_publication: DirectoryPublication::default(),
             connected_wakers: Vec::new(),
+            directory_wakers: Vec::new(),
             event_handlers: EventHandlers::new(),
             cmd_middlewares,
             event_middlewares,
@@ -302,6 +307,7 @@ impl ClientInner {
         };
 
         if cmd.name.starts_with("notify") {
+            let was_truncated = self.directory.truncated();
             let channel_changed = server_directory::apply_channel_notification(
                 &cmd.name,
                 &cmd.params,
@@ -320,7 +326,8 @@ impl ClientInner {
                 &self.nickname,
             );
             self.process_notification_result(result, &cmd.params, sender);
-            if channel_changed || client_changed {
+            if channel_changed || client_changed || (!was_truncated && self.directory.truncated())
+            {
                 self.mark_directory_changed();
             }
             return;
@@ -339,14 +346,20 @@ impl ClientInner {
                 crate::handshake::handle_init_server(self, sender, &cmd.params);
             }
             "channellist" => {
-                if let Some(channel) = server_directory::parse_channel(&cmd.params) {
-                    self.directory.insert_channel(channel);
+                if !self.directory_ready {
+                    if let Some(channel) = server_directory::parse_channel(&cmd.params) {
+                        self.directory.insert_channel(channel);
+                    }
                 }
                 self.cmd_track.buffer(cmd.params.clone());
             }
             "channelclientlist" => {
+                let was_truncated = self.directory.truncated();
                 if let Some(client) = server_directory::parse_client(&cmd.params) {
-                    if self.directory.insert_client(client) && self.directory_ready {
+                    let changed = self.directory.insert_client(client);
+                    if (changed || (!was_truncated && self.directory.truncated()))
+                        && self.directory_ready
+                    {
                         self.mark_directory_changed();
                     }
                 }
@@ -355,6 +368,9 @@ impl ClientInner {
             "channellistfinished" => {
                 self.directory.finish_welcome();
                 self.directory_ready = true;
+                for waker in self.directory_wakers.drain(..) {
+                    let _ = waker.send(());
+                }
                 self.mark_directory_changed();
             }
             "error" => {
@@ -561,6 +577,7 @@ impl ClientInner {
             return;
         }
         self.status = ClientStatus::Disconnected;
+        self.reset_directory_availability();
         let handlers = std::mem::take(&mut self.event_handlers.disconnected);
         for h in handlers {
             let e = err.clone();
@@ -577,6 +594,12 @@ impl ClientInner {
         for h in handlers {
             tokio::spawn(async move { h(); });
         }
+    }
+
+    fn reset_directory_availability(&mut self) {
+        self.directory_ready = false;
+        self.directory_wakers.clear();
+        self.directory_publication = DirectoryPublication::default();
     }
 }
 
@@ -746,6 +769,7 @@ impl Client {
                                 }
                                 let was_connected = i.status == ClientStatus::Connected;
                                 i.status = ClientStatus::Disconnected;
+                                i.reset_directory_availability();
                                 let handlers = std::mem::take(&mut i.event_handlers.disconnected);
                                 (was_connected, handlers)
                             };
@@ -787,6 +811,7 @@ impl Client {
             }
             let was_connected = inner.status == ClientStatus::Connected;
             inner.status = ClientStatus::Disconnected;
+            inner.reset_directory_availability();
             was_connected
         };
 
@@ -839,6 +864,41 @@ impl Client {
             }
             None => {
                 rx.await.map_err(|_| Error::Teamspeak("connection cancelled".into()))?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Wait until the welcome stream has supplied the complete directory.
+    pub async fn wait_directory_ready(
+        &self,
+        signal: Option<&AbortSignal>,
+    ) -> Result<(), Error> {
+        let mut rx = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.directory_ready {
+                return Ok(());
+            }
+            if inner.status == ClientStatus::Disconnected {
+                return Err(Error::Teamspeak("directory is not available".into()));
+            }
+            let (tx, rx) = oneshot::channel();
+            inner.directory_wakers.push(tx);
+            rx
+        };
+        match signal {
+            Some(sig) => {
+                let canceled = Error::Teamspeak("directory wait cancelled".into());
+                let aborted = Error::Teamspeak("aborted".into());
+                tokio::select! {
+                    r = &mut rx => r.map_err(|_| canceled)?,
+                    _ = sig.wait_for_abort() => return Err(aborted),
+                }
+                Ok(())
+            }
+            None => {
+                rx.await
+                    .map_err(|_| Error::Teamspeak("directory wait cancelled".into()))?;
                 Ok(())
             }
         }
@@ -968,11 +1028,17 @@ impl Client {
         self
     }
 
-    /// The bounded channel tree and clients collected from the welcome stream
-    /// and notifications.
-    pub fn directory_snapshot(&self) -> DirectorySnapshot {
+    pub fn directory_ready(&self) -> bool {
+        self.inner.lock().unwrap().directory_ready
+    }
+
+    /// The bounded channel tree and clients after the welcome stream completed.
+    /// Returns `None` while the directory is still loading or disconnected.
+    pub fn directory_snapshot(&self) -> Option<DirectorySnapshot> {
         let inner = self.inner.lock().unwrap();
-        inner.directory.snapshot()
+        inner
+            .directory_ready
+            .then(|| inner.directory.snapshot())
     }
 
     pub fn use_command_middleware(&self, mw: Vec<Box<dyn CommandMiddleware>>) -> &Self {
@@ -1142,8 +1208,7 @@ impl Client {
             inner.cmd_track.reset();
             inner.ft_track.reset();
             inner.directory.clear();
-            inner.directory_ready = false;
-            inner.directory_publication = DirectoryPublication::default();
+            inner.reset_directory_availability();
             inner.clid = 0;
             inner.packet_rx = packet_rx;
             inner.close_rx = close_rx;
@@ -1197,6 +1262,7 @@ mod tests {
                 codec: None,
             }],
             clients: Vec::new(),
+            truncated: false,
         }
     }
 
@@ -1247,6 +1313,63 @@ mod tests {
             "Alicia"
         );
         assert!(inner.directory_publication.dirty);
+
+        assert!(inner.directory.insert_channel(ChannelInfo {
+            id: 7,
+            parent_id: 0,
+            order: 0,
+            name: "Live".to_string(),
+            description: String::new(),
+            password_protected: None,
+            max_clients: None,
+            max_clients_limited: None,
+            codec: None,
+        }));
+        inner.directory_publication.dirty = false;
+        inner.handle_command_str(
+            "channellist cid=7 pid=0 channel_order=0 channel_name=Stale",
+            &sender,
+        );
+        assert_eq!(
+            inner.directory.snapshot().channels[0].name,
+            "Live"
+        );
+        assert!(!inner.directory_publication.dirty);
+    }
+
+    #[tokio::test]
+    async fn directory_snapshot_waits_for_the_welcome_to_finish() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client
+            .handler
+            .lock()
+            .unwrap()
+            .create_packet_sender();
+        client.inner.lock().unwrap().status = ClientStatus::Connecting;
+
+        assert!(!client.directory_ready());
+        assert!(client.directory_snapshot().is_none());
+
+        let waiter_client = Arc::clone(&client);
+        let waiter = tokio::spawn(async move {
+            waiter_client.wait_directory_ready(None).await
+        });
+        tokio::task::yield_now().await;
+
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("channellistfinished", &sender);
+        waiter.await.expect("waiter task").expect("directory ready");
+
+        assert!(client.directory_ready());
+        assert!(client.directory_snapshot().is_some());
     }
 
     #[tokio::test]
@@ -1291,5 +1414,37 @@ mod tests {
             .expect("directory handler");
         assert!(!overlapped.load(Ordering::SeqCst));
         assert_eq!(*seen.lock().unwrap(), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn directory_snapshot_handler_survives_a_panic() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+        let handler: EventHandler = {
+            let calls = Arc::clone(&calls);
+            let done_tx = Arc::clone(&done_tx);
+            Arc::new(move |_| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("directory handler panic");
+                }
+                if let Some(done) = done_tx.lock().unwrap().take() {
+                    let _ = done.send(());
+                }
+            })
+        };
+
+        let mut handler = OrderedDirectoryHandler::new(handler);
+        handler.enqueue(snapshot(1));
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        handler.enqueue(snapshot(2));
+
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("directory handler stopped after panic")
+            .expect("directory handler");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

@@ -25,11 +25,12 @@ async fn main() -> Result<(), tsclient_rs::Error> {
 
     client.connect().await?;
     client.wait_connected(None).await?;
+    client.wait_directory_ready(None).await?;
     println!("Connected, CLID: {}", client.client_id());
 
     // The welcome stream is available even when the server denies an explicit
     // channellist or clientlist command to a guest.
-    let directory = client.directory_snapshot();
+    let directory = client.directory_snapshot().expect("directory is ready");
     println!(
         "{} channels, {} visible clients",
         directory.channels.len(),
