@@ -359,16 +359,22 @@ impl ClientInner {
                 let was_truncated = self.directory.truncated();
                 if let Some(client) = server_directory::parse_client(&cmd.params) {
                     let id = client.id;
-                    let mut changed = self.directory.insert_client(client);
-                    // The row is a snapshot from before it was sent; replay
-                    // updates that arrived for this client while it was
-                    // still unknown.
-                    for params in self.directory.take_pending_client_updates(id) {
-                        changed |= server_directory::apply_client_notification(
-                            "notifyclientupdated",
-                            &params,
-                            &mut self.directory,
-                        );
+                    let mut changed = false;
+                    // A row is a snapshot from before it was sent: live
+                    // events own the state of clients they introduced or
+                    // removed, and a buffered welcome patch replays over a
+                    // fresh insert only.
+                    if !self.directory.client_departed(id)
+                        && self.directory.client(id).is_none()
+                    {
+                        changed = self.directory.insert_client(client);
+                        if let Some(params) = self.directory.take_pending_client_updates(id) {
+                            changed |= server_directory::apply_client_notification(
+                                "notifyclientupdated",
+                                &params,
+                                &mut self.directory,
+                            );
+                        }
                     }
                     if (changed || (!was_truncated && self.directory.truncated()))
                         && self.directory_ready
@@ -1508,6 +1514,53 @@ mod tests {
         assert_eq!(stored.input_muted, Some(true));
         assert_eq!(stored.away, Some(true));
         assert_eq!(stored.away_message.as_deref(), Some("brb"));
+    }
+
+    #[tokio::test]
+    async fn welcome_rows_yield_to_enterview_leftview_and_decode_escapes() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client.inner.lock().unwrap().status = ClientStatus::Connecting;
+        let mut inner = client.inner.lock().unwrap();
+
+        // An enterview introduces the client with state newer than the row
+        // that follows it; the row must not replace the entry.
+        inner.handle_command_str(
+            "notifycliententerview clid=7 ctid=3 client_nickname=Fresh client_input_muted=1",
+            &sender,
+        );
+        inner.handle_command_str(
+            "channelclientlist clid=7 cid=9 client_nickname=Stale client_input_muted=0",
+            &sender,
+        );
+        let stored = inner.directory.client(7).expect("client").clone();
+        assert_eq!(stored.nickname, "Fresh");
+        assert_eq!(stored.channel_id, 3);
+        assert_eq!(stored.input_muted, Some(true));
+
+        // A client seen leaving must not be resurrected by its welcome row.
+        inner.handle_command_str("notifyclientleftview clid=8 reasonid=1", &sender);
+        inner.handle_command_str(
+            "channelclientlist clid=8 cid=4 client_nickname=Ghost",
+            &sender,
+        );
+        assert!(inner.directory.client(8).is_none());
+
+        // Wire escapes are decoded by parse_command before rows reach the
+        // cache; the away message needs no second unescape.
+        inner.handle_command_str(
+            "channelclientlist clid=9 cid=1 client_nickname=Esc client_away_message=brb\\saway",
+            &sender,
+        );
+        assert_eq!(
+            inner.directory.client(9).expect("client").away_message.as_deref(),
+            Some("brb away")
+        );
     }
 
     #[tokio::test]

@@ -41,9 +41,10 @@ wait for a complete snapshot.
 Each is `Option`-typed: `None` means the server has not reported the flag
 yet, which is distinct from a reported `Some(false)`. Mute and away toggles
 arrive through `notifyclientupdated` and are reflected in later snapshots.
-Updates that arrive before a client's welcome row are replayed once that
-row inserts the client, so interleaved welcome traffic cannot regress
-them.
+Welcome traffic is reconciled against live events: updates that arrive
+before a client's row are replayed once the row inserts the client, and
+clients an enterview introduced or a left view removed are never replaced
+or resurrected by a late row.
 
 ## Commands
 

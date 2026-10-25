@@ -22,11 +22,14 @@ pub(crate) struct DirectoryCache {
     welcome_complete: bool,
     truncated: bool,
     /// `notifyclientupdated` rows for clients the welcome has not introduced
-    /// yet. A `channelclientlist` row is a snapshot from before the rows were
-    /// sent, so an update that arrives first carries newer state than the
-    /// row that follows it; the row path replays these on insert. Dropped
-    /// once the welcome finishes.
-    pending_client_updates: HashMap<i32, Vec<HashMap<String, String>>>,
+    /// yet, coalesced to one patch per client: a `channelclientlist` row is a
+    /// snapshot from before the rows were sent, so an update that arrives
+    /// first carries newer state than the row that follows it; the row path
+    /// replays the patch on insert. Dropped once the welcome finishes.
+    pending_client_updates: HashMap<i32, HashMap<String, String>>,
+    /// Clients a live event removed, welcome or live: a left view cannot be
+    /// undone by a late `channelclientlist` row still in flight.
+    departed_clients: HashSet<i32>,
 }
 
 impl DirectoryCache {
@@ -40,21 +43,37 @@ impl DirectoryCache {
 
     /// Buffer a `notifyclientupdated` row for a client the welcome has not
     /// introduced yet, so the client's `channelclientlist` row can replay it.
+    /// Updates for an already buffered id always merge — the cap bounds
+    /// distinct clients only; a dropped new id sets `truncated`, so the
+    /// snapshot reports the loss.
     fn buffer_pending_client_update(&mut self, id: i32, params: &HashMap<String, String>) {
-        if self.welcome_complete
-            || self.pending_client_updates.len() >= MAX_PENDING_CLIENT_UPDATES
-        {
+        if self.welcome_complete {
             return;
         }
-        self.pending_client_updates
-            .entry(id)
-            .or_default()
-            .push(params.clone());
+        match self.pending_client_updates.get_mut(&id) {
+            Some(patch) => patch.extend(params.clone()),
+            None => {
+                if self.pending_client_updates.len() >= MAX_PENDING_CLIENT_UPDATES {
+                    self.truncated = true;
+                    return;
+                }
+                self.pending_client_updates.insert(id, params.clone());
+            }
+        }
     }
 
-    /// Remove and return the updates buffered for `id`.
-    pub(crate) fn take_pending_client_updates(&mut self, id: i32) -> Vec<HashMap<String, String>> {
-        self.pending_client_updates.remove(&id).unwrap_or_default()
+    /// Remove and return the update patch buffered for `id`.
+    pub(crate) fn take_pending_client_updates(
+        &mut self,
+        id: i32,
+    ) -> Option<HashMap<String, String>> {
+        self.pending_client_updates.remove(&id)
+    }
+
+    /// Whether a live event removed this client, so a late welcome row must
+    /// not resurrect it.
+    pub(crate) fn client_departed(&self, id: i32) -> bool {
+        self.departed_clients.contains(&id)
     }
 
     pub(crate) fn insert_channel(&mut self, mut channel: ChannelInfo) -> bool {
@@ -115,6 +134,11 @@ impl DirectoryCache {
 
     pub(crate) fn remove_client(&mut self, id: i32) -> bool {
         self.pending_client_updates.remove(&id);
+        // A client seen leaving must not come back through a welcome or
+        // query row still in flight; enterview reinsertion is unaffected.
+        if self.departed_clients.len() < MAX_DIRECTORY_ENTRIES {
+            self.departed_clients.insert(id);
+        }
         let Some(client) = self.clients.remove(&id) else {
             return false;
         };
@@ -234,6 +258,7 @@ impl DirectoryCache {
         self.welcome_complete = false;
         self.truncated = false;
         self.pending_client_updates.clear();
+        self.departed_clients.clear();
     }
 
     pub(crate) fn finish_welcome(&mut self) {
@@ -809,16 +834,33 @@ mod tests {
     }
 
     #[test]
-    fn welcome_updates_buffer_for_unknown_clients_until_taken() {
+    fn welcome_updates_coalesce_per_client() {
         let mut directory = DirectoryCache::default();
         assert!(!apply_client_notification(
             "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_input_muted", "1")]),
+            &row(&[("clid", "7"), ("client_input_muted", "1"), ("client_away", "1")]),
+            &mut directory,
+        ));
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_input_muted", "0"), ("client_away_message", "brb")]),
             &mut directory,
         ));
         assert!(directory.client(7).is_none());
-        assert_eq!(directory.take_pending_client_updates(7).len(), 1);
-        assert!(directory.take_pending_client_updates(7).is_empty());
+
+        let patch = directory.take_pending_client_updates(7).expect("patch");
+        assert_eq!(patch.len(), 4); // clid + the three state keys
+        assert_eq!(patch.get("clid").map(String::as_str), Some("7"));
+        assert_eq!(
+            patch.get("client_input_muted").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(patch.get("client_away").map(String::as_str), Some("1"));
+        assert_eq!(
+            patch.get("client_away_message").map(String::as_str),
+            Some("brb")
+        );
+        assert!(directory.take_pending_client_updates(7).is_none());
 
         // Non-update notifications for unknown clients are not buffered.
         assert!(!apply_client_notification(
@@ -826,7 +868,7 @@ mod tests {
             &row(&[("clid", "7"), ("ctid", "3")]),
             &mut directory,
         ));
-        assert!(directory.take_pending_client_updates(7).is_empty());
+        assert!(directory.take_pending_client_updates(7).is_none());
 
         // Once the welcome finishes, updates for unknown clients are dropped.
         directory.finish_welcome();
@@ -835,7 +877,42 @@ mod tests {
             &row(&[("clid", "9"), ("client_away", "1")]),
             &mut directory,
         ));
-        assert!(directory.take_pending_client_updates(9).is_empty());
+        assert!(directory.take_pending_client_updates(9).is_none());
+    }
+
+    #[test]
+    fn pending_update_overflow_sets_truncated_but_keeps_buffered_clients() {
+        let mut directory = DirectoryCache::default();
+        for id in 1..=MAX_PENDING_CLIENT_UPDATES as i32 {
+            let clid = id.to_string();
+            assert!(!apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", &clid), ("client_away", "1")]),
+                &mut directory,
+            ));
+        }
+        assert!(!directory.truncated());
+
+        // A new id past the cap is dropped, and the snapshot reports the loss.
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "20000"), ("client_away", "1")]),
+            &mut directory,
+        ));
+        assert!(directory.take_pending_client_updates(20000).is_none());
+        assert!(directory.truncated());
+
+        // An already buffered id keeps merging past the cap.
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "1"), ("client_input_muted", "1")]),
+            &mut directory,
+        ));
+        let patch = directory.take_pending_client_updates(1).expect("patch");
+        assert_eq!(
+            patch.get("client_input_muted").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
@@ -1005,6 +1082,13 @@ mod tests {
 
         assert!(apply_client_notification(
             "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_away", "1")]),
+            &mut directory,
+        ));
+        assert_eq!(directory.client(7).expect("client").away, Some(true));
+
+        assert!(apply_client_notification(
+            "notifyclientupdated",
             &row(&[("clid", "7"), ("client_servergroups", "")]),
             &mut directory,
         ));
@@ -1030,6 +1114,17 @@ mod tests {
             &mut directory,
         ));
         assert!(directory.client(7).expect("client").server_groups.is_empty());
+
+        // A groups-only update leaves previously set flags alone.
+        assert!(apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_servergroups", "6")]),
+            &mut directory,
+        ));
+        let client = directory.client(7).expect("client");
+        assert_eq!(client.server_groups, vec!["6"]);
+        assert_eq!(client.input_muted, Some(false));
+        assert_eq!(client.away, Some(true));
     }
 
     #[test]

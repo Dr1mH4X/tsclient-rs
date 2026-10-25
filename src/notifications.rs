@@ -73,9 +73,8 @@ fn handle_client_enter_view(
         clients.insert_client(info.clone());
         // An enterview payload describes the client as of now, newer than
         // any update buffered while the client was unknown.
-        clients.take_pending_client_updates(info.id);
+        let _ = clients.take_pending_client_updates(info.id);
     }
-
     NotificationResult::ClientEnter { info }
 }
 
@@ -260,6 +259,19 @@ mod tests {
             &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
             &mut clients,
         ));
+        // Guard against a vacuous pass: the patch really was buffered.
+        assert_eq!(
+            clients
+                .take_pending_client_updates(5)
+                .expect("buffered")
+                .len(),
+            2 // clid + client_input_muted
+        );
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
+            &mut clients,
+        ));
 
         // The enterview payload describes the client as of now.
         handle_client_enter_view(
@@ -275,7 +287,7 @@ mod tests {
         let stored = clients.client(5).expect("client");
         assert_eq!(stored.nickname, "newcomer");
         assert_eq!(stored.input_muted, Some(false));
-        assert!(clients.take_pending_client_updates(5).is_empty());
+        assert!(clients.take_pending_client_updates(5).is_none());
     }
 
     #[test]
