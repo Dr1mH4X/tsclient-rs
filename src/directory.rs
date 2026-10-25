@@ -27,6 +27,10 @@ pub(crate) struct DirectoryCache {
     /// first carries newer state than the row that follows it; the row path
     /// replays the patch on insert. Dropped once the welcome finishes.
     pending_client_updates: HashMap<i32, HashMap<String, String>>,
+    /// Server group adds/deletes for unknown welcome clients, coalesced per
+    /// client to the last operation per group id. Replayed after the update
+    /// patch.
+    pending_group_ops: HashMap<i32, HashMap<String, bool>>,
     /// Clients a live event removed, welcome or live: a left view cannot be
     /// undone by a late `channelclientlist` row still in flight.
     departed_clients: HashSet<i32>,
@@ -68,6 +72,38 @@ impl DirectoryCache {
         id: i32,
     ) -> Option<HashMap<String, String>> {
         self.pending_client_updates.remove(&id)
+    }
+
+    /// Buffer a server group add/delete for a client the welcome has not
+    /// introduced yet; the last operation per group id wins.
+    fn buffer_pending_group_op(&mut self, id: i32, sgid: String, add: bool) {
+        if self.welcome_complete {
+            return;
+        }
+        match self.pending_group_ops.get_mut(&id) {
+            Some(ops) => {
+                ops.insert(sgid, add);
+            }
+            None => {
+                if self.pending_group_ops.len() >= MAX_PENDING_CLIENT_UPDATES {
+                    self.truncated = true;
+                    return;
+                }
+                self.pending_group_ops.insert(id, HashMap::from([(sgid, add)]));
+            }
+        }
+    }
+
+    /// Remove and return the group operations buffered for `id`.
+    pub(crate) fn take_pending_group_ops(&mut self, id: i32) -> HashMap<String, bool> {
+        self.pending_group_ops.remove(&id).unwrap_or_default()
+    }
+
+    /// Drop buffered welcome state for a client whose payload is newer (an
+    /// enterview) or that is gone (a left view).
+    pub(crate) fn discard_pending_welcome_state(&mut self, id: i32) {
+        self.pending_client_updates.remove(&id);
+        self.pending_group_ops.remove(&id);
     }
 
     /// Whether a live event removed this client, so a late welcome row must
@@ -133,7 +169,7 @@ impl DirectoryCache {
     }
 
     pub(crate) fn remove_client(&mut self, id: i32) -> bool {
-        self.pending_client_updates.remove(&id);
+        self.discard_pending_welcome_state(id);
         // A client seen leaving must not come back through a welcome or
         // query row still in flight; enterview reinsertion is unaffected.
         if self.departed_clients.len() < MAX_DIRECTORY_ENTRIES {
@@ -258,6 +294,7 @@ impl DirectoryCache {
         self.welcome_complete = false;
         self.truncated = false;
         self.pending_client_updates.clear();
+        self.pending_group_ops.clear();
         self.departed_clients.clear();
     }
 
@@ -297,6 +334,7 @@ impl DirectoryCache {
         }
         self.welcome_complete = true;
         self.pending_client_updates.clear();
+        self.pending_group_ops.clear();
     }
 
     fn index_channel(&mut self, parent_id: u64, channel_id: u64, predecessor: u64) {
@@ -567,6 +605,16 @@ pub(crate) fn apply_client_notification(
     if directory.client(id).is_none() {
         if name == "notifyclientupdated" {
             directory.buffer_pending_client_update(id, params);
+        } else if name == "notifyservergroupclientadded"
+            || name == "notifyservergroupclientdeleted"
+        {
+            if let Some(group_id) = params.get("sgid").filter(|value| !value.is_empty()) {
+                directory.buffer_pending_group_op(
+                    id,
+                    group_id.clone(),
+                    name == "notifyservergroupclientadded",
+                );
+            }
         }
         return None;
     }
@@ -890,6 +938,46 @@ mod tests {
             &mut directory,
         ).is_none());
         assert!(directory.take_pending_client_updates(9).is_none());
+    }
+
+    #[test]
+    fn pending_group_ops_coalesce_per_client() {
+        let mut directory = DirectoryCache::default();
+        // The last operation per group id wins; different ids are independent.
+        assert!(apply_client_notification(
+            "notifyservergroupclientadded",
+            &row(&[("clid", "12"), ("sgid", "8")]),
+            &mut directory,
+        )
+        .is_none());
+        assert!(apply_client_notification(
+            "notifyservergroupclientdeleted",
+            &row(&[("clid", "12"), ("sgid", "8")]),
+            &mut directory,
+        )
+        .is_none());
+        assert!(apply_client_notification(
+            "notifyservergroupclientadded",
+            &row(&[("clid", "12"), ("sgid", "9")]),
+            &mut directory,
+        )
+        .is_none());
+
+        let ops = directory.take_pending_group_ops(12);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops.get("8"), Some(&false));
+        assert_eq!(ops.get("9"), Some(&true));
+        assert!(directory.take_pending_group_ops(12).is_empty());
+
+        // Once the welcome finishes, buffered group operations are dropped.
+        assert!(apply_client_notification(
+            "notifyservergroupclientadded",
+            &row(&[("clid", "13"), ("sgid", "8")]),
+            &mut directory,
+        )
+        .is_none());
+        directory.finish_welcome();
+        assert!(directory.take_pending_group_ops(13).is_empty());
     }
 
     #[test]
