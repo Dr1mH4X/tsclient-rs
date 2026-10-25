@@ -7,6 +7,9 @@ use crate::types::{ChannelInfo, ClientInfo, DirectorySnapshot};
 
 const MAX_DIRECTORY_ENTRIES: usize = u16::MAX as usize;
 const MAX_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
+/// Bound on clients with buffered welcome updates; past it the updates are
+/// dropped and the affected flags stay stale until the next client update.
+const MAX_PENDING_CLIENT_UPDATES: usize = 1024;
 
 /// The bounded cache behind the live directory.
 #[derive(Default)]
@@ -18,6 +21,15 @@ pub(crate) struct DirectoryCache {
     client_bytes: usize,
     welcome_complete: bool,
     truncated: bool,
+    /// `notifyclientupdated` rows for clients the welcome has not introduced
+    /// yet, coalesced to one patch per client: a `channelclientlist` row is a
+    /// snapshot from before the rows were sent, so an update that arrives
+    /// first carries newer state than the row that follows it; the row path
+    /// replays the patch on insert. Dropped once the welcome finishes.
+    pending_client_updates: HashMap<i32, HashMap<String, String>>,
+    /// Clients a live event removed, welcome or live: a left view cannot be
+    /// undone by a late `channelclientlist` row still in flight.
+    departed_clients: HashSet<i32>,
 }
 
 impl DirectoryCache {
@@ -27,6 +39,41 @@ impl DirectoryCache {
 
     pub(crate) fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Buffer a `notifyclientupdated` row for a client the welcome has not
+    /// introduced yet, so the client's `channelclientlist` row can replay it.
+    /// Updates for an already buffered id always merge — the cap bounds
+    /// distinct clients only; a dropped new id sets `truncated`, so the
+    /// snapshot reports the loss.
+    fn buffer_pending_client_update(&mut self, id: i32, params: &HashMap<String, String>) {
+        if self.welcome_complete {
+            return;
+        }
+        match self.pending_client_updates.get_mut(&id) {
+            Some(patch) => patch.extend(params.clone()),
+            None => {
+                if self.pending_client_updates.len() >= MAX_PENDING_CLIENT_UPDATES {
+                    self.truncated = true;
+                    return;
+                }
+                self.pending_client_updates.insert(id, params.clone());
+            }
+        }
+    }
+
+    /// Remove and return the update patch buffered for `id`.
+    pub(crate) fn take_pending_client_updates(
+        &mut self,
+        id: i32,
+    ) -> Option<HashMap<String, String>> {
+        self.pending_client_updates.remove(&id)
+    }
+
+    /// Whether a live event removed this client, so a late welcome row must
+    /// not resurrect it.
+    pub(crate) fn client_departed(&self, id: i32) -> bool {
+        self.departed_clients.contains(&id)
     }
 
     pub(crate) fn insert_channel(&mut self, mut channel: ChannelInfo) -> bool {
@@ -86,6 +133,12 @@ impl DirectoryCache {
     }
 
     pub(crate) fn remove_client(&mut self, id: i32) -> bool {
+        self.pending_client_updates.remove(&id);
+        // A client seen leaving must not come back through a welcome or
+        // query row still in flight; enterview reinsertion is unaffected.
+        if self.departed_clients.len() < MAX_DIRECTORY_ENTRIES {
+            self.departed_clients.insert(id);
+        }
         let Some(client) = self.clients.remove(&id) else {
             return false;
         };
@@ -204,6 +257,8 @@ impl DirectoryCache {
         self.client_bytes = 0;
         self.welcome_complete = false;
         self.truncated = false;
+        self.pending_client_updates.clear();
+        self.departed_clients.clear();
     }
 
     pub(crate) fn finish_welcome(&mut self) {
@@ -241,6 +296,7 @@ impl DirectoryCache {
             self.settle_channel_orders(parent_id);
         }
         self.welcome_complete = true;
+        self.pending_client_updates.clear();
     }
 
     fn index_channel(&mut self, parent_id: u64, channel_id: u64, predecessor: u64) {
@@ -488,6 +544,11 @@ pub fn parse_client(params: &HashMap<String, String>) -> Option<ClientInfo> {
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or(0),
         server_groups,
+        away: parse_bool(params.get("client_away")),
+        away_message: params.get("client_away_message").cloned(),
+        input_muted: parse_bool(params.get("client_input_muted")),
+        output_muted: parse_bool(params.get("client_output_muted")),
+        channel_commander: parse_bool(params.get("client_is_channel_commander")),
     })
 }
 
@@ -501,6 +562,9 @@ pub(crate) fn apply_client_notification(
         return false;
     };
     if directory.client(id).is_none() {
+        if name == "notifyclientupdated" {
+            directory.buffer_pending_client_update(id, params);
+        }
         return false;
     }
     if name == "notifyservergroupclientadded" || name == "notifyservergroupclientdeleted" {
@@ -574,6 +638,36 @@ pub(crate) fn apply_client_notification(
                 changed = true;
             }
         }
+        if let Some(value) = parse_bool(params.get("client_away")) {
+            if current.away != Some(value) {
+                current.away = Some(value);
+                changed = true;
+            }
+        }
+        if let Some(value) = params.get("client_away_message") {
+            if current.away_message.as_deref() != Some(value.as_str()) {
+                current.away_message = Some(value.clone());
+                changed = true;
+            }
+        }
+        if let Some(value) = parse_bool(params.get("client_input_muted")) {
+            if current.input_muted != Some(value) {
+                current.input_muted = Some(value);
+                changed = true;
+            }
+        }
+        if let Some(value) = parse_bool(params.get("client_output_muted")) {
+            if current.output_muted != Some(value) {
+                current.output_muted = Some(value);
+                changed = true;
+            }
+        }
+        if let Some(value) = parse_bool(params.get("client_is_channel_commander")) {
+            if current.channel_commander != Some(value) {
+                current.channel_commander = Some(value);
+                changed = true;
+            }
+        }
         changed
     })
 }
@@ -597,7 +691,7 @@ fn parse_server_groups(value: &str) -> Vec<String> {
     value.split(',').map(ToOwned::to_owned).collect()
 }
 
-fn parse_bool(value: Option<&String>) -> Option<bool> {
+pub(crate) fn parse_bool(value: Option<&String>) -> Option<bool> {
     match value.map(String::as_str) {
         Some("0") => Some(false),
         Some("1") => Some(true),
@@ -618,6 +712,7 @@ fn client_size(client: &ClientInfo) -> usize {
             .iter()
             .map(|group| size_of::<String>() + group.len())
             .sum::<usize>()
+        + client.away_message.as_deref().map_or(0, str::len)
 }
 
 fn ordered_channels_from_index(
@@ -736,6 +831,88 @@ mod tests {
         assert_eq!(channel.max_clients, Some(25));
         assert_eq!(channel.max_clients_limited, Some(true));
         assert_eq!(channel.codec, Some(5));
+    }
+
+    #[test]
+    fn welcome_updates_coalesce_per_client() {
+        let mut directory = DirectoryCache::default();
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_input_muted", "1"), ("client_away", "1")]),
+            &mut directory,
+        ));
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_input_muted", "0"), ("client_away_message", "brb")]),
+            &mut directory,
+        ));
+        assert!(directory.client(7).is_none());
+
+        let patch = directory.take_pending_client_updates(7).expect("patch");
+        assert_eq!(patch.len(), 4); // clid + the three state keys
+        assert_eq!(patch.get("clid").map(String::as_str), Some("7"));
+        assert_eq!(
+            patch.get("client_input_muted").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(patch.get("client_away").map(String::as_str), Some("1"));
+        assert_eq!(
+            patch.get("client_away_message").map(String::as_str),
+            Some("brb")
+        );
+        assert!(directory.take_pending_client_updates(7).is_none());
+
+        // Non-update notifications for unknown clients are not buffered.
+        assert!(!apply_client_notification(
+            "notifyclientmoved",
+            &row(&[("clid", "7"), ("ctid", "3")]),
+            &mut directory,
+        ));
+        assert!(directory.take_pending_client_updates(7).is_none());
+
+        // Once the welcome finishes, updates for unknown clients are dropped.
+        directory.finish_welcome();
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "9"), ("client_away", "1")]),
+            &mut directory,
+        ));
+        assert!(directory.take_pending_client_updates(9).is_none());
+    }
+
+    #[test]
+    fn pending_update_overflow_sets_truncated_but_keeps_buffered_clients() {
+        let mut directory = DirectoryCache::default();
+        for id in 1..=MAX_PENDING_CLIENT_UPDATES as i32 {
+            let clid = id.to_string();
+            assert!(!apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", &clid), ("client_away", "1")]),
+                &mut directory,
+            ));
+        }
+        assert!(!directory.truncated());
+
+        // A new id past the cap is dropped, and the snapshot reports the loss.
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "20000"), ("client_away", "1")]),
+            &mut directory,
+        ));
+        assert!(directory.take_pending_client_updates(20000).is_none());
+        assert!(directory.truncated());
+
+        // An already buffered id keeps merging past the cap.
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "1"), ("client_input_muted", "1")]),
+            &mut directory,
+        ));
+        let patch = directory.take_pending_client_updates(1).expect("patch");
+        assert_eq!(
+            patch.get("client_input_muted").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
@@ -879,6 +1056,36 @@ mod tests {
         assert_eq!(client.uid, "uid");
         assert_eq!(client.channel_id, 42);
         assert_eq!(client.server_groups, vec!["6", "9"]);
+        assert_eq!(client.away, None);
+        assert_eq!(client.input_muted, None);
+
+        assert!(apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_input_muted", "1")]),
+            &mut directory,
+        ));
+        let client = directory.client(7).expect("client");
+        assert_eq!(client.input_muted, Some(true));
+        assert_eq!(client.output_muted, None);
+        assert_eq!(client.nickname, "Alicia");
+        assert_eq!(client.channel_id, 42);
+
+        assert!(apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_input_muted", "0")]),
+            &mut directory,
+        ));
+        assert_eq!(
+            directory.client(7).expect("client").input_muted,
+            Some(false)
+        );
+
+        assert!(apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_away", "1")]),
+            &mut directory,
+        ));
+        assert_eq!(directory.client(7).expect("client").away, Some(true));
 
         assert!(apply_client_notification(
             "notifyclientupdated",
@@ -907,6 +1114,17 @@ mod tests {
             &mut directory,
         ));
         assert!(directory.client(7).expect("client").server_groups.is_empty());
+
+        // A groups-only update leaves previously set flags alone.
+        assert!(apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_servergroups", "6")]),
+            &mut directory,
+        ));
+        let client = directory.client(7).expect("client");
+        assert_eq!(client.server_groups, vec!["6"]);
+        assert_eq!(client.input_muted, Some(false));
+        assert_eq!(client.away, Some(true));
     }
 
     #[test]
@@ -937,6 +1155,11 @@ mod tests {
                 channel_id: 1,
                 r#type: 0,
                 server_groups: Vec::new(),
+                away: None,
+                away_message: None,
+                input_muted: None,
+                output_muted: None,
+                channel_commander: None,
             }));
         }
         directory.finish_welcome();

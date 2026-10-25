@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::command::{build_command, build_command_ordered, unescape};
-use crate::directory::parse_channel;
+use crate::directory::{parse_bool, parse_channel};
 use crate::helpers;
 use crate::types::*;
 use crate::Client;
@@ -94,6 +94,11 @@ pub async fn list_clients(client: &Client) -> Result<Vec<ClientInfo>, Error> {
                 channel_id: helpers::parse_u64(item.get("cid").map(|s| s.as_str()).unwrap_or("0")),
                 r#type: helpers::parse_i10(item.get("client_type").map(|s| s.as_str()).unwrap_or("0")),
                 server_groups,
+                away: parse_bool(item.get("client_away")),
+                away_message: item.get("client_away_message").cloned(),
+                input_muted: parse_bool(item.get("client_input_muted")),
+                output_muted: parse_bool(item.get("client_output_muted")),
+                channel_commander: parse_bool(item.get("client_is_channel_commander")),
             }
         })
         .collect())

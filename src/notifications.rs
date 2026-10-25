@@ -62,12 +62,19 @@ fn handle_client_enter_view(
         channel_id: 0,
         r#type: 0,
         server_groups: Vec::new(),
+        away: None,
+        away_message: None,
+        input_muted: None,
+        output_muted: None,
+        channel_commander: None,
     });
 
     if info.id != 0 {
         clients.insert_client(info.clone());
+        // An enterview payload describes the client as of now, newer than
+        // any update buffered while the client was unknown.
+        let _ = clients.take_pending_client_updates(info.id);
     }
-
     NotificationResult::ClientEnter { info }
 }
 
@@ -195,6 +202,7 @@ fn handle_client_poked(params: &HashMap<String, String>) -> NotificationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::directory::apply_client_notification;
 
     fn make_params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -219,9 +227,67 @@ mod tests {
                 assert_eq!(info.nickname, "testuser");
                 assert_eq!(info.server_groups, vec!["1", "2", "3"]);
                 assert_eq!(clients.client(42).expect("client").nickname, "testuser");
+                assert_eq!(info.input_muted, None);
             }
             _ => panic!("expected ClientEnter"),
         }
+
+        let muted = make_params(&[
+            ("clid", "43"),
+            ("ctid", "100"),
+            ("client_nickname", "muted"),
+            ("client_input_muted", "1"),
+            ("client_away", "0"),
+            ("client_away_message", "brb"),
+            ("client_is_channel_commander", "1"),
+        ]);
+        handle_client_enter_view(&muted, &mut clients, "testuser");
+        let stored = clients.client(43).expect("client");
+        assert_eq!(stored.input_muted, Some(true));
+        assert_eq!(stored.output_muted, None);
+        assert_eq!(stored.away, Some(false));
+        assert_eq!(stored.away_message.as_deref(), Some("brb"));
+        assert_eq!(stored.channel_commander, Some(true));
+    }
+
+    #[test]
+    fn enterview_supersedes_buffered_welcome_updates() {
+        let mut clients = DirectoryCache::default();
+        // The update names a client the welcome has not introduced yet.
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
+            &mut clients,
+        ));
+        // Guard against a vacuous pass: the patch really was buffered.
+        assert_eq!(
+            clients
+                .take_pending_client_updates(5)
+                .expect("buffered")
+                .len(),
+            2 // clid + client_input_muted
+        );
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
+            &mut clients,
+        ));
+
+        // The enterview payload describes the client as of now.
+        handle_client_enter_view(
+            &make_params(&[
+                ("clid", "5"),
+                ("ctid", "1"),
+                ("client_nickname", "newcomer"),
+                ("client_input_muted", "0"),
+            ]),
+            &mut clients,
+            "bot",
+        );
+        let stored = clients.client(5).expect("client");
+        assert_eq!(stored.nickname, "newcomer");
+        assert_eq!(stored.input_muted, Some(false));
+        assert!(clients.take_pending_client_updates(5).is_none());
     }
 
     #[test]
@@ -234,6 +300,11 @@ mod tests {
             server_groups: vec![],
             channel_id: 100,
             r#type: 0,
+            away: None,
+            away_message: None,
+            input_muted: None,
+            output_muted: None,
+            channel_commander: None,
         }));
         let params = make_params(&[
             ("clid", "42"),
@@ -261,6 +332,11 @@ mod tests {
             server_groups: vec!["1".into()],
             channel_id: 0,
             r#type: 0,
+            away: None,
+            away_message: None,
+            input_muted: None,
+            output_muted: None,
+            channel_commander: None,
         }));
         let params = make_params(&[
             ("invokerid", "10"),
