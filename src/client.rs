@@ -358,7 +358,18 @@ impl ClientInner {
             "channelclientlist" => {
                 let was_truncated = self.directory.truncated();
                 if let Some(client) = server_directory::parse_client(&cmd.params) {
-                    let changed = self.directory.insert_client(client);
+                    let id = client.id;
+                    let mut changed = self.directory.insert_client(client);
+                    // The row is a snapshot from before it was sent; replay
+                    // updates that arrived for this client while it was
+                    // still unknown.
+                    for params in self.directory.take_pending_client_updates(id) {
+                        changed |= server_directory::apply_client_notification(
+                            "notifyclientupdated",
+                            &params,
+                            &mut self.directory,
+                        );
+                    }
                     if (changed || (!was_truncated && self.directory.truncated()))
                         && self.directory_ready
                     {
@@ -1459,6 +1470,44 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn welcome_updates_replay_when_the_client_row_arrives() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client.inner.lock().unwrap().status = ClientStatus::Connecting;
+
+        // The update names a client the welcome has not introduced yet.
+        client.inner.lock().unwrap().handle_command_str(
+            "notifyclientupdated clid=7 client_input_muted=1 client_away=1 client_away_message=brb",
+            &sender,
+        );
+        assert!(client.inner.lock().unwrap().directory.client(7).is_none());
+
+        // The row is the batch snapshot from before the update was sent.
+        client.inner.lock().unwrap().handle_command_str(
+            "channelclientlist clid=7 cid=3 client_nickname=Alice client_input_muted=0",
+            &sender,
+        );
+        let stored = client
+            .inner
+            .lock()
+            .unwrap()
+            .directory
+            .client(7)
+            .expect("client")
+            .clone();
+        assert_eq!(stored.nickname, "Alice");
+        assert_eq!(stored.channel_id, 3);
+        assert_eq!(stored.input_muted, Some(true));
+        assert_eq!(stored.away, Some(true));
+        assert_eq!(stored.away_message.as_deref(), Some("brb"));
     }
 
     #[tokio::test]

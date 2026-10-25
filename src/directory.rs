@@ -7,6 +7,9 @@ use crate::types::{ChannelInfo, ClientInfo, DirectorySnapshot};
 
 const MAX_DIRECTORY_ENTRIES: usize = u16::MAX as usize;
 const MAX_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
+/// Bound on clients with buffered welcome updates; past it the updates are
+/// dropped and the affected flags stay stale until the next client update.
+const MAX_PENDING_CLIENT_UPDATES: usize = 1024;
 
 /// The bounded cache behind the live directory.
 #[derive(Default)]
@@ -18,6 +21,12 @@ pub(crate) struct DirectoryCache {
     client_bytes: usize,
     welcome_complete: bool,
     truncated: bool,
+    /// `notifyclientupdated` rows for clients the welcome has not introduced
+    /// yet. A `channelclientlist` row is a snapshot from before the rows were
+    /// sent, so an update that arrives first carries newer state than the
+    /// row that follows it; the row path replays these on insert. Dropped
+    /// once the welcome finishes.
+    pending_client_updates: HashMap<i32, Vec<HashMap<String, String>>>,
 }
 
 impl DirectoryCache {
@@ -27,6 +36,25 @@ impl DirectoryCache {
 
     pub(crate) fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Buffer a `notifyclientupdated` row for a client the welcome has not
+    /// introduced yet, so the client's `channelclientlist` row can replay it.
+    fn buffer_pending_client_update(&mut self, id: i32, params: &HashMap<String, String>) {
+        if self.welcome_complete
+            || self.pending_client_updates.len() >= MAX_PENDING_CLIENT_UPDATES
+        {
+            return;
+        }
+        self.pending_client_updates
+            .entry(id)
+            .or_default()
+            .push(params.clone());
+    }
+
+    /// Remove and return the updates buffered for `id`.
+    pub(crate) fn take_pending_client_updates(&mut self, id: i32) -> Vec<HashMap<String, String>> {
+        self.pending_client_updates.remove(&id).unwrap_or_default()
     }
 
     pub(crate) fn insert_channel(&mut self, mut channel: ChannelInfo) -> bool {
@@ -86,6 +114,7 @@ impl DirectoryCache {
     }
 
     pub(crate) fn remove_client(&mut self, id: i32) -> bool {
+        self.pending_client_updates.remove(&id);
         let Some(client) = self.clients.remove(&id) else {
             return false;
         };
@@ -204,6 +233,7 @@ impl DirectoryCache {
         self.client_bytes = 0;
         self.welcome_complete = false;
         self.truncated = false;
+        self.pending_client_updates.clear();
     }
 
     pub(crate) fn finish_welcome(&mut self) {
@@ -241,6 +271,7 @@ impl DirectoryCache {
             self.settle_channel_orders(parent_id);
         }
         self.welcome_complete = true;
+        self.pending_client_updates.clear();
     }
 
     fn index_channel(&mut self, parent_id: u64, channel_id: u64, predecessor: u64) {
@@ -506,6 +537,9 @@ pub(crate) fn apply_client_notification(
         return false;
     };
     if directory.client(id).is_none() {
+        if name == "notifyclientupdated" {
+            directory.buffer_pending_client_update(id, params);
+        }
         return false;
     }
     if name == "notifyservergroupclientadded" || name == "notifyservergroupclientdeleted" {
@@ -772,6 +806,36 @@ mod tests {
         assert_eq!(channel.max_clients, Some(25));
         assert_eq!(channel.max_clients_limited, Some(true));
         assert_eq!(channel.codec, Some(5));
+    }
+
+    #[test]
+    fn welcome_updates_buffer_for_unknown_clients_until_taken() {
+        let mut directory = DirectoryCache::default();
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_input_muted", "1")]),
+            &mut directory,
+        ));
+        assert!(directory.client(7).is_none());
+        assert_eq!(directory.take_pending_client_updates(7).len(), 1);
+        assert!(directory.take_pending_client_updates(7).is_empty());
+
+        // Non-update notifications for unknown clients are not buffered.
+        assert!(!apply_client_notification(
+            "notifyclientmoved",
+            &row(&[("clid", "7"), ("ctid", "3")]),
+            &mut directory,
+        ));
+        assert!(directory.take_pending_client_updates(7).is_empty());
+
+        // Once the welcome finishes, updates for unknown clients are dropped.
+        directory.finish_welcome();
+        assert!(!apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "9"), ("client_away", "1")]),
+            &mut directory,
+        ));
+        assert!(directory.take_pending_client_updates(9).is_empty());
     }
 
     #[test]
