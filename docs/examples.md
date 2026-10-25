@@ -23,6 +23,16 @@ async fn main() -> Result<(), tsclient_rs::Error> {
         }
     }));
 
+    // Per-client state changes (mute, away, groups) arrive as events, so a
+    // consumer never has to poll the directory.
+    client.on_client_updated(Arc::new(|event| {
+        if let Event::ClientUpdated(info) = event {
+            if info.input_muted == Some(true) {
+                println!("{} muted their microphone", info.nickname);
+            }
+        }
+    }));
+
     client.connect().await?;
     client.wait_connected(None).await?;
     client.wait_directory_ready(None).await?;

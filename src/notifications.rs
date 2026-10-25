@@ -72,8 +72,8 @@ fn handle_client_enter_view(
     if info.id != 0 {
         clients.insert_client(info.clone());
         // An enterview payload describes the client as of now, newer than
-        // any update buffered while the client was unknown.
-        let _ = clients.take_pending_client_updates(info.id);
+        // anything buffered while the client was unknown.
+        clients.discard_pending_welcome_state(info.id);
     }
     NotificationResult::ClientEnter { info }
 }
@@ -254,11 +254,11 @@ mod tests {
     fn enterview_supersedes_buffered_welcome_updates() {
         let mut clients = DirectoryCache::default();
         // The update names a client the welcome has not introduced yet.
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
             &mut clients,
-        ));
+        ).is_none());
         // Guard against a vacuous pass: the patch really was buffered.
         assert_eq!(
             clients
@@ -267,11 +267,17 @@ mod tests {
                 .len(),
             2 // clid + client_input_muted
         );
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
             &mut clients,
-        ));
+        ).is_none());
+        // Buffered group operations are superseded as well.
+        assert!(apply_client_notification(
+            "notifyservergroupclientadded",
+            &make_params(&[("clid", "5"), ("sgid", "8")]),
+            &mut clients,
+        ).is_none());
 
         // The enterview payload describes the client as of now.
         handle_client_enter_view(
@@ -288,6 +294,7 @@ mod tests {
         assert_eq!(stored.nickname, "newcomer");
         assert_eq!(stored.input_muted, Some(false));
         assert!(clients.take_pending_client_updates(5).is_none());
+        assert!(clients.take_pending_group_ops(5).is_empty());
     }
 
     #[test]

@@ -147,6 +147,7 @@ pub struct VoiceData {
 pub enum Event {
     TextMessage(TextMessage),
     ClientEnter(ClientInfo),
+    ClientUpdated(ClientInfo),
     ClientLeave(ClientLeftViewEvent),
     ClientMoved(ClientMovedEvent),
     DirectorySnapshot(DirectorySnapshot),

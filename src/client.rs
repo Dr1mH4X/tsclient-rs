@@ -1,6 +1,6 @@
 //! Client lifecycle & connection management — mirrors `teamspeak-js/src/client.ts`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -125,11 +125,71 @@ impl OrderedDirectoryHandler {
     }
 }
 
+/// Cap on updates queued per handler; past it the oldest update is dropped.
+/// Each event carries the full record, so consumers still converge, and the
+/// coalesced `DirectorySnapshot` event carries the whole state regardless.
+const MAX_QUEUED_CLIENT_UPDATES: usize = 256;
+
+/// Delivers client updates to one handler in dispatch order: a drain task
+/// pops a bounded FIFO, so an older record can never overtake a newer one
+/// and a slow handler cannot accumulate unbounded work.
+struct SerialEventHandler {
+    handler: EventHandler,
+    pending: Arc<Mutex<VecDeque<ClientInfo>>>,
+    wake: Arc<Notify>,
+    started: bool,
+}
+
+impl SerialEventHandler {
+    fn new(handler: EventHandler) -> Self {
+        Self {
+            handler,
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            wake: Arc::new(Notify::new()),
+            started: false,
+        }
+    }
+
+    fn enqueue(&mut self, info: ClientInfo) {
+        if !self.started {
+            self.started = true;
+            self.start();
+        }
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.len() >= MAX_QUEUED_CLIENT_UPDATES {
+                pending.pop_front();
+            }
+            pending.push_back(info);
+        }
+        self.wake.notify_one();
+    }
+
+    fn start(&mut self) {
+        let handler = Arc::clone(&self.handler);
+        let pending = Arc::clone(&self.pending);
+        let wake = Arc::clone(&self.wake);
+        tokio::spawn(async move {
+            loop {
+                wake.notified().await;
+                loop {
+                    let next = pending.lock().unwrap().pop_front();
+                    let Some(info) = next else { break };
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        handler(Event::ClientUpdated(info));
+                    }));
+                }
+            }
+        });
+    }
+}
+
 // ---- Event handler storage ------------------------------------------------------
 
 struct EventHandlers {
     text_message: Vec<EventHandler>,
     client_enter: Vec<EventHandler>,
+    client_updated: Vec<SerialEventHandler>,
     client_leave: Vec<EventHandler>,
     client_moved: Vec<EventHandler>,
     directory_snapshot: Vec<OrderedDirectoryHandler>,
@@ -145,6 +205,7 @@ impl EventHandlers {
         Self {
             text_message: Vec::new(),
             client_enter: Vec::new(),
+            client_updated: Vec::new(),
             client_leave: Vec::new(),
             client_moved: Vec::new(),
             directory_snapshot: Vec::new(),
@@ -315,7 +376,7 @@ impl ClientInner {
                 &cmd.params,
                 &mut self.directory,
             );
-            let client_changed = server_directory::apply_client_notification(
+            let updated_client = server_directory::apply_client_notification(
                 &cmd.name,
                 &cmd.params,
                 &mut self.directory,
@@ -328,6 +389,10 @@ impl ClientInner {
                 &self.nickname,
             );
             self.process_notification_result(result, &cmd.params, sender);
+            let client_changed = updated_client.is_some();
+            if let Some(info) = updated_client {
+                self.dispatch_event(Event::ClientUpdated(info));
+            }
             if channel_changed || client_changed || (!was_truncated && self.directory.truncated())
             {
                 self.mark_directory_changed();
@@ -369,11 +434,33 @@ impl ClientInner {
                     {
                         changed = self.directory.insert_client(client);
                         if let Some(params) = self.directory.take_pending_client_updates(id) {
-                            changed |= server_directory::apply_client_notification(
+                            if let Some(info) = server_directory::apply_client_notification(
                                 "notifyclientupdated",
                                 &params,
                                 &mut self.directory,
-                            );
+                            ) {
+                                changed = true;
+                                self.dispatch_event(Event::ClientUpdated(info));
+                            }
+                        }
+                        for (sgid, add) in self.directory.take_pending_group_ops(id) {
+                            let name = if add {
+                                "notifyservergroupclientadded"
+                            } else {
+                                "notifyservergroupclientdeleted"
+                            };
+                            let op = HashMap::from([
+                                ("clid".to_string(), id.to_string()),
+                                ("sgid".to_string(), sgid),
+                            ]);
+                            if let Some(info) = server_directory::apply_client_notification(
+                                name,
+                                &op,
+                                &mut self.directory,
+                            ) {
+                                changed = true;
+                                self.dispatch_event(Event::ClientUpdated(info));
+                            }
                         }
                     }
                     if (changed || (!was_truncated && self.directory.truncated()))
@@ -532,6 +619,11 @@ impl ClientInner {
                         let h = Arc::clone(h);
                         let i = info.clone();
                         tokio::spawn(async move { h(Event::ClientEnter(i)); });
+                    }
+                }
+                Event::ClientUpdated(info) => {
+                    for handler in &mut self.event_handlers.client_updated {
+                        handler.enqueue(info.clone());
                     }
                 }
                 Event::ClientLeave(evt) => {
@@ -1044,6 +1136,11 @@ impl Client {
         self
     }
 
+    pub fn on_client_updated(&self, handler: EventHandler) -> &Self {
+        self.inner.lock().unwrap().event_handlers.client_updated.push(SerialEventHandler::new(handler));
+        self
+    }
+
     pub fn on_client_leave(&self, handler: EventHandler) -> &Self {
         self.inner.lock().unwrap().event_handlers.client_leave.push(handler);
         self
@@ -1489,6 +1586,19 @@ mod tests {
         let sender = client.handler.lock().unwrap().create_packet_sender();
         client.inner.lock().unwrap().status = ClientStatus::Connecting;
 
+        let updated_seen = Arc::new(Mutex::new(Vec::new()));
+        let (ev_tx, ev_rx) = oneshot::channel();
+        let ev_tx = Arc::new(Mutex::new(Some(ev_tx)));
+        let handler_seen = Arc::clone(&updated_seen);
+        client.on_client_updated(Arc::new(move |event| {
+            if let Event::ClientUpdated(info) = event {
+                handler_seen.lock().unwrap().push(info);
+            }
+            if let Some(done) = ev_tx.lock().unwrap().take() {
+                let _ = done.send(());
+            }
+        }));
+
         // The update names a client the welcome has not introduced yet.
         client.inner.lock().unwrap().handle_command_str(
             "notifyclientupdated clid=7 client_input_muted=1 client_away=1 client_away_message=brb",
@@ -1514,6 +1624,14 @@ mod tests {
         assert_eq!(stored.input_muted, Some(true));
         assert_eq!(stored.away, Some(true));
         assert_eq!(stored.away_message.as_deref(), Some("brb"));
+
+        // The replayed patch dispatches the merged state as an event.
+        tokio::time::timeout(Duration::from_secs(1), ev_rx)
+            .await
+            .expect("replayed client updated event")
+            .ok();
+        assert_eq!(updated_seen.lock().unwrap().len(), 1);
+        assert_eq!(updated_seen.lock().unwrap()[0], stored);
     }
 
     #[tokio::test]
@@ -1561,6 +1679,206 @@ mod tests {
             inner.directory.client(9).expect("client").away_message.as_deref(),
             Some("brb away")
         );
+    }
+
+    #[tokio::test]
+    async fn client_updates_dispatch_events() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client.inner.lock().unwrap().status = ClientStatus::Connecting;
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("channelclientlist clid=7 cid=3 client_nickname=Alice", &sender);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+        let handler_seen = Arc::clone(&seen);
+        client.on_client_updated(Arc::new(move |event| {
+            if let Event::ClientUpdated(info) = event {
+                handler_seen.lock().unwrap().push(info);
+            }
+            if let Some(done) = done_tx.lock().unwrap().take() {
+                let _ = done.send(());
+            }
+        }));
+
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyclientupdated clid=7 client_input_muted=1", &sender);
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("client updated event")
+            .ok();
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].id, 7);
+            assert_eq!(seen[0].nickname, "Alice");
+            assert_eq!(seen[0].input_muted, Some(true));
+        }
+
+        // A server group change updates the record and dispatches too.
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyservergroupclientadded clid=7 sgid=8", &sender);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while seen.lock().unwrap().len() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server group event missing"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(seen.lock().unwrap()[1].server_groups, vec!["8"]);
+
+        // Updates for unknown clients dispatch nothing.
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyclientupdated clid=99 client_input_muted=1", &sender);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn welcome_group_ops_replay_when_the_client_row_arrives() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client.inner.lock().unwrap().status = ClientStatus::Connecting;
+
+        // A group change names a client the welcome has not introduced yet.
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyservergroupclientadded clid=7 sgid=8", &sender);
+        assert!(client.inner.lock().unwrap().directory.client(7).is_none());
+
+        // The row arrives without the group membership.
+        client.inner.lock().unwrap().handle_command_str(
+            "channelclientlist clid=7 cid=3 client_nickname=Alice client_servergroups=6",
+            &sender,
+        );
+        assert_eq!(
+            client
+                .inner
+                .lock()
+                .unwrap()
+                .directory
+                .client(7)
+                .expect("client")
+                .server_groups,
+            vec!["6", "8"]
+        );
+    }
+
+    fn client_info(id: i32) -> ClientInfo {
+        ClientInfo {
+            id,
+            nickname: format!("client-{id}"),
+            uid: String::new(),
+            channel_id: 1,
+            r#type: 0,
+            server_groups: Vec::new(),
+            away: None,
+            away_message: None,
+            input_muted: None,
+            output_muted: None,
+            channel_commander: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn client_updated_handlers_run_in_dispatch_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        let handler: EventHandler = {
+            let seen = Arc::clone(&seen);
+            let done_tx = Arc::clone(&done_tx);
+            Arc::new(move |event| {
+                let Event::ClientUpdated(info) = event else {
+                    return;
+                };
+                std::thread::sleep(Duration::from_millis(2));
+                seen.lock().unwrap().push(info.id);
+                if seen.lock().unwrap().len() == 3 {
+                    if let Some(done) = done_tx.lock().unwrap().take() {
+                        let _ = done.send(());
+                    }
+                }
+            })
+        };
+
+        let mut serial = SerialEventHandler::new(handler);
+        for id in 1..=3 {
+            serial.enqueue(client_info(id));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("client updated handlers did not finish")
+            .ok();
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn slow_handlers_drop_the_oldest_queued_updates() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        let handler: EventHandler = {
+            let seen = Arc::clone(&seen);
+            let done_tx = Arc::clone(&done_tx);
+            Arc::new(move |event| {
+                let Event::ClientUpdated(info) = event else {
+                    return;
+                };
+                std::thread::sleep(Duration::from_millis(1));
+                seen.lock().unwrap().push(info.id);
+                if seen.lock().unwrap().len() == MAX_QUEUED_CLIENT_UPDATES {
+                    if let Some(done) = done_tx.lock().unwrap().take() {
+                        let _ = done.send(());
+                    }
+                }
+            })
+        };
+
+        let mut serial = SerialEventHandler::new(handler);
+        for id in 0..(MAX_QUEUED_CLIENT_UPDATES as i32 + 44) {
+            serial.enqueue(client_info(id));
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), done_rx)
+            .await
+            .expect("bounded queue did not drain")
+            .ok();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), MAX_QUEUED_CLIENT_UPDATES);
+        assert_eq!(seen[0], 44);
+        assert_eq!(*seen.last().unwrap(), MAX_QUEUED_CLIENT_UPDATES as i32 + 43);
     }
 
     #[tokio::test]
