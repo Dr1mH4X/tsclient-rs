@@ -254,11 +254,11 @@ mod tests {
     fn enterview_supersedes_buffered_welcome_updates() {
         let mut clients = DirectoryCache::default();
         // The update names a client the welcome has not introduced yet.
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
             &mut clients,
-        ));
+        ).is_none());
         // Guard against a vacuous pass: the patch really was buffered.
         assert_eq!(
             clients
@@ -267,11 +267,11 @@ mod tests {
                 .len(),
             2 // clid + client_input_muted
         );
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
             &mut clients,
-        ));
+        ).is_none());
 
         // The enterview payload describes the client as of now.
         handle_client_enter_view(

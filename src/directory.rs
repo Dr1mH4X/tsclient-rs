@@ -553,26 +553,29 @@ pub fn parse_client(params: &HashMap<String, String>) -> Option<ClientInfo> {
 }
 
 /// Apply the fields a `notifyclientupdated` row carries to a known client.
+/// Returns the updated record when the entry changed, `None` otherwise —
+/// unknown clients' `notifyclientupdated` rows are buffered for the welcome
+/// replay instead of applied.
 pub(crate) fn apply_client_notification(
     name: &str,
     params: &HashMap<String, String>,
     directory: &mut DirectoryCache,
-) -> bool {
+) -> Option<ClientInfo> {
     let Some(id) = parse_client_id(params) else {
-        return false;
+        return None;
     };
     if directory.client(id).is_none() {
         if name == "notifyclientupdated" {
             directory.buffer_pending_client_update(id, params);
         }
-        return false;
+        return None;
     }
     if name == "notifyservergroupclientadded" || name == "notifyservergroupclientdeleted" {
         let Some(group_id) = params.get("sgid").filter(|value| !value.is_empty()) else {
-            return false;
+            return None;
         };
         let add = name == "notifyservergroupclientadded";
-        return directory.update_client(id, |current| {
+        let changed = directory.update_client(id, |current| {
             if add {
                 if current
                     .server_groups
@@ -591,9 +594,13 @@ pub(crate) fn apply_client_notification(
             }
             true
         });
+        if !changed {
+            return None;
+        }
+        return directory.client(id).cloned();
     }
     if name != "notifyclientupdated" {
-        return false;
+        return None;
     }
     let server_groups = params
         .get("client_servergroups")
@@ -606,7 +613,7 @@ pub(crate) fn apply_client_notification(
         .get("client_type")
         .and_then(|value| value.parse::<i32>().ok());
 
-    directory.update_client(id, |current| {
+    let changed = directory.update_client(id, |current| {
         let mut changed = false;
         if let Some(value) = params.get("client_nickname") {
             if current.nickname.as_str() != value {
@@ -669,7 +676,12 @@ pub(crate) fn apply_client_notification(
             }
         }
         changed
-    })
+    });
+    if changed {
+        directory.client(id).cloned()
+    } else {
+        None
+    }
 }
 
 fn parse_u64(value: &str) -> u64 {
@@ -836,16 +848,16 @@ mod tests {
     #[test]
     fn welcome_updates_coalesce_per_client() {
         let mut directory = DirectoryCache::default();
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &row(&[("clid", "7"), ("client_input_muted", "1"), ("client_away", "1")]),
             &mut directory,
-        ));
-        assert!(!apply_client_notification(
+        ).is_none());
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &row(&[("clid", "7"), ("client_input_muted", "0"), ("client_away_message", "brb")]),
             &mut directory,
-        ));
+        ).is_none());
         assert!(directory.client(7).is_none());
 
         let patch = directory.take_pending_client_updates(7).expect("patch");
@@ -863,20 +875,20 @@ mod tests {
         assert!(directory.take_pending_client_updates(7).is_none());
 
         // Non-update notifications for unknown clients are not buffered.
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientmoved",
             &row(&[("clid", "7"), ("ctid", "3")]),
             &mut directory,
-        ));
+        ).is_none());
         assert!(directory.take_pending_client_updates(7).is_none());
 
         // Once the welcome finishes, updates for unknown clients are dropped.
         directory.finish_welcome();
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &row(&[("clid", "9"), ("client_away", "1")]),
             &mut directory,
-        ));
+        ).is_none());
         assert!(directory.take_pending_client_updates(9).is_none());
     }
 
@@ -885,29 +897,29 @@ mod tests {
         let mut directory = DirectoryCache::default();
         for id in 1..=MAX_PENDING_CLIENT_UPDATES as i32 {
             let clid = id.to_string();
-            assert!(!apply_client_notification(
+            assert!(apply_client_notification(
                 "notifyclientupdated",
                 &row(&[("clid", &clid), ("client_away", "1")]),
                 &mut directory,
-            ));
+            ).is_none());
         }
         assert!(!directory.truncated());
 
         // A new id past the cap is dropped, and the snapshot reports the loss.
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &row(&[("clid", "20000"), ("client_away", "1")]),
             &mut directory,
-        ));
+        ).is_none());
         assert!(directory.take_pending_client_updates(20000).is_none());
         assert!(directory.truncated());
 
         // An already buffered id keeps merging past the cap.
-        assert!(!apply_client_notification(
+        assert!(apply_client_notification(
             "notifyclientupdated",
             &row(&[("clid", "1"), ("client_input_muted", "1")]),
             &mut directory,
-        ));
+        ).is_none());
         let patch = directory.take_pending_client_updates(1).expect("patch");
         assert_eq!(
             patch.get("client_input_muted").map(String::as_str),
@@ -1050,7 +1062,7 @@ mod tests {
             "notifyclientupdated",
             &row(&[("clid", "7"), ("client_nickname", "Alicia")]),
             &mut directory,
-        ));
+        ).is_some());
         let client = directory.client(7).expect("client");
         assert_eq!(client.nickname, "Alicia");
         assert_eq!(client.uid, "uid");
@@ -1063,7 +1075,7 @@ mod tests {
             "notifyclientupdated",
             &row(&[("clid", "7"), ("client_input_muted", "1")]),
             &mut directory,
-        ));
+        ).is_some());
         let client = directory.client(7).expect("client");
         assert_eq!(client.input_muted, Some(true));
         assert_eq!(client.output_muted, None);
@@ -1074,7 +1086,7 @@ mod tests {
             "notifyclientupdated",
             &row(&[("clid", "7"), ("client_input_muted", "0")]),
             &mut directory,
-        ));
+        ).is_some());
         assert_eq!(
             directory.client(7).expect("client").input_muted,
             Some(false)
@@ -1084,26 +1096,26 @@ mod tests {
             "notifyclientupdated",
             &row(&[("clid", "7"), ("client_away", "1")]),
             &mut directory,
-        ));
+        ).is_some());
         assert_eq!(directory.client(7).expect("client").away, Some(true));
 
         assert!(apply_client_notification(
             "notifyclientupdated",
             &row(&[("clid", "7"), ("client_servergroups", "")]),
             &mut directory,
-        ));
+        ).is_some());
         assert!(directory.client(7).expect("client").server_groups.is_empty());
 
         assert!(apply_client_notification(
             "notifyservergroupclientadded",
             &row(&[("clid", "7"), ("sgid", "8")]),
             &mut directory,
-        ));
-        assert!(!apply_client_notification(
+        ).is_some());
+        assert!(apply_client_notification(
             "notifyservergroupclientadded",
             &row(&[("clid", "7"), ("sgid", "8")]),
             &mut directory,
-        ));
+        ).is_none());
         assert_eq!(
             directory.client(7).expect("client").server_groups,
             vec!["8"]
@@ -1112,7 +1124,7 @@ mod tests {
             "notifyservergroupclientdeleted",
             &row(&[("clid", "7"), ("sgid", "8")]),
             &mut directory,
-        ));
+        ).is_some());
         assert!(directory.client(7).expect("client").server_groups.is_empty());
 
         // A groups-only update leaves previously set flags alone.
@@ -1120,7 +1132,7 @@ mod tests {
             "notifyclientupdated",
             &row(&[("clid", "7"), ("client_servergroups", "6")]),
             &mut directory,
-        ));
+        ).is_some());
         let client = directory.client(7).expect("client");
         assert_eq!(client.server_groups, vec!["6"]);
         assert_eq!(client.input_muted, Some(false));
