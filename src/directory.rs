@@ -444,6 +444,7 @@ fn parse_channel_row(
         codec: params
             .get("channel_codec")
             .and_then(|value| value.parse::<i32>().ok()),
+        icon_id: params.get("channel_icon_id").and_then(|value| parse_icon_id(value)),
     })
 }
 
@@ -513,6 +514,12 @@ pub fn apply_channel_notification(
                 let limited = !value;
                 if current.max_clients_limited != Some(limited) {
                     current.max_clients_limited = Some(limited);
+                    changed = true;
+                }
+            }
+            if let Some(value) = params.get("channel_icon_id").and_then(|value| parse_icon_id(value)) {
+                if current.icon_id != Some(value) {
+                    current.icon_id = Some(value);
                     changed = true;
                 }
             }
@@ -730,6 +737,13 @@ pub(crate) fn apply_client_notification(
     } else {
         None
     }
+}
+
+fn parse_icon_id(value: &str) -> Option<u32> {
+    value.parse::<u32>().ok().or_else(|| {
+        // i_icon_id 也会以同一组位的有符号形式出现在协议里。
+        value.parse::<i32>().ok().map(|id| id as u32)
+    })
 }
 
 fn parse_u64(value: &str) -> u64 {
@@ -1337,11 +1351,51 @@ mod tests {
             max_clients: None,
             max_clients_limited: None,
             codec: None,
+            icon_id: None,
         };
 
         assert!(!directory.insert_channel(channel));
         let snapshot = directory.snapshot();
         assert!(snapshot.channels.is_empty());
         assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn channel_icons_keep_unsigned_signed_and_missing_ids() {
+        for (wire, expected) in [
+            ("0", Some(0)),
+            ("4294967295", Some(u32::MAX)),
+            ("-1", Some(u32::MAX)),
+            ("-1285107717", Some(3009859579)),
+            ("4294967296", None),
+            ("-2147483649", None),
+            ("invalid", None),
+        ] {
+            let params = HashMap::from([
+                ("cid".to_string(), "1".to_string()),
+                ("channel_icon_id".to_string(), wire.to_string()),
+            ]);
+            assert_eq!(parse_channel(&params).expect("channel").icon_id, expected);
+        }
+        let params = HashMap::from([("cid".to_string(), "1".to_string())]);
+        assert_eq!(parse_channel(&params).expect("channel").icon_id, None);
+    }
+
+    #[test]
+    fn channel_icon_updates_preserve_omitted_values_and_clear_with_zero() {
+        let mut directory = DirectoryCache::default();
+        let mut params = HashMap::from([
+            ("cid".to_string(), "1".to_string()),
+            ("cpid".to_string(), "0".to_string()),
+            ("channel_icon_id".to_string(), "-1".to_string()),
+        ]);
+        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(u32::MAX));
+        params.remove("channel_icon_id");
+        assert!(!apply_channel_notification("notifychanneledited", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(u32::MAX));
+        params.insert("channel_icon_id".to_string(), "0".to_string());
+        assert!(apply_channel_notification("notifychanneledited", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(0));
     }
 }

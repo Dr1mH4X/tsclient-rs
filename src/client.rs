@@ -1321,6 +1321,16 @@ impl Client {
         transfer::download_file_data(host, info, dest).await
     }
 
+    /// 下载服务器文件区中的自定义图标，限制下载前的声明大小。
+    pub async fn download_icon(
+        &self,
+        host: &str,
+        icon_id: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        crate::api::download_icon(self, host, icon_id, max_bytes).await
+    }
+
     // ---- Internal (package-visible) -------------------------------------------
 
     /// Called by handshake when the server acknowledges our connection.
@@ -1420,6 +1430,7 @@ mod tests {
                 max_clients: None,
                 max_clients_limited: None,
                 codec: None,
+                icon_id: None,
             }],
             clients: Vec::new(),
             truncated: false,
@@ -1484,6 +1495,7 @@ mod tests {
             max_clients: None,
             max_clients_limited: None,
             codec: None,
+            icon_id: None,
         }));
         inner.directory_publication.dirty = false;
         inner.handle_command_str(

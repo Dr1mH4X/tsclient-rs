@@ -170,7 +170,7 @@ let upload_info = client.file_transfer_init_upload(
 // Upload file data
 let file_data = std::fs::read("local_file.txt")?;
 let cursor = Cursor::new(file_data);
-uploadFileData(&upload_info.server_password, &upload_info, cursor).await?;
+uploadFileData("127.0.0.1", &upload_info, cursor).await?;
 
 // Initialize file download
 let download_info = client.file_transfer_init_download(
@@ -181,7 +181,7 @@ let download_info = client.file_transfer_init_download(
 
 // Download file data
 let mut output = Vec::new();
-downloadFileData(&download_info.server_password, &download_info, &mut output).await?;
+downloadFileData("127.0.0.1", &download_info, &mut output).await?;
 
 // Delete server file
 fileTransferDeleteFile(&client, channel_id, "/path/to/file", "").await?;
@@ -221,3 +221,15 @@ impl CommandMiddleware for LogMiddleware {
 
 client.use_command_middleware(vec![Box::new(LogMiddleware)]);
 ```
+
+## 只读频道图标调试
+
+`examples/channel_icons.rs` 从欢迎目录读取频道图标 id，逐个下载唯一的自定义图标；它不上传文件或修改服务器。服务器地址和输出目录从环境变量传入，不会保存身份私钥。
+
+```sh
+TS_ICON_SERVER=127.0.0.1:9987 \
+TS_ICON_OUTPUT_DIR=/tmp/channel-icons \
+cargo run --example channel_icons
+```
+
+文件传输使用与服务器相同的主机；如果连接地址通过 SRV 指向其他主机，可用 `TS_ICON_HOST` 显式指定实际传输主机。下载调用的 `max_bytes` 是应用自身的限制，示例限制每个图标为 1 MiB。

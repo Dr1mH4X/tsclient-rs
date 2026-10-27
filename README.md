@@ -26,6 +26,7 @@ Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.co
 - **Live directory** — Read the channel tree and visible clients from the welcome stream and channel/client events
 - **Voice data** — Send Opus voice packets (codec 4 & 5)
 - **File transfers** — Upload, download, and delete files on the server
+- **频道图标** — 读取实时频道图标 id，并通过文件传输下载自定义图标
 - **Address resolution** — SRV records, TSDNS, and direct address support
 - **Middleware** — Pluggable command and event middleware chains
 - **Built-in rate limiter** — Token-bucket throttling to prevent server-side flood kicks

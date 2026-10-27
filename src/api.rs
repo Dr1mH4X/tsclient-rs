@@ -166,3 +166,38 @@ pub async fn file_transfer_delete_file(
     let cmd = build_command("ftdeletefile", params);
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
+
+/// 图标文件位于频道 0，文件名使用无符号 CRC-32 十进制值。
+pub fn icon_file_name(icon_id: u32) -> String {
+    format!("/icon_{icon_id}")
+}
+
+/// 下载图标；调用者提供目标主机和允许的最大字节数。
+pub async fn download_icon(
+    client: &Client,
+    host: &str,
+    icon_id: u32,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Error> {
+    if icon_id == 0 {
+        return Err(Error::FileTransfer("icon ID must be non-zero".into()));
+    }
+    let info = client.file_transfer_init_download(0, &icon_file_name(icon_id), "").await?;
+    if info.size == 0 || info.size > max_bytes as u64 {
+        return Err(Error::FileTransfer(format!("invalid icon size {} (limit {max_bytes})", info.size)));
+    }
+    let mut data = Vec::new();
+    crate::transfer::download_file_data(host, &info, &mut data).await?;
+    Ok(data)
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    #[test]
+    fn icon_file_names_use_unsigned_decimal_ids() {
+        assert_eq!(icon_file_name(3009859579), "/icon_3009859579");
+        assert_eq!(icon_file_name(u32::MAX), "/icon_4294967295");
+    }
+}
