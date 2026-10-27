@@ -463,9 +463,12 @@ pub fn apply_channel_notification(
 
     match name {
         "notifychannelcreated" => {
-            let Some(channel) = parse_channel_notification(params) else {
+            let Some(mut channel) = parse_channel_notification(params) else {
                 return false;
             };
+            if channel.icon_id.is_none() {
+                channel.icon_id = directory.channels.get(&id).and_then(|current| current.icon_id);
+            }
             directory.insert_channel(channel)
         }
         "notifychanneledited" => directory.update_channel(id, |current| {
@@ -1379,6 +1382,27 @@ mod tests {
         }
         let params = HashMap::from([("cid".to_string(), "1".to_string())]);
         assert_eq!(parse_channel(&params).expect("channel").icon_id, None);
+    }
+
+    #[test]
+    fn repeated_channel_creation_keeps_an_omitted_icon_and_accepts_explicit_zero() {
+        let mut directory = DirectoryCache::default();
+        let mut params = HashMap::from([
+            ("cid".to_string(), "1".to_string()),
+            ("cpid".to_string(), "0".to_string()),
+            ("channel_name".to_string(), "before".to_string()),
+            ("channel_icon_id".to_string(), "-1".to_string()),
+        ]);
+        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        params.remove("channel_icon_id");
+        params.insert("channel_name".to_string(), "after".to_string());
+        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        let channel = directory.snapshot().channels.remove(0);
+        assert_eq!(channel.name, "after");
+        assert_eq!(channel.icon_id, Some(u32::MAX));
+        params.insert("channel_icon_id".to_string(), "0".to_string());
+        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(0));
     }
 
     #[test]

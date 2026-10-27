@@ -87,3 +87,7 @@ or resurrected by a late row.
 需要控制协议请求与 TCP 传输时，可先调用 `client.file_transfer_init_download(0, &icon_file_name(id), "")`，校验返回的 `size` 后调用 `downloadFileData(host, &info, writer)`。`host` 由调用者提供，不取第三方主机；应用自身负责访问策略和缓存。
 
 文件传输先向 TCP 连接写入原始 `ftkey`，之后传输原始文件字节，与 JS `src/client/transfer.ts` 和 Go `transfer.go` 一致。下载严格校验声明长度，提前关闭或多传字节都会失败；连接超时为 10 秒，传输密钥及每次网络读写的无进展超时为 30 秒。低层兼容入口 `dialFileTransfer(host, port)` 只建立连接，密钥由上传和下载函数发送。
+
+**明文传输：** TeamSpeak 文件传输协议通过普通 TCP 发送 `ftkey` 和文件内容，库不提供传输加密。敏感文件应通过可信网络或由调用方建立的加密隧道传输。
+
+上述超时仅覆盖网络操作；调用方提供的 `AsyncRead` 读取、`AsyncWrite` 写入和刷新均不设超时。需要统一期限时，可使用 `tokio::time::timeout` 包裹整个上传或下载调用。

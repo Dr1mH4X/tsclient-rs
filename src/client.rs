@@ -1245,16 +1245,7 @@ impl Client {
             return Err(err);
         }
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            &mut ft_rx,
-        )
-        .await
-        .map_err(|_| Error::FileTransferTimeout)?
-        .map_err(|_| Error::Teamspeak("file transfer channel closed".into()))?;
-
-        let mut inner = self.inner.lock().unwrap();
-        inner.ft_track.unregister(cftid);
+        let result = self.wait_file_transfer(cftid, &mut ft_rx, Duration::from_secs(10)).await?;
 
         match result {
             FtNotification::Upload(info) => Ok(info),
@@ -1283,16 +1274,7 @@ impl Client {
             return Err(err);
         }
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            &mut ft_rx,
-        )
-        .await
-        .map_err(|_| Error::FileTransferTimeout)?
-        .map_err(|_| Error::Teamspeak("file transfer channel closed".into()))?;
-
-        let mut inner = self.inner.lock().unwrap();
-        inner.ft_track.unregister(cftid);
+        let result = self.wait_file_transfer(cftid, &mut ft_rx, Duration::from_secs(10)).await?;
 
         match result {
             FtNotification::Download(info) => Ok(info),
@@ -1301,6 +1283,19 @@ impl Client {
                 Err(Error::FileTransfer(format!("{} (status={})", st.message, st.status)))
             }
         }
+    }
+
+    async fn wait_file_transfer(
+        &self,
+        cftid: i32,
+        receiver: &mut oneshot::Receiver<FtNotification>,
+        timeout: Duration,
+    ) -> Result<FtNotification, Error> {
+        let result = tokio::time::timeout(timeout, receiver).await;
+        self.inner.lock().unwrap().ft_track.unregister(cftid);
+        result
+            .map_err(|_| Error::FileTransferTimeout)?
+            .map_err(|_| Error::Teamspeak("file transfer channel closed".into()))
     }
 
     pub async fn upload_file_data<R: tokio::io::AsyncRead + Unpin>(
@@ -1435,6 +1430,37 @@ mod tests {
             clients: Vec::new(),
             truncated: false,
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_transfer_wait_unregisters_its_sender() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        );
+        let (cftid, mut receiver) = client.inner.lock().unwrap().ft_track.register();
+        assert!(matches!(
+            client.wait_file_transfer(cftid, &mut receiver, Duration::ZERO).await,
+            Err(Error::FileTransferTimeout)
+        ));
+        assert_eq!(receiver.try_recv().unwrap_err(), oneshot::error::TryRecvError::Closed);
+
+        let (next_id, mut next_receiver) = client.inner.lock().unwrap().ft_track.register();
+        client.inner.lock().unwrap().ft_track.notify(cftid, FtNotification::Status(FileTransferStatusInfo {
+            client_file_transfer_id: cftid,
+            status: 1,
+            message: String::new(),
+        }));
+        assert_eq!(next_receiver.try_recv().unwrap_err(), oneshot::error::TryRecvError::Empty);
+        client.inner.lock().unwrap().ft_track.notify(next_id, FtNotification::Status(FileTransferStatusInfo {
+            client_file_transfer_id: next_id,
+            status: 2,
+            message: String::new(),
+        }));
+        let notification = client.wait_file_transfer(next_id, &mut next_receiver, Duration::from_secs(1)).await.unwrap();
+        assert!(matches!(notification, FtNotification::Status(info) if info.status == 2));
     }
 
     #[test]

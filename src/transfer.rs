@@ -1,4 +1,7 @@
 //! File transfer — mirrors `teamspeak-js/src/transfer.ts`
+//!
+//! TeamSpeak 文件传输的 TCP 密钥和文件内容均为明文，不提供传输加密。
+//! 敏感文件应由调用方通过可信网络或加密隧道传输。
 
 use std::collections::HashMap;
 
@@ -85,7 +88,8 @@ async fn open_transfer(
     Ok(stream)
 }
 
-/// 按 JS/Go 参考实现发送 ftkey，随后传输原始文件字节。
+/// 按 JS/Go 参考实现通过明文 TCP 发送 ftkey 和原始文件字节。
+/// 调用方数据源的读取不设超时；需要期限时应包裹整个调用。
 pub async fn upload_file_data<R: AsyncRead + Unpin>(
     host: &str,
     info: &FileUploadInfo,
@@ -108,7 +112,8 @@ pub async fn upload_file_data<R: AsyncRead + Unpin>(
         .map_err(|e| crate::Error::FileTransfer(format!("shutdown failed: {e}")))
 }
 
-/// 按 JS/Go 参考实现发送 ftkey，接收准确的声明字节数并等待服务器关闭连接。
+/// 通过明文 TCP 发送 ftkey，接收准确的声明字节数并等待服务器关闭连接。
+/// 调用方目标的写入和刷新不设超时；需要期限时应包裹整个调用。
 pub async fn download_file_data<W: AsyncWrite + Unpin>(
     host: &str,
     info: &FileDownloadInfo,
@@ -204,7 +209,8 @@ mod tests {
     async fn download_sends_raw_key_and_preserves_non_block_sized_icon_bytes() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let data = b"GIF89a-icon-data";
+        let data = b"GIF89a-icon-data-tail";
+        assert_ne!(data.len() % 16, 0);
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut key = [0u8; 8];
