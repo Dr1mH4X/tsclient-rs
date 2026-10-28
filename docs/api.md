@@ -76,7 +76,7 @@ or resurrected by a late row.
 
 ## 频道图标
 
-`ChannelInfo.icon_id` 保存 `channel_icon_id`，类型为 `Option<u32>`。`None` 表示服务器未报告该字段，`Some(0)` 表示没有自定义图标；协议中的有符号 32 位 id 会按同一组位转换成无符号值。频道创建和编辑通知会更新后续目录快照，未携带图标字段的通知保留已有值。
+`ChannelInfo.icon_id` 保存 `channel_icon_id`，类型为 `Option<u32>`。`None` 表示服务器未报告该字段，`Some(0)` 表示没有自定义图标；协议中的有符号 32 位 id 以及零扩展到 64 位的无符号形式都会按同一组位转换成无符号值。频道创建和编辑通知会更新后续目录快照，未携带图标字段的通知保留已有值。`listChannels` 请求 `channellist -icon`，因此该接口返回的频道也带有图标 id。
 
 | API | 用途 |
 | --- | --- |

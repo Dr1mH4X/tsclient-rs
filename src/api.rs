@@ -71,7 +71,7 @@ pub async fn get_client_info(
 
 /// List all channels on the server.
 pub async fn list_channels(client: &Client) -> Result<Vec<ChannelInfo>, Error> {
-    let data = client.exec_command_with_response("channellist", QUERY_TIMEOUT_MS).await?;
+    let data = client.exec_command_with_response("channellist -icon", QUERY_TIMEOUT_MS).await?;
     Ok(data.iter().filter_map(parse_channel).collect())
 }
 

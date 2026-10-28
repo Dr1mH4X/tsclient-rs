@@ -743,10 +743,19 @@ pub(crate) fn apply_client_notification(
 }
 
 fn parse_icon_id(value: &str) -> Option<u32> {
-    value.parse::<u32>().ok().or_else(|| {
-        // i_icon_id 也会以同一组位的有符号形式出现在协议里。
-        value.parse::<i32>().ok().map(|id| id as u32)
-    })
+    let value = value.trim().parse::<i128>().ok()?;
+    // notifychanneledited 发送的是有符号 32 位 id 零扩展到 64 位后的无符号值；
+    // 查询协议则发送有符号或无符号的 32 位形式。
+    const SIGN_EXTENDED_MIN: i128 = (u64::MAX as i128) - (1 << 31) + 1;
+    let value = if (SIGN_EXTENDED_MIN..=u64::MAX as i128).contains(&value) {
+        value - (1i128 << 64)
+    } else {
+        value
+    };
+    if !(-(1i128 << 31)..(1i128 << 32)).contains(&value) {
+        return None;
+    }
+    Some(value as i64 as u32)
 }
 
 fn parse_u64(value: &str) -> u64 {
@@ -1370,8 +1379,13 @@ mod tests {
             ("4294967295", Some(u32::MAX)),
             ("-1", Some(u32::MAX)),
             ("-1285107717", Some(3009859579)),
+            ("-2147483648", Some(2147483648)),
+            ("18446744072424443899", Some(3009859579)),
+            ("18446744071562067968", Some(2147483648)),
             ("4294967296", None),
             ("-2147483649", None),
+            ("18446744071562067967", None),
+            ("18446744073709551616", None),
             ("invalid", None),
         ] {
             let params = HashMap::from([
@@ -1421,5 +1435,9 @@ mod tests {
         params.insert("channel_icon_id".to_string(), "0".to_string());
         assert!(apply_channel_notification("notifychanneledited", &params, &mut directory));
         assert_eq!(directory.snapshot().channels[0].icon_id, Some(0));
+        // The voice protocol's notifychanneledited sends the id sign-extended to 64 bits.
+        params.insert("channel_icon_id".to_string(), "18446744072424443899".to_string());
+        assert!(apply_channel_notification("notifychanneledited", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(3009859579));
     }
 }
