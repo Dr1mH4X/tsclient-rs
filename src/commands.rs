@@ -39,6 +39,7 @@ pub struct CommandTracker {
     rows: HashMap<i32, Vec<HashMap<String, String>>>,
     /// return_codes whose caller gave up (timeout or send failure).
     abandoned: HashSet<i32>,
+    notifications: HashMap<i32, &'static str>,
     next_rc: i32,
     welcome_complete: bool,
 }
@@ -50,6 +51,7 @@ impl CommandTracker {
             order: VecDeque::new(),
             rows: HashMap::new(),
             abandoned: HashSet::new(),
+            notifications: HashMap::new(),
             next_rc: 0,
             welcome_complete: false,
         }
@@ -63,6 +65,33 @@ impl CommandTracker {
         self.order.push_back(rc);
         self.rows.insert(rc, Vec::new());
         (rc, rx)
+    }
+
+    pub fn register_command(&mut self, command: &str) -> (i32, oneshot::Receiver<CommandResult>) {
+        let (rc, response) = self.register();
+        let expected = match command.split_whitespace().next().unwrap_or("") {
+            "servergrouplist" => Some("notifyservergrouplist"),
+            "channelgrouplist" => Some("notifychannelgrouplist"),
+            "servergrouppermlist" => Some("notifyservergrouppermlist"),
+            "channelgrouppermlist" => Some("notifychannelgrouppermlist"),
+            "permissionlist" => Some("notifypermissionlist"),
+            "permget" => Some("notifypermget"),
+            "ftgetfilelist" => Some("notifyfilelist"),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            self.notifications.insert(rc, expected);
+        }
+        (rc, response)
+    }
+
+    pub fn buffer_notification(&mut self, name: &str, params: HashMap<String, String>) {
+        let Some(rc) = self.order.front() else {
+            return;
+        };
+        if self.notifications.get(rc).copied() == Some(name) {
+            self.buffer(params);
+        }
     }
 
     /// The caller stopped waiting for `rc`. Keep the slot in `order` until the
@@ -106,6 +135,7 @@ impl CommandTracker {
             }
             self.order.pop_front();
             self.abandoned.remove(&front);
+            self.notifications.remove(&front);
             if let Some(mut carried) = self.rows.remove(&front) {
                 rows.append(&mut carried);
             }
@@ -113,6 +143,7 @@ impl CommandTracker {
 
         self.order.retain(|queued| *queued != rc);
         self.abandoned.remove(&rc);
+        self.notifications.remove(&rc);
         match self.rows.remove(&rc) {
             Some(mut own) => rows.append(&mut own),
             None => {}
@@ -135,6 +166,7 @@ impl CommandTracker {
     pub fn on_untracked_reply(&mut self) {}
 
     pub fn reset(&mut self) {
+        self.notifications.clear();
         self.pending.clear();
         self.order.clear();
         self.rows.clear();
@@ -278,5 +310,19 @@ mod tests {
 
         let result = rx_b.try_recv().expect("command resolved");
         assert_eq!(keys(&result.data), vec!["b"]);
+    }
+    #[test]
+    fn notification_answers_only_enter_the_matching_query() {
+        let mut tracker = tracker_past_welcome();
+        let (rc, mut response) = tracker.register_command("ftgetfilelist cid=2 path=/");
+        tracker.buffer_notification("notifyclientupdated", row("unrelated"));
+        tracker.buffer_notification("notifyservergrouplist", row("wrong-query"));
+        tracker.buffer_notification("notifyfilelist", row("file"));
+        tracker.resolve(rc, None);
+        assert_eq!(keys(&response.try_recv().unwrap().data), vec!["file"]);
+        let (rc, mut response) = tracker.register_command("clientinfo clid=1");
+        tracker.buffer_notification("notifyfilelist", row("unsolicited"));
+        tracker.resolve(rc, None);
+        assert!(response.try_recv().unwrap().data.is_empty());
     }
 }

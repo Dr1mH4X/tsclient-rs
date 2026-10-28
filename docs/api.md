@@ -91,3 +91,11 @@ or resurrected by a late row.
 **明文传输：** TeamSpeak 文件传输协议通过普通 TCP 发送 `ftkey` 和文件内容，库不提供传输加密。敏感文件应通过可信网络或由调用方建立的加密隧道传输。
 
 上述超时仅覆盖网络操作；调用方提供的 `AsyncRead` 读取、`AsyncWrite` 写入和刷新均不设超时。需要统一期限时，可使用 `tokio::time::timeout` 包裹整个上传或下载调用。
+
+## 查询通知与有效权限
+
+`exec_command_with_response` 收集当前命令对应的权限组、权限列表及频道文件列表通知，返回其中的数据行；普通成员状态通知不会混入查询。通知仍正常更新客户端状态。命令串行发送时，通知行归属于随后返回确认的查询，与 JS 参考实现的内联响应规则一致。
+
+`client.permission_value(permid)` 返回服务器通过 `notifyclientneededpermissions` 最近推送的本端有效权限；未报告或撤销时返回 `None`，断开连接后清空。`on_own_permissions_changed` 收到 `Event::OwnPermissionsChanged` 后，调用方可重新读取受影响的操作权限。权限 id 由服务器的 `permissionlist` 数据确定，不能跨服务器版本写死。
+
+文件传输协商中的 `notifystatusfiletransfer` 拒绝结果以 `Error::ServerError` 返回，保留数字错误码与服务器文案，调用方可以区分频道密码错误和权限不足。

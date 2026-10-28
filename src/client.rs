@@ -194,6 +194,7 @@ struct EventHandlers {
     client_moved: Vec<EventHandler>,
     directory_snapshot: Vec<OrderedDirectoryHandler>,
     poked: Vec<EventHandler>,
+    own_permissions_changed: Vec<EventHandler>,
     voice_data: Vec<EventHandler>,
     connected: Vec<Arc<dyn Fn() + Send + Sync>>,
     disconnected: Vec<EventHandler>,
@@ -210,6 +211,7 @@ impl EventHandlers {
             client_moved: Vec::new(),
             directory_snapshot: Vec::new(),
             poked: Vec::new(),
+            own_permissions_changed: Vec::new(),
             voice_data: Vec::new(),
             connected: Vec::new(),
             disconnected: Vec::new(),
@@ -230,6 +232,7 @@ pub(crate) struct ClientInner {
     pub(crate) client_init_options: ClientInitOptions,
     pub(crate) status: ClientStatus,
     pub(crate) cmd_track: CommandTracker,
+    own_permissions: HashMap<u32,i32>,
     pub(crate) ft_track: FileTransferTracker,
     pub(crate) directory: server_directory::DirectoryCache,
     pub(crate) directory_ready: bool,
@@ -272,6 +275,7 @@ impl ClientInner {
             client_init_options,
             status: ClientStatus::Disconnected,
             cmd_track: CommandTracker::new(),
+            own_permissions: HashMap::new(),
             ft_track: FileTransferTracker::new(),
             directory: server_directory::DirectoryCache::default(),
             directory_ready: false,
@@ -370,6 +374,25 @@ impl ClientInner {
         };
 
         if cmd.name.starts_with("notify") {
+            self.cmd_track
+                .buffer_notification(&cmd.name, cmd.params.clone());
+            if cmd.name == "notifyclientneededpermissions" {
+                if let Some(id) = cmd.params.get("permid").and_then(|v| v.parse::<u32>().ok()) {
+                    match cmd
+                        .params
+                        .get("permvalue")
+                        .and_then(|v| v.parse::<i32>().ok())
+                    {
+                        Some(value) => {
+                            self.own_permissions.insert(id, value);
+                        }
+                        None => {
+                            self.own_permissions.remove(&id);
+                        }
+                    }
+                }
+                self.dispatch_event(Event::OwnPermissionsChanged);
+            }
             let was_truncated = self.directory.truncated();
             let channel_changed = server_directory::apply_channel_notification(
                 &cmd.name,
@@ -645,6 +668,14 @@ impl ClientInner {
                         handler.enqueue(snapshot.clone());
                     }
                 }
+                Event::OwnPermissionsChanged => {
+                    for handler in &self.event_handlers.own_permissions_changed {
+                        let handler = Arc::clone(handler);
+                        tokio::spawn(async move {
+                            handler(Event::OwnPermissionsChanged);
+                        });
+                    }
+                }
                 Event::Poked(evt) => {
                     for h in &self.event_handlers.poked {
                         let h = Arc::clone(h);
@@ -710,6 +741,7 @@ impl ClientInner {
     fn reset_directory_availability(&mut self) {
         self.directory_ready = false;
         self.directory_wakers.clear();
+        self.own_permissions.clear();
         self.directory_publication = DirectoryPublication::default();
     }
 
@@ -1079,7 +1111,7 @@ impl Client {
     ) -> Result<Vec<HashMap<String, String>>, Error> {
         let (rc, mut rx) = {
             let mut inner = self.inner.lock().unwrap();
-            inner.cmd_track.register()
+            inner.cmd_track.register_command(cmd)
         };
         let with_rc = commands::append_return_code(cmd, rc);
 
@@ -1125,6 +1157,26 @@ impl Client {
     }
 
     // ---- Events ---------------------------------------------------------------
+
+    /// 服务器最近推送的本端有效权限；未报告或已撤销时为 None。
+    pub fn permission_value(&self, permission_id: u32) -> Option<i32> {
+        self.inner
+            .lock()
+            .unwrap()
+            .own_permissions
+            .get(&permission_id)
+            .copied()
+    }
+
+    pub fn on_own_permissions_changed(&self, handler: EventHandler) -> &Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .own_permissions_changed
+            .push(handler);
+        self
+    }
 
     pub fn on_text_message(&self, handler: EventHandler) -> &Self {
         self.inner.lock().unwrap().event_handlers.text_message.push(handler);
@@ -1251,7 +1303,7 @@ impl Client {
             FtNotification::Upload(info) => Ok(info),
             FtNotification::Download(_) => Err(Error::FileTransfer("unexpected download response".into())),
             FtNotification::Status(st) => {
-                Err(Error::FileTransfer(format!("{} (status={})", st.message, st.status)))
+                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message })
             }
         }
     }
@@ -1280,7 +1332,7 @@ impl Client {
             FtNotification::Download(info) => Ok(info),
             FtNotification::Upload(_) => Err(Error::FileTransfer("unexpected upload response".into())),
             FtNotification::Status(st) => {
-                Err(Error::FileTransfer(format!("{} (status={})", st.message, st.status)))
+                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message })
             }
         }
     }
@@ -1370,6 +1422,7 @@ impl Client {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.crypt = new_crypt;
+            inner.own_permissions.clear();
             inner.cmd_track.reset();
             inner.ft_track.reset();
             inner.directory.clear();
@@ -1994,4 +2047,54 @@ mod tests {
             .expect("directory handler");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+    #[test]
+    fn effective_permissions_update_and_revoke_without_polluting_commands() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".into(),
+            "test".into(),
+            ClientOptions::default(),
+        );
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.cmd_track.signal_welcome_complete();
+            let (rc, mut result) = inner.cmd_track.register_command("servergrouplist");
+            inner.handle_command_str(
+                "notifyclientneededpermissions permid=42 permvalue=75",
+                &sender,
+            );
+            inner.handle_command_str("notifyservergrouplist sgid=6 name=Admin type=1", &sender);
+            inner.cmd_track.resolve(rc, None);
+            let rows = result.try_recv().unwrap().data;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["sgid"], "6");
+        }
+        assert_eq!(client.permission_value(42), Some(75));
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyclientneededpermissions permid=42", &sender);
+        assert_eq!(client.permission_value(42), None);
+    }
+    #[tokio::test]
+    async fn transfer_status_preserves_the_server_error_code() {
+        for status in [781,2568] {
+            let client=Client::new(crate::crypto::generate_identity(0),"127.0.0.1:9987".into(),"test".into(),ClientOptions::default());
+            let inner=Arc::clone(&client.inner);
+            *client.final_cmd_handler.lock().unwrap()=Arc::new(move |_| {
+                let inner=Arc::clone(&inner);
+                Box::pin(async move {
+                    let mut inner=inner.lock().unwrap();
+                    inner.cmd_track.resolve(1,None);
+                    inner.ft_track.notify(1,FtNotification::Status(FileTransferStatusInfo {message:"fixture refusal".into(),status,client_file_transfer_id:1}));
+                    Ok(())
+                })
+            });
+            let error=client.file_transfer_init_download(1,"/fixture","").await.unwrap_err();
+            assert!(matches!(error,Error::ServerError{id,..} if id==status.to_string()));
+        }
+    }
+
 }

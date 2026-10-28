@@ -233,3 +233,7 @@ cargo run --example channel_icons
 ```
 
 文件传输使用与服务器相同的主机；如果连接地址通过 SRV 指向其他主机，可用 `TS_ICON_HOST` 显式指定实际传输主机。下载调用的 `max_bytes` 是应用自身的限制，示例限制每个图标为 1 MiB。
+
+## 读取服务器报告的权限
+
+先通过 `client.exec_command_with_response("permissionlist", 5000)` 读取服务器的权限名称表，再使用对应 id 调用 `client.permission_value(id)`。返回 `None` 表示未知或已撤销，界面应禁用相应管理操作；最终操作仍由服务器校验。
