@@ -444,6 +444,7 @@ fn parse_channel_row(
         codec: params
             .get("channel_codec")
             .and_then(|value| value.parse::<i32>().ok()),
+        icon_id: params.get("channel_icon_id").and_then(|value| parse_icon_id(value)),
     })
 }
 
@@ -462,9 +463,12 @@ pub fn apply_channel_notification(
 
     match name {
         "notifychannelcreated" => {
-            let Some(channel) = parse_channel_notification(params) else {
+            let Some(mut channel) = parse_channel_notification(params) else {
                 return false;
             };
+            if channel.icon_id.is_none() {
+                channel.icon_id = directory.channels.get(&id).and_then(|current| current.icon_id);
+            }
             directory.insert_channel(channel)
         }
         "notifychanneledited" => directory.update_channel(id, |current| {
@@ -513,6 +517,12 @@ pub fn apply_channel_notification(
                 let limited = !value;
                 if current.max_clients_limited != Some(limited) {
                     current.max_clients_limited = Some(limited);
+                    changed = true;
+                }
+            }
+            if let Some(value) = params.get("channel_icon_id").and_then(|value| parse_icon_id(value)) {
+                if current.icon_id != Some(value) {
+                    current.icon_id = Some(value);
                     changed = true;
                 }
             }
@@ -730,6 +740,22 @@ pub(crate) fn apply_client_notification(
     } else {
         None
     }
+}
+
+fn parse_icon_id(value: &str) -> Option<u32> {
+    let value = value.trim().parse::<i128>().ok()?;
+    // notifychanneledited 发送的是有符号 32 位 id 零扩展到 64 位后的无符号值；
+    // 查询协议则发送有符号或无符号的 32 位形式。
+    const SIGN_EXTENDED_MIN: i128 = (u64::MAX as i128) - (1 << 31) + 1;
+    let value = if (SIGN_EXTENDED_MIN..=u64::MAX as i128).contains(&value) {
+        value - (1i128 << 64)
+    } else {
+        value
+    };
+    if !(-(1i128 << 31)..(1i128 << 32)).contains(&value) {
+        return None;
+    }
+    Some(value as i64 as u32)
 }
 
 fn parse_u64(value: &str) -> u64 {
@@ -1337,11 +1363,81 @@ mod tests {
             max_clients: None,
             max_clients_limited: None,
             codec: None,
+            icon_id: None,
         };
 
         assert!(!directory.insert_channel(channel));
         let snapshot = directory.snapshot();
         assert!(snapshot.channels.is_empty());
         assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn channel_icons_keep_unsigned_signed_and_missing_ids() {
+        for (wire, expected) in [
+            ("0", Some(0)),
+            ("4294967295", Some(u32::MAX)),
+            ("-1", Some(u32::MAX)),
+            ("-1285107717", Some(3009859579)),
+            ("-2147483648", Some(2147483648)),
+            ("18446744072424443899", Some(3009859579)),
+            ("18446744071562067968", Some(2147483648)),
+            ("4294967296", None),
+            ("-2147483649", None),
+            ("18446744071562067967", None),
+            ("18446744073709551616", None),
+            ("invalid", None),
+        ] {
+            let params = HashMap::from([
+                ("cid".to_string(), "1".to_string()),
+                ("channel_icon_id".to_string(), wire.to_string()),
+            ]);
+            assert_eq!(parse_channel(&params).expect("channel").icon_id, expected);
+        }
+        let params = HashMap::from([("cid".to_string(), "1".to_string())]);
+        assert_eq!(parse_channel(&params).expect("channel").icon_id, None);
+    }
+
+    #[test]
+    fn repeated_channel_creation_keeps_an_omitted_icon_and_accepts_explicit_zero() {
+        let mut directory = DirectoryCache::default();
+        let mut params = HashMap::from([
+            ("cid".to_string(), "1".to_string()),
+            ("cpid".to_string(), "0".to_string()),
+            ("channel_name".to_string(), "before".to_string()),
+            ("channel_icon_id".to_string(), "-1".to_string()),
+        ]);
+        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        params.remove("channel_icon_id");
+        params.insert("channel_name".to_string(), "after".to_string());
+        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        let channel = directory.snapshot().channels.remove(0);
+        assert_eq!(channel.name, "after");
+        assert_eq!(channel.icon_id, Some(u32::MAX));
+        params.insert("channel_icon_id".to_string(), "0".to_string());
+        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(0));
+    }
+
+    #[test]
+    fn channel_icon_updates_preserve_omitted_values_and_clear_with_zero() {
+        let mut directory = DirectoryCache::default();
+        let mut params = HashMap::from([
+            ("cid".to_string(), "1".to_string()),
+            ("cpid".to_string(), "0".to_string()),
+            ("channel_icon_id".to_string(), "-1".to_string()),
+        ]);
+        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(u32::MAX));
+        params.remove("channel_icon_id");
+        assert!(!apply_channel_notification("notifychanneledited", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(u32::MAX));
+        params.insert("channel_icon_id".to_string(), "0".to_string());
+        assert!(apply_channel_notification("notifychanneledited", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(0));
+        // The voice protocol's notifychanneledited sends the id sign-extended to 64 bits.
+        params.insert("channel_icon_id".to_string(), "18446744072424443899".to_string());
+        assert!(apply_channel_notification("notifychanneledited", &params, &mut directory));
+        assert_eq!(directory.snapshot().channels[0].icon_id, Some(3009859579));
     }
 }

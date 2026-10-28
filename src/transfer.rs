@@ -1,10 +1,11 @@
 //! File transfer — mirrors `teamspeak-js/src/transfer.ts`
+//!
+//! TeamSpeak 文件传输的 TCP 密钥和文件内容均为明文，不提供传输加密。
+//! 敏感文件应由调用方通过可信网络或加密隧道传输。
 
 use std::collections::HashMap;
 
-use aes::Aes128;
-use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
-use cipher::generic_array::GenericArray;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
@@ -58,123 +59,91 @@ impl FileTransferTracker {
     }
 }
 
-/// Connect to the file transfer port.
-/// Mirrors JS `dialFileTransfer` — just connects, does NOT send the key.
+/// 打开文件传输 TCP 连接；此低层入口不发送传输密钥。
 pub async fn dial_file_transfer(
     host: &str,
     port: u16,
 ) -> Result<tokio::net::TcpStream, crate::Error> {
-    let addr = format!("{host}:{port}");
-    let stream = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    .map_err(|_| crate::Error::FileTransfer("connection timeout".into()))?
-    .map_err(|e| crate::Error::FileTransfer(format!("failed to connect: {e}")))?;
+    if port == 0 {
+        return Err(crate::Error::FileTransfer("invalid file transfer port: 0".into()));
+    }
+    tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| crate::Error::FileTransfer("connection timeout".into()))?
+        .map_err(|e| crate::Error::FileTransfer(format!("failed to connect: {e}")))
+}
+
+async fn open_transfer(
+    host: &str,
+    port: i32,
+    key: &str,
+) -> Result<tokio::net::TcpStream, crate::Error> {
+    let port = u16::try_from(port)
+        .map_err(|_| crate::Error::FileTransfer(format!("invalid file transfer port: {port}")))?;
+    let mut stream = dial_file_transfer(host, port).await?;
+    tokio::time::timeout(Duration::from_secs(30), stream.write_all(key.as_bytes()))
+        .await
+        .map_err(|_| crate::Error::FileTransfer("transfer key write timeout".into()))?
+        .map_err(|e| crate::Error::FileTransfer(format!("failed to send transfer key: {e}")))?;
     Ok(stream)
 }
 
-/// Upload file data with AES-128-ECB encryption.
-/// Mirrors JS `uploadFileData(host, info, data: Readable)`.
-/// `data` is an async reader — data is streamed and encrypted in 16-byte blocks.
+/// 按 JS/Go 参考实现通过明文 TCP 发送 ftkey 和原始文件字节。
+/// 调用方数据源的读取不设超时；需要期限时应包裹整个调用。
 pub async fn upload_file_data<R: AsyncRead + Unpin>(
     host: &str,
     info: &FileUploadInfo,
     mut data: R,
 ) -> Result<(), crate::Error> {
-    let mut stream = dial_file_transfer(host, info.port as u16).await?;
-
-    let key = base64_decode(&info.file_transfer_key);
-    let cipher = Aes128::new_from_slice(&key)
-        .map_err(|e| crate::Error::FileTransfer(format!("invalid AES key: {e}")))?;
-
-    let mut read_buf = vec![0u8; 4096];
-    let mut pending: Vec<u8> = Vec::new();
-
+    let mut stream = open_transfer(host, info.port, &info.file_transfer_key).await?;
+    let mut buffer = [0u8; 32 * 1024];
     loop {
-        let n = data
-            .read(&mut read_buf)
-            .await
+        let length = data.read(&mut buffer).await
             .map_err(|e| crate::Error::FileTransfer(format!("read failed: {e}")))?;
-        if n == 0 {
+        if length == 0 {
             break;
         }
-        pending.extend_from_slice(&read_buf[..n]);
-
-        // Encrypt complete 16-byte blocks
-        let num_blocks = pending.len() / 16;
-        for i in 0..num_blocks {
-            let mut block = GenericArray::clone_from_slice(&pending[i * 16..(i + 1) * 16]);
-            cipher.encrypt_block(&mut block);
-            stream
-                .write_all(&block)
-                .await
-                .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
-        }
-        pending = pending[num_blocks * 16..].to_vec();
+        tokio::time::timeout(Duration::from_secs(30), stream.write_all(&buffer[..length]))
+            .await
+            .map_err(|_| crate::Error::FileTransfer("upload write timeout".into()))?
+            .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
     }
-
-    // JS: cipher.final() with setAutoPadding(false) — any remaining bytes
-    // (< 16) are silently dropped, matching JS behavior.
-    stream
-        .shutdown()
-        .await
-        .map_err(|e| crate::Error::FileTransfer(format!("shutdown failed: {e}")))?;
-    Ok(())
+    stream.shutdown().await
+        .map_err(|e| crate::Error::FileTransfer(format!("shutdown failed: {e}")))
 }
 
-/// Download file data with AES-128-ECB decryption.
-/// Mirrors JS `downloadFileData(host, info, dest: Writable)`.
-/// `dest` is an async writer — decrypted data is streamed out.
+/// 通过明文 TCP 发送 ftkey，接收准确的声明字节数并等待服务器关闭连接。
+/// 调用方目标的写入和刷新不设超时；需要期限时应包裹整个调用。
 pub async fn download_file_data<W: AsyncWrite + Unpin>(
     host: &str,
     info: &FileDownloadInfo,
     mut dest: W,
 ) -> Result<(), crate::Error> {
-    let mut stream = dial_file_transfer(host, info.port as u16).await?;
-
-    let key = base64_decode(&info.file_transfer_key);
-    let cipher = Aes128::new_from_slice(&key)
-        .map_err(|e| crate::Error::FileTransfer(format!("invalid AES key: {e}")))?;
-
-    let mut read_buf = vec![0u8; 4096];
-    let mut pending: Vec<u8> = Vec::new();
-
+    let mut stream = open_transfer(host, info.port, &info.file_transfer_key).await?;
+    let mut remaining = info.size;
+    let mut buffer = [0u8; 32 * 1024];
     loop {
-        let n = stream
-            .read(&mut read_buf)
+        // 声明长度之外最多读取一个字节，发现超量时不把它交给调用者。
+        let limit = remaining.saturating_add(1).min(buffer.len() as u64) as usize;
+        let length = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer[..limit]))
             .await
+            .map_err(|_| crate::Error::FileTransfer("download read timeout".into()))?
             .map_err(|e| crate::Error::FileTransfer(format!("read failed: {e}")))?;
-        if n == 0 {
+        if length == 0 {
+            if remaining != 0 {
+                return Err(crate::Error::FileTransfer(format!("download ended with {remaining} bytes missing")));
+            }
             break;
         }
-        pending.extend_from_slice(&read_buf[..n]);
-
-        // Decrypt complete 16-byte blocks
-        let num_blocks = pending.len() / 16;
-        for i in 0..num_blocks {
-            let mut block = GenericArray::clone_from_slice(&pending[i * 16..(i + 1) * 16]);
-            cipher.decrypt_block(&mut block);
-            dest.write_all(&block)
-                .await
-                .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
+        if length as u64 > remaining {
+            return Err(crate::Error::FileTransfer("download exceeds announced size".into()));
         }
-        pending = pending[num_blocks * 16..].to_vec();
+        dest.write_all(&buffer[..length]).await
+            .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
+        remaining -= length as u64;
     }
-
-    // JS: decipher.final() with setAutoPadding(false) — remaining bytes dropped.
-    dest.flush()
-        .await
-        .map_err(|e| crate::Error::FileTransfer(format!("flush failed: {e}")))?;
-    Ok(())
-}
-
-fn base64_decode(s: &str) -> Vec<u8> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .unwrap_or_default()
+    dest.flush().await
+        .map_err(|e| crate::Error::FileTransfer(format!("flush failed: {e}")))
 }
 
 pub fn build_ft_init_upload(
@@ -219,4 +188,86 @@ pub fn build_ft_init_download(
     params.insert("clientftfid".to_string(), cftid.to_string());
     params.insert("seekpos".to_string(), "0".to_string());
     build_command("ftinitdownload", params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn download_info(port: u16, size: u64) -> FileDownloadInfo {
+        FileDownloadInfo {
+            file_transfer_key: "test-key".into(),
+            size,
+            client_file_transfer_id: 1,
+            server_file_transfer_id: 2,
+            port: i32::from(port),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_sends_raw_key_and_preserves_non_block_sized_icon_bytes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let data = b"GIF89a-icon-data-tail";
+        assert_ne!(data.len() % 16, 0);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut key = [0u8; 8];
+            socket.read_exact(&mut key).await.unwrap();
+            assert_eq!(&key, b"test-key");
+            socket.write_all(data).await.unwrap();
+        });
+        let mut output = Vec::new();
+        download_file_data("127.0.0.1", &download_info(port, data.len() as u64), &mut output).await.unwrap();
+        assert_eq!(output, data);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_rejects_truncated_or_oversized_content() {
+        for (data, size) in [(b"short".as_slice(), 6), (b"too-long".as_slice(), 4)] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut key = [0u8; 8];
+                socket.read_exact(&mut key).await.unwrap();
+                socket.write_all(data).await.unwrap();
+            });
+            let mut output = Vec::new();
+            assert!(download_file_data("127.0.0.1", &download_info(port, size), &mut output).await.is_err());
+            assert!(output.len() as u64 <= size);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_sends_key_and_the_complete_unencrypted_payload() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            socket.read_to_end(&mut data).await.unwrap();
+            data
+        });
+        let info = FileUploadInfo {
+            file_transfer_key: "test-key".into(),
+            seek_position: 0,
+            client_file_transfer_id: 1,
+            server_file_transfer_id: 2,
+            port: i32::from(port),
+        };
+        upload_file_data("127.0.0.1", &info, b"unaligned-file".as_slice()).await.unwrap();
+        assert_eq!(server.await.unwrap(), b"test-keyunaligned-file");
+    }
+
+    #[tokio::test]
+    async fn transfer_ports_are_validated_without_wrapping() {
+        for port in [-1, 0, 65536] {
+            let info = FileDownloadInfo { port, ..download_info(1, 1) };
+            assert!(download_file_data("127.0.0.1", &info, &mut Vec::new()).await.is_err());
+        }
+    }
 }

@@ -91,6 +91,8 @@ pub struct ChannelInfo {
     pub max_clients: Option<u16>,
     pub max_clients_limited: Option<bool>,
     pub codec: Option<i32>,
+    /// 服务器自定义图标的无符号 32 位 id；缺失与明确的 0 分别保留。
+    pub icon_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
