@@ -272,7 +272,11 @@ impl AbortSignal {
 
 #[async_trait::async_trait]
 pub trait AddrResolver: Send + Sync {
-    async fn resolve(&self, addr: &str, signal: Option<&AbortSignal>) -> Result<Vec<ResolvedAddr>, Error>;
+    async fn resolve(
+        &self,
+        addr: &str,
+        signal: Option<&AbortSignal>,
+    ) -> Result<Vec<ResolvedAddr>, Error>;
 }
 
 // ---- ClientOptions ----------------------------------------------------------

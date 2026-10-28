@@ -129,12 +129,7 @@ impl EAX {
         Ok(Self { key: k })
     }
 
-    pub fn encrypt(
-        &self,
-        nonce: &[u8],
-        header: &[u8],
-        plaintext: &[u8],
-    ) -> (Vec<u8>, Vec<u8>) {
+    pub fn encrypt(&self, nonce: &[u8], header: &[u8], plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let n_star = cmac_with_tag(&self.key, 0, nonce);
         let h_star = cmac_with_tag(&self.key, 1, header);
 

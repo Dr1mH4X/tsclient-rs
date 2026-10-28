@@ -1,7 +1,7 @@
 //! License chain parsing & key derivation — mirrors `teamspeak-js/src/handshake/license.ts`
 
-use crate::crypto::hash512;
 use crate::Error;
+use crate::crypto::hash512;
 
 const LICENSE_ROOT_KEY: [u8; 32] = [
     0xcd, 0x0d, 0xe2, 0xae, 0xd4, 0x63, 0x45, 0x50, 0x9a, 0x7e, 0x3c, 0xfd, 0x8f, 0x68, 0xb3, 0xdc,
@@ -67,7 +67,10 @@ fn parse_license_block(data: &[u8]) -> Result<(LicenseBlock, usize), Error> {
         return Err(Error::Teamspeak("license too short".into()));
     }
     if data[0] != 0 {
-        return Err(Error::Teamspeak(format!("wrong key kind in license: {}", data[0])));
+        return Err(Error::Teamspeak(format!(
+            "wrong key kind in license: {}",
+            data[0]
+        )));
     }
 
     let block_type = data[33];
@@ -140,13 +143,18 @@ fn parse_block_payload(
                 properties.push(data[pos..pos + prop_len].to_vec());
                 pos += prop_len;
             }
-            Ok((BlockPayload(properties, String::new(), server_type), pos - min_block_len))
+            Ok((
+                BlockPayload(properties, String::new(), server_type),
+                pos - min_block_len,
+            ))
         }
         32 => {
             // Ephemeral
             Ok((BlockPayload(vec![], String::new(), 0), 0))
         }
-        _ => Err(Error::Teamspeak(format!("invalid license block type: {block_type}"))),
+        _ => Err(Error::Teamspeak(format!(
+            "invalid license block type: {block_type}"
+        ))),
     }
 }
 
@@ -174,7 +182,10 @@ fn derive_key_from_block(block: &LicenseBlock, parent: &[u8]) -> Vec<u8> {
     let n = curve25519_dalek::constants::BASEPOINT_ORDER;
     let n_biguint = num_bigint::BigUint::from_bytes_le(&n.to_bytes());
 
-    let pub_bytes: [u8; 32] = block_key.as_slice().try_into().expect("block_key len != 32");
+    let pub_bytes: [u8; 32] = block_key
+        .as_slice()
+        .try_into()
+        .expect("block_key len != 32");
     let pub_point = CompressedEdwardsY(pub_bytes)
         .decompress()
         .expect("invalid edwards point in block_key");

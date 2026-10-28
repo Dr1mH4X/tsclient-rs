@@ -3,8 +3,8 @@
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
 
-use crate::types::AbortSignal;
 use crate::Error;
+use crate::types::AbortSignal;
 
 const P256_SCALAR_SIZE: usize = 32;
 const P256_UNCOMPRESSED_KEY_SIZE: usize = 65;
@@ -66,15 +66,15 @@ impl Identity {
     }
 
     pub fn security_level(&self) -> i32 {
-        let hash = sha1_hash(format!(
-            "{}{}",
-            self.public_key_base64(),
-            self.offset
-        ));
+        let hash = sha1_hash(format!("{}{}", self.public_key_base64(), self.offset));
         count_leading_zeros(&hash)
     }
 
-    pub async fn upgrade_to_level(&mut self, target_level: i32, signal: Option<&AbortSignal>) -> Result<(), Error> {
+    pub async fn upgrade_to_level(
+        &mut self,
+        target_level: i32,
+        signal: Option<&AbortSignal>,
+    ) -> Result<(), Error> {
         let prefix = self.public_key_base64().to_string();
         loop {
             if let Some(sig) = signal {
@@ -163,7 +163,9 @@ fn generate_p256_private_key() -> [u8; P256_SCALAR_SIZE] {
     bytes
 }
 
-fn derive_p256_public_key(private_key: &[u8; P256_SCALAR_SIZE]) -> [u8; P256_UNCOMPRESSED_KEY_SIZE] {
+fn derive_p256_public_key(
+    private_key: &[u8; P256_SCALAR_SIZE],
+) -> [u8; P256_UNCOMPRESSED_KEY_SIZE] {
     let secret = p256::SecretKey::from_slice(private_key).unwrap();
     let public_key = secret.public_key();
     let encoded = p256::EncodedPoint::from(public_key);

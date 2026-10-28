@@ -23,7 +23,11 @@ pub struct ServerError {
 
 impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TeamSpeak server error: {} (id={})", self.server_message, self.id)
+        write!(
+            f,
+            "TeamSpeak server error: {} (id={})",
+            self.server_message, self.id
+        )
     }
 }
 
@@ -198,7 +202,11 @@ impl From<TeamspeakError> for Error {
 
 impl From<ServerError> for Error {
     fn from(e: ServerError) -> Self {
-        Error::ServerError { id: e.id, server_message: e.server_message, extra_message: e.extra_message }
+        Error::ServerError {
+            id: e.id,
+            server_message: e.server_message,
+            extra_message: e.extra_message,
+        }
     }
 }
 
@@ -258,14 +266,35 @@ impl From<std::io::Error> for Error {
 
 impl Error {
     pub(crate) fn flood_retry_delay(&self) -> Option<std::time::Duration> {
-        let Error::ServerError { id, extra_message: Some(extra), .. } = self else { return None; };
-        if id != "524" { return None; }
-        let (digits, multiplier) = if let Some(digits) = extra.strip_prefix("retry in ").and_then(|s| s.strip_suffix("ms")) {
+        let Error::ServerError {
+            id,
+            extra_message: Some(extra),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if id != "524" {
+            return None;
+        }
+        let (digits, multiplier) = if let Some(digits) = extra
+            .strip_prefix("retry in ")
+            .and_then(|s| s.strip_suffix("ms"))
+        {
             (digits, 1)
-        } else if let Some(digits) = extra.strip_prefix("please wait ").and_then(|s| s.strip_suffix(" seconds")) {
+        } else if let Some(digits) = extra
+            .strip_prefix("please wait ")
+            .and_then(|s| s.strip_suffix(" seconds"))
+        {
             (digits, 1000)
-        } else { return None; };
-        if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|c| c.is_ascii_digit()) { return None; }
-        Some(std::time::Duration::from_millis(digits.parse::<u64>().ok()? * multiplier))
+        } else {
+            return None;
+        };
+        if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some(std::time::Duration::from_millis(
+            digits.parse::<u64>().ok()? * multiplier,
+        ))
     }
 }

@@ -46,8 +46,8 @@ pub fn sign(private_key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Verify a P-256 ECDSA signature (SHA-256 hash, ASN.1 DER encoded).
 pub fn verify_sign(public_key: &[u8], data: &[u8], sig: &[u8]) -> bool {
-    use p256::ecdsa::{Signature, VerifyingKey};
     use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
     let Ok(verifying_key) = VerifyingKey::from_sec1_bytes(public_key) else {
         return false;
     };
@@ -58,7 +58,10 @@ pub fn verify_sign(public_key: &[u8], data: &[u8], sig: &[u8]) -> bool {
 }
 
 /// TS3-specific shared secret derivation using Ed25519 point arithmetic.
-pub fn get_shared_secret2(public_key_bytes: &[u8], private_key_bytes: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn get_shared_secret2(
+    public_key_bytes: &[u8],
+    private_key_bytes: &[u8],
+) -> Result<Vec<u8>, Error> {
     if public_key_bytes.len() != CURVE25519_KEY_SIZE
         || private_key_bytes.len() != CURVE25519_KEY_SIZE
     {

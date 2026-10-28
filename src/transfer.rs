@@ -65,12 +65,17 @@ pub async fn dial_file_transfer(
     port: u16,
 ) -> Result<tokio::net::TcpStream, crate::Error> {
     if port == 0 {
-        return Err(crate::Error::FileTransfer("invalid file transfer port: 0".into()));
+        return Err(crate::Error::FileTransfer(
+            "invalid file transfer port: 0".into(),
+        ));
     }
-    tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect((host, port)))
-        .await
-        .map_err(|_| crate::Error::FileTransfer("connection timeout".into()))?
-        .map_err(|e| crate::Error::FileTransfer(format!("failed to connect: {e}")))
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| crate::Error::FileTransfer("connection timeout".into()))?
+    .map_err(|e| crate::Error::FileTransfer(format!("failed to connect: {e}")))
 }
 
 async fn open_transfer(
@@ -98,7 +103,9 @@ pub async fn upload_file_data<R: AsyncRead + Unpin>(
     let mut stream = open_transfer(host, info.port, &info.file_transfer_key).await?;
     let mut buffer = [0u8; 32 * 1024];
     loop {
-        let length = data.read(&mut buffer).await
+        let length = data
+            .read(&mut buffer)
+            .await
             .map_err(|e| crate::Error::FileTransfer(format!("read failed: {e}")))?;
         if length == 0 {
             break;
@@ -108,7 +115,9 @@ pub async fn upload_file_data<R: AsyncRead + Unpin>(
             .map_err(|_| crate::Error::FileTransfer("upload write timeout".into()))?
             .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
     }
-    stream.shutdown().await
+    stream
+        .shutdown()
+        .await
         .map_err(|e| crate::Error::FileTransfer(format!("shutdown failed: {e}")))
 }
 
@@ -125,24 +134,31 @@ pub async fn download_file_data<W: AsyncWrite + Unpin>(
     loop {
         // 声明长度之外最多读取一个字节，发现超量时不把它交给调用者。
         let limit = remaining.saturating_add(1).min(buffer.len() as u64) as usize;
-        let length = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer[..limit]))
-            .await
-            .map_err(|_| crate::Error::FileTransfer("download read timeout".into()))?
-            .map_err(|e| crate::Error::FileTransfer(format!("read failed: {e}")))?;
+        let length =
+            tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer[..limit]))
+                .await
+                .map_err(|_| crate::Error::FileTransfer("download read timeout".into()))?
+                .map_err(|e| crate::Error::FileTransfer(format!("read failed: {e}")))?;
         if length == 0 {
             if remaining != 0 {
-                return Err(crate::Error::FileTransfer(format!("download ended with {remaining} bytes missing")));
+                return Err(crate::Error::FileTransfer(format!(
+                    "download ended with {remaining} bytes missing"
+                )));
             }
             break;
         }
         if length as u64 > remaining {
-            return Err(crate::Error::FileTransfer("download exceeds announced size".into()));
+            return Err(crate::Error::FileTransfer(
+                "download exceeds announced size".into(),
+            ));
         }
-        dest.write_all(&buffer[..length]).await
+        dest.write_all(&buffer[..length])
+            .await
             .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
         remaining -= length as u64;
     }
-    dest.flush().await
+    dest.flush()
+        .await
         .map_err(|e| crate::Error::FileTransfer(format!("flush failed: {e}")))
 }
 
@@ -165,17 +181,15 @@ pub fn build_ft_init_upload(
     params.insert("cpw".to_string(), password.to_string());
     params.insert("size".to_string(), size.to_string());
     params.insert("clientftfid".to_string(), cftid.to_string());
-    params.insert("overwrite".to_string(), if overwrite { "1" } else { "0" }.to_string());
+    params.insert(
+        "overwrite".to_string(),
+        if overwrite { "1" } else { "0" }.to_string(),
+    );
     params.insert("resume".to_string(), "0".to_string());
     build_command("ftinitupload", params)
 }
 
-pub fn build_ft_init_download(
-    channel_id: u64,
-    path: &str,
-    password: &str,
-    cftid: i32,
-) -> String {
+pub fn build_ft_init_download(channel_id: u64, path: &str, password: &str, cftid: i32) -> String {
     let target_path = if path.starts_with('/') {
         path.to_string()
     } else {
@@ -219,7 +233,13 @@ mod tests {
             socket.write_all(data).await.unwrap();
         });
         let mut output = Vec::new();
-        download_file_data("127.0.0.1", &download_info(port, data.len() as u64), &mut output).await.unwrap();
+        download_file_data(
+            "127.0.0.1",
+            &download_info(port, data.len() as u64),
+            &mut output,
+        )
+        .await
+        .unwrap();
         assert_eq!(output, data);
         server.await.unwrap();
     }
@@ -236,7 +256,11 @@ mod tests {
                 socket.write_all(data).await.unwrap();
             });
             let mut output = Vec::new();
-            assert!(download_file_data("127.0.0.1", &download_info(port, size), &mut output).await.is_err());
+            assert!(
+                download_file_data("127.0.0.1", &download_info(port, size), &mut output)
+                    .await
+                    .is_err()
+            );
             assert!(output.len() as u64 <= size);
             server.await.unwrap();
         }
@@ -259,15 +283,24 @@ mod tests {
             server_file_transfer_id: 2,
             port: i32::from(port),
         };
-        upload_file_data("127.0.0.1", &info, b"unaligned-file".as_slice()).await.unwrap();
+        upload_file_data("127.0.0.1", &info, b"unaligned-file".as_slice())
+            .await
+            .unwrap();
         assert_eq!(server.await.unwrap(), b"test-keyunaligned-file");
     }
 
     #[tokio::test]
     async fn transfer_ports_are_validated_without_wrapping() {
         for port in [-1, 0, 65536] {
-            let info = FileDownloadInfo { port, ..download_info(1, 1) };
-            assert!(download_file_data("127.0.0.1", &info, &mut Vec::new()).await.is_err());
+            let info = FileDownloadInfo {
+                port,
+                ..download_info(1, 1)
+            };
+            assert!(
+                download_file_data("127.0.0.1", &info, &mut Vec::new())
+                    .await
+                    .is_err()
+            );
         }
     }
 }

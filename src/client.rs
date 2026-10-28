@@ -7,10 +7,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::sync::Notify;
 
+use crate::Error;
 use crate::command::parse_command;
 use crate::commands::{self, CommandTracker};
 use crate::crypto::{Crypt, Identity};
@@ -18,14 +19,13 @@ use crate::directory as server_directory;
 use crate::discovery::Resolver;
 use crate::events::{build_command_chain, build_event_chain};
 use crate::helpers::{is_auto_nickname_match, split_command_rows};
-use crate::notifications::{handle_notification, NotificationResult};
+use crate::notifications::{NotificationResult, handle_notification};
 use crate::throttle::CommandThrottle;
 use crate::transfer::{self, FileTransferTracker, FtNotification};
 use crate::transport::{Packet, PacketHandler, PacketSender, PacketType};
 pub use crate::types::AbortSignal;
-use crate::types::*;
 pub use crate::types::ClientStatus;
-use crate::Error;
+use crate::types::*;
 
 // ---- Internal helpers -----------------------------------------------------------
 
@@ -232,7 +232,7 @@ pub(crate) struct ClientInner {
     pub(crate) client_init_options: ClientInitOptions,
     pub(crate) status: ClientStatus,
     pub(crate) cmd_track: CommandTracker,
-    own_permissions: HashMap<u32,i32>,
+    own_permissions: HashMap<u32, i32>,
     pub(crate) ft_track: FileTransferTracker,
     pub(crate) directory: server_directory::DirectoryCache,
     pub(crate) directory_ready: bool,
@@ -297,7 +297,9 @@ impl ClientInner {
 
     fn process_packet(&mut self, sender: &PacketSender, p: Packet) {
         let p_type = p.type_flagged & 0x0f;
-        if p_type == 8 /* Init1 */ {
+        if p_type == 8
+        /* Init1 */
+        {
             match crate::handshake::process_init1(&mut self.crypt, Some(&p.data)) {
                 Ok(Some(response)) => {
                     sender.set_crypt(self.crypt.clone());
@@ -308,12 +310,12 @@ impl ClientInner {
             return;
         }
 
-        if (p_type == 0 /* Voice */ || p_type == 1 /* VoiceWhisper */) && p.data.len() > 5 {
+        if (p_type == 0 /* Voice */ || p_type == 1/* VoiceWhisper */) && p.data.len() > 5 {
             self.handle_voice_packet(&p.data);
             return;
         }
 
-        if (p_type == 2 /* Command */ || p_type == 3 /* CommandLow */) && !p.data.is_empty() {
+        if (p_type == 2 /* Command */ || p_type == 3/* CommandLow */) && !p.data.is_empty() {
             if let Ok(s) = String::from_utf8(p.data) {
                 self.handle_command_lines(&s, sender);
             }
@@ -376,7 +378,9 @@ impl ClientInner {
         if cmd.name.starts_with("notify") {
             self.cmd_track
                 .buffer_notification(&cmd.name, cmd.params.clone());
-            if cmd.name == "notifyclientneededpermissions" && self.status != ClientStatus::Disconnected {
+            if cmd.name == "notifyclientneededpermissions"
+                && self.status != ClientStatus::Disconnected
+            {
                 if let Some(id) = cmd.params.get("permid").and_then(|v| v.parse::<u32>().ok()) {
                     match cmd
                         .params
@@ -416,8 +420,7 @@ impl ClientInner {
             if let Some(info) = updated_client {
                 self.dispatch_event(Event::ClientUpdated(info));
             }
-            if channel_changed || client_changed || (!was_truncated && self.directory.truncated())
-            {
+            if channel_changed || client_changed || (!was_truncated && self.directory.truncated()) {
                 self.mark_directory_changed();
             }
             return;
@@ -452,9 +455,7 @@ impl ClientInner {
                     // events own the state of clients they introduced or
                     // removed, and a buffered welcome patch replays over a
                     // fresh insert only.
-                    if !self.directory.client_departed(id)
-                        && self.directory.client(id).is_none()
-                    {
+                    if !self.directory.client_departed(id) && self.directory.client(id).is_none() {
                         changed = self.directory.insert_client(client);
                         if let Some(params) = self.directory.take_pending_client_updates(id) {
                             if let Some(info) = server_directory::apply_client_notification(
@@ -564,7 +565,9 @@ impl ClientInner {
                     for h in &self.event_handlers.kicked {
                         let h = Arc::clone(h);
                         let msg = event.reason_msg.clone();
-                        tokio::spawn(async move { h(Event::Kicked(msg)); });
+                        tokio::spawn(async move {
+                            h(Event::Kicked(msg));
+                        });
                     }
                 }
                 self.mark_directory_changed();
@@ -580,13 +583,16 @@ impl ClientInner {
                 self.dispatch_event(Event::Poked(event));
             }
             NotificationResult::StartUpload { info } => {
-                self.ft_track.notify(info.client_file_transfer_id, FtNotification::Upload(info));
+                self.ft_track
+                    .notify(info.client_file_transfer_id, FtNotification::Upload(info));
             }
             NotificationResult::StartDownload { info } => {
-                self.ft_track.notify(info.client_file_transfer_id, FtNotification::Download(info));
+                self.ft_track
+                    .notify(info.client_file_transfer_id, FtNotification::Download(info));
             }
             NotificationResult::FileTransferStatus { info } => {
-                self.ft_track.notify(info.client_file_transfer_id, FtNotification::Status(info));
+                self.ft_track
+                    .notify(info.client_file_transfer_id, FtNotification::Status(info));
             }
             NotificationResult::Unknown => {}
         }
@@ -634,14 +640,18 @@ impl ClientInner {
                     for h in &self.event_handlers.text_message {
                         let h = Arc::clone(h);
                         let m = msg.clone();
-                        tokio::spawn(async move { h(Event::TextMessage(m)); });
+                        tokio::spawn(async move {
+                            h(Event::TextMessage(m));
+                        });
                     }
                 }
                 Event::ClientEnter(info) => {
                     for h in &self.event_handlers.client_enter {
                         let h = Arc::clone(h);
                         let i = info.clone();
-                        tokio::spawn(async move { h(Event::ClientEnter(i)); });
+                        tokio::spawn(async move {
+                            h(Event::ClientEnter(i));
+                        });
                     }
                 }
                 Event::ClientUpdated(info) => {
@@ -653,14 +663,18 @@ impl ClientInner {
                     for h in &self.event_handlers.client_leave {
                         let h = Arc::clone(h);
                         let e = evt.clone();
-                        tokio::spawn(async move { h(Event::ClientLeave(e)); });
+                        tokio::spawn(async move {
+                            h(Event::ClientLeave(e));
+                        });
                     }
                 }
                 Event::ClientMoved(evt) => {
                     for h in &self.event_handlers.client_moved {
                         let h = Arc::clone(h);
                         let e = evt.clone();
-                        tokio::spawn(async move { h(Event::ClientMoved(e)); });
+                        tokio::spawn(async move {
+                            h(Event::ClientMoved(e));
+                        });
                     }
                 }
                 Event::DirectorySnapshot(snapshot) => {
@@ -680,34 +694,44 @@ impl ClientInner {
                     for h in &self.event_handlers.poked {
                         let h = Arc::clone(h);
                         let e = evt.clone();
-                        tokio::spawn(async move { h(Event::Poked(e)); });
+                        tokio::spawn(async move {
+                            h(Event::Poked(e));
+                        });
                     }
                 }
                 Event::VoiceData(data) => {
                     for h in &self.event_handlers.voice_data {
                         let h = Arc::clone(h);
                         let d = data.clone();
-                        tokio::spawn(async move { h(Event::VoiceData(d)); });
+                        tokio::spawn(async move {
+                            h(Event::VoiceData(d));
+                        });
                     }
                 }
                 Event::Connected => {
                     for h in &self.event_handlers.connected {
                         let h = Arc::clone(h);
-                        tokio::spawn(async move { h(); });
+                        tokio::spawn(async move {
+                            h();
+                        });
                     }
                 }
                 Event::Disconnected(err) => {
                     for h in &self.event_handlers.disconnected {
                         let h = Arc::clone(h);
                         let e = err.clone();
-                        tokio::spawn(async move { h(Event::Disconnected(e)); });
+                        tokio::spawn(async move {
+                            h(Event::Disconnected(e));
+                        });
                     }
                 }
                 Event::Kicked(msg) => {
                     for h in &self.event_handlers.kicked {
                         let h = Arc::clone(h);
                         let m = msg.clone();
-                        tokio::spawn(async move { h(Event::Kicked(m)); });
+                        tokio::spawn(async move {
+                            h(Event::Kicked(m));
+                        });
                     }
                 }
             }
@@ -723,7 +747,9 @@ impl ClientInner {
         let handlers = std::mem::take(&mut self.event_handlers.disconnected);
         for h in handlers {
             let e = err.clone();
-            tokio::spawn(async move { h(Event::Disconnected(e)); });
+            tokio::spawn(async move {
+                h(Event::Disconnected(e));
+            });
         }
     }
 
@@ -734,7 +760,9 @@ impl ClientInner {
         }
         let handlers = std::mem::take(&mut self.event_handlers.connected);
         for h in handlers {
-            tokio::spawn(async move { h(); });
+            tokio::spawn(async move {
+                h();
+            });
         }
     }
 
@@ -801,15 +829,12 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(
-        identity: Identity,
-        addr: String,
-        nickname: String,
-        options: ClientOptions,
-    ) -> Self {
+    pub fn new(identity: Identity, addr: String, nickname: String, options: ClientOptions) -> Self {
         let client_init_options = ClientInitOptions::from(&options);
         let logger: Arc<dyn Logger> = options.logger;
-        let resolver: Box<dyn AddrResolver> = options.resolver.unwrap_or_else(|| Box::new(Resolver::new()));
+        let resolver: Box<dyn AddrResolver> = options
+            .resolver
+            .unwrap_or_else(|| Box::new(Resolver::new()));
         let cmd_middlewares = options.command_middleware;
         let event_middlewares = options.event_middleware;
 
@@ -899,7 +924,8 @@ impl Client {
             let inner = self.inner.lock().unwrap();
             resolve_addr_impl(&inner.addr, &*self.resolver).await
         };
-        self.logger.info(&format!("connecting to server: {target_addr}"), &[]);
+        self.logger
+            .info(&format!("connecting to server: {target_addr}"), &[]);
         {
             let handler = self.handler.lock().unwrap();
             handler.connect(&target_addr).await?;
@@ -1002,7 +1028,9 @@ impl Client {
         self.logger.info("disconnecting from server", &[]);
 
         if was_connected {
-            let _ = self.exec_command("clientdisconnect reasonmsg=Shutdown", 1000).await;
+            let _ = self
+                .exec_command("clientdisconnect reasonmsg=Shutdown", 1000)
+                .await;
         }
 
         self.handler.lock().unwrap().close();
@@ -1050,17 +1078,15 @@ impl Client {
                 Ok(())
             }
             None => {
-                rx.await.map_err(|_| Error::Teamspeak("connection cancelled".into()))?;
+                rx.await
+                    .map_err(|_| Error::Teamspeak("connection cancelled".into()))?;
                 Ok(())
             }
         }
     }
 
     /// Wait until the welcome stream has supplied the complete directory.
-    pub async fn wait_directory_ready(
-        &self,
-        signal: Option<&AbortSignal>,
-    ) -> Result<(), Error> {
+    pub async fn wait_directory_ready(&self, signal: Option<&AbortSignal>) -> Result<(), Error> {
         let (mut rx, _guard) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.directory_ready {
@@ -1112,8 +1138,13 @@ impl Client {
         cmd: &str,
         timeout_ms: u64,
     ) -> Result<Vec<HashMap<String, String>>, Error> {
-        if cmd.split_whitespace().any(|part| part.starts_with("return_code=")) {
-            return Err(Error::Teamspeak("return_code is managed by the client".into()));
+        if cmd
+            .split_whitespace()
+            .any(|part| part.starts_with("return_code="))
+        {
+            return Err(Error::Teamspeak(
+                "return_code is managed by the client".into(),
+            ));
         }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         for refused in 0..=3 {
@@ -1124,12 +1155,19 @@ impl Client {
                 throttle.wait(None).await?;
                 let (rc, rx) = self.inner.lock().unwrap().cmd_track.register_command(cmd);
                 registered = Some(rc);
-                self.logger.debug(&format!("command {} awaiting response rc={rc}", cmd.split_whitespace().next().unwrap_or("")), &[]);
+                self.logger.debug(
+                    &format!(
+                        "command {} awaiting response rc={rc}",
+                        cmd.split_whitespace().next().unwrap_or("")
+                    ),
+                    &[],
+                );
                 let handler = self.final_cmd_handler.lock().unwrap().clone();
                 handler(commands::append_return_code(cmd, rc)).await?;
                 sent = true;
                 drop(throttle);
-                rx.await.map_err(|_| Error::Teamspeak("command channel closed".into()))
+                rx.await
+                    .map_err(|_| Error::Teamspeak("command channel closed".into()))
             };
             let result = tokio::time::timeout_at(deadline, attempt).await;
             if let Some(rc) = registered {
@@ -1147,8 +1185,13 @@ impl Client {
                 if let Some(delay) = error.flood_retry_delay() {
                     // Match the reference client's recovery margin; only an explicit refusal is retried.
                     let hold = delay.saturating_mul(2);
-                    self.logger.debug(&format!("server requested command pause: {}ms", delay.as_millis()), &[]);
-                    if refused < 3 && hold < deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                    self.logger.debug(
+                        &format!("server requested command pause: {}ms", delay.as_millis()),
+                        &[],
+                    );
+                    if refused < 3
+                        && hold < deadline.saturating_duration_since(tokio::time::Instant::now())
+                    {
                         self.throttle.lock().await.hold(hold);
                         continue;
                     }
@@ -1183,27 +1226,52 @@ impl Client {
     }
 
     pub fn on_text_message(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.text_message.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .text_message
+            .push(handler);
         self
     }
 
     pub fn on_client_enter(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.client_enter.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .client_enter
+            .push(handler);
         self
     }
 
     pub fn on_client_updated(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.client_updated.push(SerialEventHandler::new(handler));
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .client_updated
+            .push(SerialEventHandler::new(handler));
         self
     }
 
     pub fn on_client_leave(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.client_leave.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .client_leave
+            .push(handler);
         self
     }
 
     pub fn on_client_moved(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.client_moved.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .client_moved
+            .push(handler);
         self
     }
 
@@ -1220,27 +1288,52 @@ impl Client {
     }
 
     pub fn on_poked(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.poked.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .poked
+            .push(handler);
         self
     }
 
     pub fn on_voice_data(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.voice_data.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .voice_data
+            .push(handler);
         self
     }
 
     pub fn on_connected(&self, handler: Arc<dyn Fn() + Send + Sync>) -> &Self {
-        self.inner.lock().unwrap().event_handlers.connected.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .connected
+            .push(handler);
         self
     }
 
     pub fn on_disconnected(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.disconnected.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .disconnected
+            .push(handler);
         self
     }
 
     pub fn on_kicked(&self, handler: EventHandler) -> &Self {
-        self.inner.lock().unwrap().event_handlers.kicked.push(handler);
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .kicked
+            .push(handler);
         self
     }
 
@@ -1252,9 +1345,7 @@ impl Client {
     /// Returns `None` while the directory is still loading or disconnected.
     pub fn directory_snapshot(&self) -> Option<DirectorySnapshot> {
         let inner = self.inner.lock().unwrap();
-        inner
-            .directory_ready
-            .then(|| inner.directory.snapshot())
+        inner.directory_ready.then(|| inner.directory.snapshot())
     }
 
     pub fn use_command_middleware(&self, mw: Vec<Box<dyn CommandMiddleware>>) -> &Self {
@@ -1293,7 +1384,8 @@ impl Client {
             let mut inner = self.inner.lock().unwrap();
             inner.ft_track.register()
         };
-        let cmd = transfer::build_ft_init_upload(channel_id, path, password, size, cftid, overwrite);
+        let cmd =
+            transfer::build_ft_init_upload(channel_id, path, password, size, cftid, overwrite);
 
         if let Err(err) = self.exec_command(&cmd, 10_000).await {
             let mut inner = self.inner.lock().unwrap();
@@ -1301,14 +1393,20 @@ impl Client {
             return Err(err);
         }
 
-        let result = self.wait_file_transfer(cftid, &mut ft_rx, Duration::from_secs(10)).await?;
+        let result = self
+            .wait_file_transfer(cftid, &mut ft_rx, Duration::from_secs(10))
+            .await?;
 
         match result {
             FtNotification::Upload(info) => Ok(info),
-            FtNotification::Download(_) => Err(Error::FileTransfer("unexpected download response".into())),
-            FtNotification::Status(st) => {
-                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message, extra_message:None })
+            FtNotification::Download(_) => {
+                Err(Error::FileTransfer("unexpected download response".into()))
             }
+            FtNotification::Status(st) => Err(Error::ServerError {
+                id: st.status.to_string(),
+                server_message: st.message,
+                extra_message: None,
+            }),
         }
     }
 
@@ -1330,14 +1428,20 @@ impl Client {
             return Err(err);
         }
 
-        let result = self.wait_file_transfer(cftid, &mut ft_rx, Duration::from_secs(10)).await?;
+        let result = self
+            .wait_file_transfer(cftid, &mut ft_rx, Duration::from_secs(10))
+            .await?;
 
         match result {
             FtNotification::Download(info) => Ok(info),
-            FtNotification::Upload(_) => Err(Error::FileTransfer("unexpected upload response".into())),
-            FtNotification::Status(st) => {
-                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message, extra_message:None })
+            FtNotification::Upload(_) => {
+                Err(Error::FileTransfer("unexpected upload response".into()))
             }
+            FtNotification::Status(st) => Err(Error::ServerError {
+                id: st.status.to_string(),
+                server_message: st.message,
+                extra_message: None,
+            }),
         }
     }
 
@@ -1394,7 +1498,9 @@ impl Client {
         let handlers = std::mem::take(&mut inner.event_handlers.connected);
         drop(inner);
         for h in handlers {
-            tokio::spawn(async move { h(); });
+            tokio::spawn(async move {
+                h();
+            });
         }
     }
 
@@ -1409,18 +1515,25 @@ impl Client {
         };
 
         // Replace the PacketHandler entirely, matching JS resetForConnect
-        *self.handler.lock().unwrap() = PacketHandler::new(new_crypt.clone(), Arc::clone(&self.logger));
+        *self.handler.lock().unwrap() =
+            PacketHandler::new(new_crypt.clone(), Arc::clone(&self.logger));
 
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = mpsc::unbounded_channel();
 
-        self.handler.lock().unwrap().set_on_packet(Box::new(move |p: Packet| {
-            let _ = packet_tx.send(p);
-        }));
+        self.handler
+            .lock()
+            .unwrap()
+            .set_on_packet(Box::new(move |p: Packet| {
+                let _ = packet_tx.send(p);
+            }));
         let close_tx_for_inner = close_tx.clone();
-        self.handler.lock().unwrap().set_on_close(Box::new(move |err: Option<Error>| {
-            let _ = close_tx.send(err);
-        }));
+        self.handler
+            .lock()
+            .unwrap()
+            .set_on_close(Box::new(move |err: Option<Error>| {
+                let _ = close_tx.send(err);
+            }));
 
         let sender = self.handler.lock().unwrap().create_packet_sender();
         {
@@ -1435,10 +1548,8 @@ impl Client {
             inner.close_rx = close_rx;
             inner.close_tx = close_tx_for_inner;
         }
-        *self.final_cmd_handler.lock().unwrap() = Self::build_cmd_handler_simple(
-            &self.inner.lock().unwrap().cmd_middlewares,
-            &sender,
-        );
+        *self.final_cmd_handler.lock().unwrap() =
+            Self::build_cmd_handler_simple(&self.inner.lock().unwrap().cmd_middlewares, &sender);
     }
 }
 
@@ -1451,7 +1562,10 @@ async fn resolve_addr_impl(addr: &str, resolver: &dyn AddrResolver) -> String {
         format!("{}:9987", addr)
     };
     match resolver.resolve(addr, None).await {
-        Ok(addrs) => addrs.first().map(|a| a.addr.clone()).unwrap_or(addr_with_port),
+        Ok(addrs) => addrs
+            .first()
+            .map(|a| a.addr.clone())
+            .unwrap_or(addr_with_port),
         Err(_) => addr_with_port,
     }
 }
@@ -1498,24 +1612,41 @@ mod tests {
         );
         let (cftid, mut receiver) = client.inner.lock().unwrap().ft_track.register();
         assert!(matches!(
-            client.wait_file_transfer(cftid, &mut receiver, Duration::ZERO).await,
+            client
+                .wait_file_transfer(cftid, &mut receiver, Duration::ZERO)
+                .await,
             Err(Error::FileTransferTimeout)
         ));
-        assert_eq!(receiver.try_recv().unwrap_err(), oneshot::error::TryRecvError::Closed);
+        assert_eq!(
+            receiver.try_recv().unwrap_err(),
+            oneshot::error::TryRecvError::Closed
+        );
 
         let (next_id, mut next_receiver) = client.inner.lock().unwrap().ft_track.register();
-        client.inner.lock().unwrap().ft_track.notify(cftid, FtNotification::Status(FileTransferStatusInfo {
-            client_file_transfer_id: cftid,
-            status: 1,
-            message: String::new(),
-        }));
-        assert_eq!(next_receiver.try_recv().unwrap_err(), oneshot::error::TryRecvError::Empty);
-        client.inner.lock().unwrap().ft_track.notify(next_id, FtNotification::Status(FileTransferStatusInfo {
-            client_file_transfer_id: next_id,
-            status: 2,
-            message: String::new(),
-        }));
-        let notification = client.wait_file_transfer(next_id, &mut next_receiver, Duration::from_secs(1)).await.unwrap();
+        client.inner.lock().unwrap().ft_track.notify(
+            cftid,
+            FtNotification::Status(FileTransferStatusInfo {
+                client_file_transfer_id: cftid,
+                status: 1,
+                message: String::new(),
+            }),
+        );
+        assert_eq!(
+            next_receiver.try_recv().unwrap_err(),
+            oneshot::error::TryRecvError::Empty
+        );
+        client.inner.lock().unwrap().ft_track.notify(
+            next_id,
+            FtNotification::Status(FileTransferStatusInfo {
+                client_file_transfer_id: next_id,
+                status: 2,
+                message: String::new(),
+            }),
+        );
+        let notification = client
+            .wait_file_transfer(next_id, &mut next_receiver, Duration::from_secs(1))
+            .await
+            .unwrap();
         assert!(matches!(notification, FtNotification::Status(info) if info.status == 2));
     }
 
@@ -1540,11 +1671,7 @@ mod tests {
             "bot".to_string(),
             ClientOptions::default(),
         );
-        let sender = client
-            .handler
-            .lock()
-            .unwrap()
-            .create_packet_sender();
+        let sender = client.handler.lock().unwrap().create_packet_sender();
         let mut inner = client.inner.lock().unwrap();
         inner.directory_ready = true;
 
@@ -1557,10 +1684,7 @@ mod tests {
         assert!(inner.directory_publication.dirty);
 
         inner.directory_publication.dirty = false;
-        inner.handle_command_str(
-            "notifyclientupdated clid=7 client_nickname=Alicia",
-            &sender,
-        );
+        inner.handle_command_str("notifyclientupdated clid=7 client_nickname=Alicia", &sender);
         assert_eq!(
             inner.directory.client(7).expect("client").nickname,
             "Alicia"
@@ -1584,10 +1708,7 @@ mod tests {
             "channellist cid=7 pid=0 channel_order=0 channel_name=Stale",
             &sender,
         );
-        assert_eq!(
-            inner.directory.snapshot().channels[0].name,
-            "Live"
-        );
+        assert_eq!(inner.directory.snapshot().channels[0].name, "Live");
         assert!(!inner.directory_publication.dirty);
     }
 
@@ -1599,20 +1720,14 @@ mod tests {
             "bot".to_string(),
             ClientOptions::default(),
         ));
-        let sender = client
-            .handler
-            .lock()
-            .unwrap()
-            .create_packet_sender();
+        let sender = client.handler.lock().unwrap().create_packet_sender();
         client.inner.lock().unwrap().status = ClientStatus::Connecting;
 
         assert!(!client.directory_ready());
         assert!(client.directory_snapshot().is_none());
 
         let waiter_client = Arc::clone(&client);
-        let waiter = tokio::spawn(async move {
-            waiter_client.wait_directory_ready(None).await
-        });
+        let waiter = tokio::spawn(async move { waiter_client.wait_directory_ready(None).await });
         tokio::task::yield_now().await;
 
         client
@@ -1635,8 +1750,7 @@ mod tests {
             ClientOptions::default(),
         ));
         client.inner.lock().unwrap().status = ClientStatus::Connecting;
-        let directory_wakers =
-            || client.inner.lock().unwrap().directory_wakers.len();
+        let directory_wakers = || client.inner.lock().unwrap().directory_wakers.len();
 
         let signal = AbortSignal::new();
         let mut fut = Box::pin(client.wait_directory_ready(Some(&signal)));
@@ -1770,7 +1884,12 @@ mod tests {
             &sender,
         );
         assert_eq!(
-            inner.directory.client(9).expect("client").away_message.as_deref(),
+            inner
+                .directory
+                .client(9)
+                .expect("client")
+                .away_message
+                .as_deref(),
             Some("brb away")
         );
     }
@@ -1785,11 +1904,10 @@ mod tests {
         ));
         let sender = client.handler.lock().unwrap().create_packet_sender();
         client.inner.lock().unwrap().status = ClientStatus::Connecting;
-        client
-            .inner
-            .lock()
-            .unwrap()
-            .handle_command_str("channelclientlist clid=7 cid=3 client_nickname=Alice", &sender);
+        client.inner.lock().unwrap().handle_command_str(
+            "channelclientlist clid=7 cid=3 client_nickname=Alice",
+            &sender,
+        );
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (done_tx, done_rx) = oneshot::channel();
@@ -1884,6 +2002,28 @@ mod tests {
                 .server_groups,
             vec!["6", "8"]
         );
+    }
+
+    #[tokio::test]
+    async fn multi_row_enter_view_carries_target_channel_to_all_clients() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client.inner.lock().unwrap().status = ClientStatus::Connected;
+
+        client.inner.lock().unwrap().handle_command_lines(
+            "notifycliententerview cfid=0 ctid=20 reasonid=2 clid=110 client_nickname=Alice|clid=111 client_nickname=Bob|clid=112 client_nickname=Carol",
+            &sender,
+        );
+
+        let inner = client.inner.lock().unwrap();
+        assert_eq!(inner.directory.client(110).expect("110").channel_id, 20);
+        assert_eq!(inner.directory.client(111).expect("111").channel_id, 20);
+        assert_eq!(inner.directory.client(112).expect("112").channel_id, 20);
     }
 
     fn client_info(id: i32) -> ClientInfo {
@@ -2084,79 +2224,167 @@ mod tests {
     }
     #[tokio::test]
     async fn transfer_status_preserves_the_server_error_code() {
-        for status in [781,2568] {
-            let client=Client::new(crate::crypto::generate_identity(0),"127.0.0.1:9987".into(),"test".into(),ClientOptions::default());
-            let inner=Arc::clone(&client.inner);
-            *client.final_cmd_handler.lock().unwrap()=Arc::new(move |_| {
-                let inner=Arc::clone(&inner);
+        for status in [781, 2568] {
+            let client = Client::new(
+                crate::crypto::generate_identity(0),
+                "127.0.0.1:9987".into(),
+                "test".into(),
+                ClientOptions::default(),
+            );
+            let inner = Arc::clone(&client.inner);
+            *client.final_cmd_handler.lock().unwrap() = Arc::new(move |_| {
+                let inner = Arc::clone(&inner);
                 Box::pin(async move {
-                    let mut inner=inner.lock().unwrap();
-                    inner.cmd_track.resolve(1,None);
-                    inner.ft_track.notify(1,FtNotification::Status(FileTransferStatusInfo {message:"fixture refusal".into(),status,client_file_transfer_id:1}));
+                    let mut inner = inner.lock().unwrap();
+                    inner.cmd_track.resolve(1, None);
+                    inner.ft_track.notify(
+                        1,
+                        FtNotification::Status(FileTransferStatusInfo {
+                            message: "fixture refusal".into(),
+                            status,
+                            client_file_transfer_id: 1,
+                        }),
+                    );
                     Ok(())
                 })
             });
-            let error=client.file_transfer_init_download(1,"/fixture","").await.unwrap_err();
+            let error = client
+                .file_transfer_init_download(1, "/fixture", "")
+                .await
+                .unwrap_err();
             assert!(matches!(error,Error::ServerError{id,..} if id==status.to_string()));
         }
     }
 
     #[tokio::test]
     async fn explicit_flood_refusal_retries_with_a_new_return_code() {
-        for (id, extra, expected) in [("524", Some("retry in 1ms"), 2), ("1024", Some("retry in 1ms"), 1), ("524", None, 1), ("524", Some("please wait 600 seconds"), 1)] {
-            let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        for (id, extra, expected) in [
+            ("524", Some("retry in 1ms"), 2),
+            ("1024", Some("retry in 1ms"), 1),
+            ("524", None, 1),
+            ("524", Some("please wait 600 seconds"), 1),
+        ] {
+            let client = Client::new(
+                crate::crypto::generate_identity(0),
+                "127.0.0.1:9987".into(),
+                "test".into(),
+                ClientOptions::default(),
+            );
             let sent = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&sent);
             let inner = Arc::clone(&client.inner);
             *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
-                let rc = line.split("return_code=").last().unwrap().parse::<i32>().unwrap();
+                let rc = line
+                    .split("return_code=")
+                    .last()
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
                 let mut sent = recorded.lock().unwrap();
                 sent.push(rc);
-                let error = (sent.len() == 1).then(|| Error::ServerError {id: id.into(), server_message: "refused".into(), extra_message: extra.map(str::to_string)});
+                let error = (sent.len() == 1).then(|| Error::ServerError {
+                    id: id.into(),
+                    server_message: "refused".into(),
+                    extra_message: extra.map(str::to_string),
+                });
                 inner.lock().unwrap().cmd_track.resolve(rc, error);
-                Box::pin(async {Ok(())})
+                Box::pin(async { Ok(()) })
             });
-            let result = client.exec_command("setclientchannelgroup cgid=1 cid=2 cldbid=3", 1000).await;
+            let result = client
+                .exec_command("setclientchannelgroup cgid=1 cid=2 cldbid=3", 1000)
+                .await;
             assert_eq!(sent.lock().unwrap().len(), expected);
             assert_eq!(result.is_ok(), expected == 2);
-            if expected == 2 { let sent = sent.lock().unwrap(); assert_ne!(sent[0], sent[1]); }
+            if expected == 2 {
+                let sent = sent.lock().unwrap();
+                assert_ne!(sent[0], sent[1]);
+            }
         }
     }
 
     #[tokio::test]
     async fn command_deadline_includes_waiting_for_the_throttle() {
-        let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".into(),
+            "test".into(),
+            ClientOptions::default(),
+        );
         client.throttle.lock().await.hold(Duration::from_secs(1));
-        *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| panic!("timed out command must not be sent"));
-        assert!(matches!(client.exec_command("clientinfo clid=1", 10).await, Err(Error::CommandTimeout {..})));
+        *client.final_cmd_handler.lock().unwrap() =
+            Arc::new(|_| panic!("timed out command must not be sent"));
+        assert!(matches!(
+            client.exec_command("clientinfo clid=1", 10).await,
+            Err(Error::CommandTimeout { .. })
+        ));
     }
 
     #[tokio::test]
     async fn failed_send_does_not_block_the_next_notification_query() {
-        let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
-        client.inner.lock().unwrap().cmd_track.signal_welcome_complete();
-        *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| Box::pin(async {Err(Error::Teamspeak("send failed".into()))}));
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".into(),
+            "test".into(),
+            ClientOptions::default(),
+        );
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .cmd_track
+            .signal_welcome_complete();
+        *client.final_cmd_handler.lock().unwrap() =
+            Arc::new(|_| Box::pin(async { Err(Error::Teamspeak("send failed".into())) }));
         assert!(client.exec_command("servergrouplist", 1000).await.is_err());
         *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| Box::pin(std::future::pending()));
-        assert!(matches!(client.exec_command("servergrouplist", 10).await, Err(Error::CommandTimeout {..})));
+        assert!(matches!(
+            client.exec_command("servergrouplist", 10).await,
+            Err(Error::CommandTimeout { .. })
+        ));
         let inner = Arc::clone(&client.inner);
         *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
             let rc = line.split("return_code=").last().unwrap().parse().unwrap();
             let mut inner = inner.lock().unwrap();
-            inner.cmd_track.buffer_notification("notifyfilelist", [("name".into(), "fixture".into())].into_iter().collect());
+            inner.cmd_track.buffer_notification(
+                "notifyfilelist",
+                [("name".into(), "fixture".into())].into_iter().collect(),
+            );
             inner.cmd_track.resolve(rc, None);
-            Box::pin(async {Ok(())})
+            Box::pin(async { Ok(()) })
         });
-        assert_eq!(client.exec_command_with_response("ftgetfilelist cid=1 path=/", 1000).await.unwrap()[0]["name"], "fixture");
-        assert!(client.exec_command("sendtextmessage msg=hi\\sreturn_code=1", 1000).await.is_ok());
-        assert!(client.exec_command("servergrouplist return_code=123", 1000).await.is_err());
+        assert_eq!(
+            client
+                .exec_command_with_response("ftgetfilelist cid=1 path=/", 1000)
+                .await
+                .unwrap()[0]["name"],
+            "fixture"
+        );
+        assert!(
+            client
+                .exec_command("sendtextmessage msg=hi\\sreturn_code=1", 1000)
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .exec_command("servergrouplist return_code=123", 1000)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn disconnected_permissions_stay_empty_and_clearing_notifies_subscribers() {
-        let mut client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        let mut client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".into(),
+            "test".into(),
+            ClientOptions::default(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        client.on_own_permissions_changed(Arc::new(move |_| {let _ = tx.send(());}));
+        client.on_own_permissions_changed(Arc::new(move |_| {
+            let _ = tx.send(());
+        }));
         let sender = client.handler.lock().unwrap().create_packet_sender();
         {
             let mut inner = client.inner.lock().unwrap();
@@ -2164,14 +2392,22 @@ mod tests {
             inner.own_permissions.insert(42, 75);
             inner.status = ClientStatus::Disconnected;
             inner.reset_directory_availability();
-            inner.handle_command_str("notifyclientneededpermissions permid=42 permvalue=75", &sender);
+            inner.handle_command_str(
+                "notifyclientneededpermissions permid=42 permvalue=75",
+                &sender,
+            );
         }
-        tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(client.permission_value(42), None);
         client.inner.lock().unwrap().own_permissions.insert(42, 75);
         client.reset_for_connect();
-        tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(client.permission_value(42), None);
     }
-
 }

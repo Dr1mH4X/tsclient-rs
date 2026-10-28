@@ -250,7 +250,10 @@ pub fn parse_server_error(params: &HashMap<String, String>) -> (Option<Error>, O
 
 /// Append a return_code parameter to a command string if not already present.
 pub fn append_return_code(cmd: &str, rc: i32) -> String {
-    if cmd.split_whitespace().any(|part| part.starts_with("return_code=")) {
+    if cmd
+        .split_whitespace()
+        .any(|part| part.starts_with("return_code="))
+    {
         cmd.to_string()
     } else {
         format!("{} return_code={}", cmd, rc)
@@ -368,7 +371,10 @@ mod tests {
         for (cmd, notify) in [
             ("banlist", "notifybanlist"),
             ("clientdblist", "notifyclientdblist"),
-            ("privilegekeyadd tokentype=0 tokenid1=6 tokenid2=0", "notifytokenadd"),
+            (
+                "privilegekeyadd tokentype=0 tokenid1=6 tokenid2=0",
+                "notifytokenadd",
+            ),
         ] {
             let (rc, mut response) = tracker.register_command(cmd);
             tracker.buffer_notification(notify, row(cmd));

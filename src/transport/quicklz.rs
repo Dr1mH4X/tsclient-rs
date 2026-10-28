@@ -189,10 +189,8 @@ fn parse_qlz_header(data: &[u8]) -> Result<(usize, usize, u8), String> {
     }
 
     let decompressed_size = if flags & 0x02 != 0 {
-        (data[5] as u32
-            | (data[6] as u32) << 8
-            | (data[7] as u32) << 16
-            | (data[8] as u32) << 24) as usize
+        (data[5] as u32 | (data[6] as u32) << 8 | (data[7] as u32) << 16 | (data[8] as u32) << 24)
+            as usize
     } else {
         data[2] as usize
     };

@@ -1,8 +1,8 @@
 //! Session encryption & decryption — mirrors `teamspeak-js/src/crypto/crypt.ts`
 
-use std::collections::HashMap;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 use super::eax::EAX;
 use super::identity::Identity;
@@ -48,7 +48,12 @@ impl Crypt {
         }
     }
 
-    pub fn solve_rsa_challenge(&self, data: &[u8], offset: usize, level: i32) -> Result<Vec<u8>, Error> {
+    pub fn solve_rsa_challenge(
+        &self,
+        data: &[u8],
+        offset: usize,
+        level: i32,
+    ) -> Result<Vec<u8>, Error> {
         if level < 0 || level > 1_000_000 {
             return Err(Error::Teamspeak("RSA challenge level out of range".into()));
         }
@@ -68,9 +73,12 @@ impl Crypt {
     }
 
     pub fn init_crypto(&mut self, alpha: &str, beta: &str, omega: &str) -> Result<(), Error> {
-        let alpha_bytes = base64_decode(alpha).ok_or_else(|| Error::Teamspeak("invalid alpha base64".into()))?;
-        let beta_bytes = base64_decode(beta).ok_or_else(|| Error::Teamspeak("invalid beta base64".into()))?;
-        let omega_bytes = base64_decode(omega).ok_or_else(|| Error::Teamspeak("invalid omega base64".into()))?;
+        let alpha_bytes =
+            base64_decode(alpha).ok_or_else(|| Error::Teamspeak("invalid alpha base64".into()))?;
+        let beta_bytes =
+            base64_decode(beta).ok_or_else(|| Error::Teamspeak("invalid beta base64".into()))?;
+        let omega_bytes =
+            base64_decode(omega).ok_or_else(|| Error::Teamspeak("invalid omega base64".into()))?;
 
         let server_pub = super::identity::import_public_key(&omega_bytes)?;
         let shared_secret = self.get_shared_secret(&server_pub);
@@ -183,11 +191,12 @@ impl Crypt {
     }
 
     fn get_shared_secret(&self, server_pub: &[u8; 65]) -> Vec<u8> {
-        use p256::{SecretKey, PublicKey};
+        use p256::{PublicKey, SecretKey};
 
         let secret = SecretKey::from_slice(&self.identity.private_key).unwrap();
         let pub_key = PublicKey::from_sec1_bytes(server_pub).unwrap();
-        let shared_point = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), pub_key.as_affine());
+        let shared_point =
+            p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), pub_key.as_affine());
         let raw_secret = shared_point.raw_secret_bytes();
         Sha1::digest(raw_secret).to_vec()
     }

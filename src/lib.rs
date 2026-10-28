@@ -21,7 +21,7 @@
     clippy::identity_op,
     clippy::explicit_auto_deref,
     clippy::question_mark,
-    clippy::new_without_default,
+    clippy::new_without_default
 )]
 
 // Modules (private to crate, selectively re-exported below)
@@ -55,29 +55,11 @@ pub use types::ClientState;
 pub use types::Event as EventMap;
 
 pub use types::{
-    TextMessage,
-    ClientMovedEvent,
-    ClientLeftViewEvent,
-    ClientInfo,
-    ChannelInfo,
-    DirectorySnapshot,
-    PokeEvent,
-    VoiceData,
-    FileUploadInfo,
-    FileDownloadInfo,
-    FileTransferStatusInfo,
-    CommandMiddleware,
-    EventMiddleware,
-    Logger,
-    AddrResolver,
-    ClientOptions,
-    ResolvedAddr,
-    EscapedString,
-    KickReason,
-    AbortSignal,
-    Event,
-    NoopLogger as noopLogger,
-    ConsoleLogger as consoleLogger,
+    AbortSignal, AddrResolver, ChannelInfo, ClientInfo, ClientLeftViewEvent, ClientMovedEvent,
+    ClientOptions, CommandMiddleware, ConsoleLogger as consoleLogger, DirectorySnapshot,
+    EscapedString, Event, EventMiddleware, FileDownloadInfo, FileTransferStatusInfo,
+    FileUploadInfo, KickReason, Logger, NoopLogger as noopLogger, PokeEvent, ResolvedAddr,
+    TextMessage, VoiceData,
 };
 
 // ---- Errors ---------------------------------------------------------------------
@@ -85,35 +67,19 @@ pub use types::{
 pub use errors::Error;
 
 pub use errors::{
-    TeamspeakError,
-    ServerError,
-    CommandTimeoutError,
-    AlreadyConnectedError,
-    EAXTagMismatchError,
-    FakeSignatureMismatchError,
-    FileTransferError,
-    FileTransferTimeoutError,
-    CryptoInitError,
-    InvalidIdentityError,
+    AlreadyConnectedError, CommandTimeoutError, CryptoInitError, EAXTagMismatchError,
+    FakeSignatureMismatchError, FileTransferError, FileTransferTimeoutError, InvalidIdentityError,
+    ServerError, TeamspeakError,
 };
 
 // ---- High-level API helpers ----------------------------------------------------
 
 pub use api::{
-    send_text_message as sendTextMessage,
-    client_move as clientMove,
-    client_kick as clientKick,
-    ban_client as banClient,
-    client_update as clientUpdate,
-    poke,
-    get_client_info as getClientInfo,
-    icon_file_name,
-    icon_file_name as iconFileName,
-    download_icon,
-    download_icon as downloadIcon,
-    list_channels as listChannels,
-    list_clients as listClients,
-    file_transfer_delete_file as fileTransferDeleteFile,
+    ban_client as banClient, client_kick as clientKick, client_move as clientMove,
+    client_update as clientUpdate, download_icon, download_icon as downloadIcon,
+    file_transfer_delete_file as fileTransferDeleteFile, get_client_info as getClientInfo,
+    icon_file_name, icon_file_name as iconFileName, list_channels as listChannels,
+    list_clients as listClients, poke, send_text_message as sendTextMessage,
 };
 
 pub use command::escape;
@@ -121,16 +87,13 @@ pub use command::escape;
 // ---- File transfer -------------------------------------------------------------
 
 pub use transfer::{
-    dial_file_transfer as dialFileTransfer,
+    dial_file_transfer as dialFileTransfer, download_file_data as downloadFileData,
     upload_file_data as uploadFileData,
-    download_file_data as downloadFileData,
 };
 
 // ---- Crypto (identity management) ---------------------------------------------
 
 pub use crypto::{
-    Identity,
-    identity_from_string as identityFromString,
-    generate_identity as generateIdentity,
-    get_uid_from_public_key as getUidFromPublicKey,
+    Identity, generate_identity as generateIdentity,
+    get_uid_from_public_key as getUidFromPublicKey, identity_from_string as identityFromString,
 };

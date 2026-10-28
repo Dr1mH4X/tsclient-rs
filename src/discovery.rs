@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts, GOOGLE};
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{GOOGLE, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RData;
-use hickory_resolver::TokioResolver;
 
-use crate::types::*;
 use crate::Error;
+use crate::types::*;
 
 const TS_DEFAULT_PORT: u16 = 9987;
 const TS_DNS_DEFAULT_PORT: u16 = 41144;
@@ -24,9 +24,9 @@ fn is_ip_address(host: &str) -> bool {
     // Match JS `/^\d{1,3}(\.\d{1,3}){3}$/` — does NOT validate octet ranges.
     let octets: Vec<&str> = host.split('.').collect();
     octets.len() == 4
-        && octets.iter().all(|o| {
-            !o.is_empty() && o.len() <= 3 && o.bytes().all(|b| b.is_ascii_digit())
-        })
+        && octets
+            .iter()
+            .all(|o| !o.is_empty() && o.len() <= 3 && o.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn split_host_port(addr: &str) -> (&str, u16) {
@@ -166,28 +166,32 @@ impl Resolver {
                 })
             })
             .collect();
-        if addrs.is_empty() {
-            None
-        } else {
-            Some(addrs)
-        }
+        if addrs.is_empty() { None } else { Some(addrs) }
     }
 
-    async fn query_tsdns(tsdns_addr: &str, query_host: &str, signal: Option<&AbortSignal>) -> Option<String> {
+    async fn query_tsdns(
+        tsdns_addr: &str,
+        query_host: &str,
+        signal: Option<&AbortSignal>,
+    ) -> Option<String> {
         let (host, port) = split_host_port(tsdns_addr);
         // Resolve TSDNS hostname via DNS first (TcpStream may fail on SRV-style names)
         let addr = if is_ip_address(host) {
             join_host_port(host, port)
         } else {
             let dns = Self::new_dns_resolver();
-            let lookup = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                dns.ipv4_lookup(host),
-            ).await.ok()?.ok()?;
-            let ip = lookup.answers().iter().find_map(|record| match &record.data {
-                RData::A(addr) => Some(addr.to_string()),
-                _ => None,
-            })?;
+            let lookup =
+                tokio::time::timeout(std::time::Duration::from_secs(2), dns.ipv4_lookup(host))
+                    .await
+                    .ok()?
+                    .ok()?;
+            let ip = lookup
+                .answers()
+                .iter()
+                .find_map(|record| match &record.data {
+                    RData::A(addr) => Some(addr.to_string()),
+                    _ => None,
+                })?;
             join_host_port(&ip, port)
         };
         let connect = tokio::time::timeout(
@@ -246,7 +250,12 @@ impl Resolver {
         None
     }
 
-    async fn resolve_tsdns_srv(&self, domains: &[String], query_host: &str, signal: Option<&AbortSignal>) -> Option<String> {
+    async fn resolve_tsdns_srv(
+        &self,
+        domains: &[String],
+        query_host: &str,
+        signal: Option<&AbortSignal>,
+    ) -> Option<String> {
         for domain in domains {
             let lookup_name = format!("_tsdns._tcp.{domain}");
             let response = self.dns.srv_lookup(lookup_name).await.ok();
@@ -268,7 +277,11 @@ impl Resolver {
         None
     }
 
-    async fn resolve_tsdns_direct(domains: &[String], query_host: &str, signal: Option<&AbortSignal>) -> Option<String> {
+    async fn resolve_tsdns_direct(
+        domains: &[String],
+        query_host: &str,
+        signal: Option<&AbortSignal>,
+    ) -> Option<String> {
         for domain in domains {
             let tsdns_addr = join_host_port(domain, TS_DNS_DEFAULT_PORT);
             if let Some(result) = Self::query_tsdns(&tsdns_addr, query_host, signal).await {

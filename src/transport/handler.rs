@@ -6,14 +6,14 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::watch;
 
+use crate::Error;
 use crate::crypto::Crypt;
 use crate::handshake::process_init1;
 use crate::types::Logger;
-use crate::Error;
 
 use super::generation_window::GenerationWindow;
 use super::packet::{
-    build_c2s_header, is_unencrypted, packet_flags, packet_type, Packet, PacketFlags, PacketType,
+    Packet, PacketFlags, PacketType, build_c2s_header, is_unencrypted, packet_flags, packet_type,
 };
 use super::quicklz::Qlz;
 
@@ -93,7 +93,8 @@ impl HandlerCore {
         if p_type == PacketType::Command {
             self.send_window_command.advance_to_excluded(p.id as u32);
         } else if p_type == PacketType::CommandLow {
-            self.send_window_command_low.advance_to_excluded(p.id as u32);
+            self.send_window_command_low
+                .advance_to_excluded(p.id as u32);
         }
 
         let unencrypted = (flags & PacketFlags::Unencrypted) != 0;
@@ -483,7 +484,11 @@ async fn bg_task(
         Ok(Some(bytes)) => {
             if socket.send(&bytes).await.is_err() {
                 let mut c = core.lock().unwrap();
-                trigger_close(&mut *c, &on_close, Some(Error::from("failed to send init1")));
+                trigger_close(
+                    &mut *c,
+                    &on_close,
+                    Some(Error::from("failed to send init1")),
+                );
                 return;
             }
         }
@@ -575,11 +580,7 @@ async fn bg_task(
 
 // ---- Packet processing -------------------------------------------------------
 
-fn handle_raw_packet(
-    c: &mut HandlerCore,
-    raw: &[u8],
-    on_packet: &Arc<Mutex<Option<OnPacket>>>,
-) {
+fn handle_raw_packet(c: &mut HandlerCore, raw: &[u8], on_packet: &Arc<Mutex<Option<OnPacket>>>) {
     if raw.len() < 11 {
         return;
     }
@@ -647,9 +648,16 @@ fn decrypt_packet_data(
     let p_type_val = packet_type(p) as u8;
     let generation = p.generation_id;
 
-    let r = c
-        .crypt
-        .decrypt(p_type_val, p.id, generation, header, ciphertext, tag, dummy, unencrypted);
+    let r = c.crypt.decrypt(
+        p_type_val,
+        p.id,
+        generation,
+        header,
+        ciphertext,
+        tag,
+        dummy,
+        unencrypted,
+    );
     if let Ok(plaintext) = r {
         return Some((plaintext, dummy_used));
     }
@@ -660,18 +668,28 @@ fn decrypt_packet_data(
             continue;
         }
         let guess_gen = guess_gen as u32;
-        let r = c
-            .crypt
-            .decrypt(p_type_val, p.id, guess_gen, header, ciphertext, tag, false, false);
+        let r = c.crypt.decrypt(
+            p_type_val, p.id, guess_gen, header, ciphertext, tag, false, false,
+        );
         if let Ok(plaintext) = r {
             return Some((plaintext, false));
         }
     }
 
-    if matches!(packet_type(p), PacketType::Command | PacketType::CommandLow | PacketType::Ack) {
-        let r = c
-            .crypt
-            .decrypt(p_type_val, p.id, generation, header, ciphertext, tag, true, unencrypted);
+    if matches!(
+        packet_type(p),
+        PacketType::Command | PacketType::CommandLow | PacketType::Ack
+    ) {
+        let r = c.crypt.decrypt(
+            p_type_val,
+            p.id,
+            generation,
+            header,
+            ciphertext,
+            tag,
+            true,
+            unencrypted,
+        );
         if let Ok(plaintext) = r {
             return Some((plaintext, true));
         }
@@ -712,15 +730,16 @@ fn send_ack(c: &mut HandlerCore, packet_id: u16, ack_type: PacketType, dummy_use
 fn send_pong(c: &mut HandlerCore, p_id: u16, dummy_used: bool) {
     let mut pong_data = vec![0u8; 2];
     pong_data[..2].copy_from_slice(&p_id.to_be_bytes());
-    let bytes = c.build_and_track_packet(PacketType::Pong, pong_data, PacketFlags::Unencrypted, dummy_used);
+    let bytes = c.build_and_track_packet(
+        PacketType::Pong,
+        pong_data,
+        PacketFlags::Unencrypted,
+        dummy_used,
+    );
     c.queue_send(bytes);
 }
 
-fn handle_packet_queue(
-    c: &mut HandlerCore,
-    p: Packet,
-    on_packet: &Arc<Mutex<Option<OnPacket>>>,
-) {
+fn handle_packet_queue(c: &mut HandlerCore, p: Packet, on_packet: &Arc<Mutex<Option<OnPacket>>>) {
     let p_type = packet_type(&p);
     if p_type != PacketType::Command && p_type != PacketType::CommandLow {
         let mut cb = on_packet.lock().unwrap();
@@ -864,10 +883,7 @@ fn try_decompress(logger: &Arc<dyn Logger>, packet: &mut Packet) {
             packet.type_flagged &= !PacketFlags::Compressed;
         }
         Err(err) => {
-            logger.debug(
-                "decompression failed",
-                &[&packet.id, &format!("{err:?}")],
-            );
+            logger.debug("decompression failed", &[&packet.id, &format!("{err:?}")]);
         }
     }
 }
@@ -894,11 +910,7 @@ fn update_post_receive_state(c: &mut HandlerCore, p: &Packet) {
 
 // ---- Resend logic ------------------------------------------------------------
 
-fn check_resends_sync(
-    c: &mut HandlerCore,
-    now: Instant,
-    on_close: &Arc<Mutex<Option<OnClose>>>,
-) {
+fn check_resends_sync(c: &mut HandlerCore, now: Instant, on_close: &Arc<Mutex<Option<OnClose>>>) {
     if now.duration_since(c.last_message_received).as_millis() as u64 > PACKET_TIMEOUT_MS {
         trigger_close(c, on_close, Some(Error::from("idle timeout")));
         return;
@@ -966,11 +978,7 @@ fn do_resend_sync(
     pending_sends.push(final_bytes);
 }
 
-fn trigger_close(
-    c: &mut HandlerCore,
-    on_close: &Arc<Mutex<Option<OnClose>>>,
-    err: Option<Error>,
-) {
+fn trigger_close(c: &mut HandlerCore, on_close: &Arc<Mutex<Option<OnClose>>>, err: Option<Error>) {
     if c.closed {
         return;
     }

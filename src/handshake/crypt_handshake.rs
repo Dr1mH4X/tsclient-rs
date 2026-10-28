@@ -2,9 +2,9 @@
 
 use rand::Rng;
 
+use crate::Error;
 use crate::command::build_command_ordered;
 use crate::crypto::Crypt;
-use crate::Error;
 
 pub const INIT_VERSION: u32 = 1566914096;
 
@@ -40,7 +40,11 @@ fn build_init1_start_packet() -> Vec<u8> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let now = if now > 0xffff_ffff { 0xffff_ffff } else { now as u32 };
+    let now = if now > 0xffff_ffff {
+        0xffff_ffff
+    } else {
+        now as u32
+    };
     buf[5..9].copy_from_slice(&now.to_be_bytes());
 
     let rng: [u8; 4] = rand::rngs::OsRng.r#gen();
@@ -104,12 +108,15 @@ fn build_init1_step4_packet(crypt: &mut Crypt, data: &[u8]) -> Result<Option<Vec
     let alpha_b64 = base64_encode(&alpha_tmp);
     let omega_b64 = crypt.identity.public_key_base64().to_string();
 
-    let cmd = build_command_ordered("clientinitiv", &[
-        ("alpha", &alpha_b64),
-        ("omega", &omega_b64),
-        ("ot", "1"),
-        ("ip", ""),
-    ]);
+    let cmd = build_command_ordered(
+        "clientinitiv",
+        &[
+            ("alpha", &alpha_b64),
+            ("omega", &omega_b64),
+            ("ot", "1"),
+            ("ip", ""),
+        ],
+    );
     let cmd_bytes = cmd.as_bytes();
 
     let mut buf = vec![0u8; INIT_VERSION_LEN + INIT_TYPE_LEN + 232 + 64 + cmd_bytes.len()];

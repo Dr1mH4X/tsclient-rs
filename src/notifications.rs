@@ -9,14 +9,31 @@ use crate::types::*;
 
 #[derive(Debug, Clone)]
 pub enum NotificationResult {
-    ClientEnter { info: ClientInfo },
-    ClientLeave { event: ClientLeftViewEvent, is_self: bool },
-    ClientMoved { event: ClientMovedEvent },
-    TextMessage { message: TextMessage },
-    Poked { event: PokeEvent },
-    StartUpload { info: FileUploadInfo },
-    StartDownload { info: FileDownloadInfo },
-    FileTransferStatus { info: FileTransferStatusInfo },
+    ClientEnter {
+        info: ClientInfo,
+    },
+    ClientLeave {
+        event: ClientLeftViewEvent,
+        is_self: bool,
+    },
+    ClientMoved {
+        event: ClientMovedEvent,
+    },
+    TextMessage {
+        message: TextMessage,
+    },
+    Poked {
+        event: PokeEvent,
+    },
+    StartUpload {
+        info: FileUploadInfo,
+    },
+    StartDownload {
+        info: FileDownloadInfo,
+    },
+    FileTransferStatus {
+        info: FileTransferStatusInfo,
+    },
     Unknown,
 }
 
@@ -142,9 +159,7 @@ fn handle_text_message(
             .or_else(|| invoker_info.as_ref().map(|i| i.uid.clone()))
             .unwrap_or_default(),
         message: unescape(params.get("msg").map(|s| s.as_str()).unwrap_or("")),
-        invoker_groups: invoker_info
-            .map(|i| i.server_groups)
-            .unwrap_or_default(),
+        invoker_groups: invoker_info.map(|i| i.server_groups).unwrap_or_default(),
     };
 
     NotificationResult::TextMessage { message }
@@ -205,7 +220,10 @@ mod tests {
     use crate::directory::apply_client_notification;
 
     fn make_params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -254,11 +272,14 @@ mod tests {
     fn enterview_supersedes_buffered_welcome_updates() {
         let mut clients = DirectoryCache::default();
         // The update names a client the welcome has not introduced yet.
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
-            &mut clients,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
+                &mut clients,
+            )
+            .is_none()
+        );
         // Guard against a vacuous pass: the patch really was buffered.
         assert_eq!(
             clients
@@ -267,17 +288,23 @@ mod tests {
                 .len(),
             2 // clid + client_input_muted
         );
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
-            &mut clients,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &make_params(&[("clid", "5"), ("client_input_muted", "1")]),
+                &mut clients,
+            )
+            .is_none()
+        );
         // Buffered group operations are superseded as well.
-        assert!(apply_client_notification(
-            "notifyservergroupclientadded",
-            &make_params(&[("clid", "5"), ("sgid", "8")]),
-            &mut clients,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyservergroupclientadded",
+                &make_params(&[("clid", "5"), ("sgid", "8")]),
+                &mut clients,
+            )
+            .is_none()
+        );
 
         // The enterview payload describes the client as of now.
         handle_client_enter_view(
@@ -313,11 +340,7 @@ mod tests {
             output_muted: None,
             channel_commander: None,
         }));
-        let params = make_params(&[
-            ("clid", "42"),
-            ("reasonid", "1"),
-            ("reasonmsg", "left"),
-        ]);
+        let params = make_params(&[("clid", "42"), ("reasonid", "1"), ("reasonmsg", "left")]);
         let result = handle_client_left_view(&params, 99, &mut clients);
         match result {
             NotificationResult::ClientLeave { event, is_self } => {

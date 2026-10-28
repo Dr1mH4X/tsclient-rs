@@ -89,7 +89,8 @@ impl DirectoryCache {
                     self.truncated = true;
                     return;
                 }
-                self.pending_group_ops.insert(id, HashMap::from([(sgid, add)]));
+                self.pending_group_ops
+                    .insert(id, HashMap::from([(sgid, add)]));
             }
         }
     }
@@ -301,7 +302,10 @@ impl DirectoryCache {
     pub(crate) fn finish_welcome(&mut self) {
         let channel_ids: Vec<u64> = self.channels.keys().copied().collect();
         for channel_id in channel_ids {
-            let Some(parent_id) = self.channels.get(&channel_id).map(|channel| channel.parent_id)
+            let Some(parent_id) = self
+                .channels
+                .get(&channel_id)
+                .map(|channel| channel.parent_id)
             else {
                 continue;
             };
@@ -444,7 +448,9 @@ fn parse_channel_row(
         codec: params
             .get("channel_codec")
             .and_then(|value| value.parse::<i32>().ok()),
-        icon_id: params.get("channel_icon_id").and_then(|value| parse_icon_id(value)),
+        icon_id: params
+            .get("channel_icon_id")
+            .and_then(|value| parse_icon_id(value)),
     })
 }
 
@@ -467,7 +473,10 @@ pub fn apply_channel_notification(
                 return false;
             };
             if channel.icon_id.is_none() {
-                channel.icon_id = directory.channels.get(&id).and_then(|current| current.icon_id);
+                channel.icon_id = directory
+                    .channels
+                    .get(&id)
+                    .and_then(|current| current.icon_id);
             }
             directory.insert_channel(channel)
         }
@@ -488,10 +497,7 @@ pub fn apply_channel_notification(
                     changed = true;
                 }
             }
-            if let Some(value) = params
-                .get("channel_order")
-                .or_else(|| params.get("order"))
-            {
+            if let Some(value) = params.get("channel_order").or_else(|| params.get("order")) {
                 let order = parse_u64(value);
                 if current.order != order {
                     current.order = order;
@@ -520,7 +526,10 @@ pub fn apply_channel_notification(
                     changed = true;
                 }
             }
-            if let Some(value) = params.get("channel_icon_id").and_then(|value| parse_icon_id(value)) {
+            if let Some(value) = params
+                .get("channel_icon_id")
+                .and_then(|value| parse_icon_id(value))
+            {
                 if current.icon_id != Some(value) {
                     current.icon_id = Some(value);
                     changed = true;
@@ -546,10 +555,7 @@ pub fn apply_channel_notification(
                     changed = true;
                 }
             }
-            if let Some(value) = params
-                .get("channel_order")
-                .or_else(|| params.get("order"))
-            {
+            if let Some(value) = params.get("channel_order").or_else(|| params.get("order")) {
                 let order = parse_u64(value);
                 if current.order != order {
                     current.order = order;
@@ -574,10 +580,7 @@ pub fn parse_client(params: &HashMap<String, String>) -> Option<ClientInfo> {
     );
     Some(ClientInfo {
         id,
-        nickname: params
-            .get("client_nickname")
-            .cloned()
-            .unwrap_or_default(),
+        nickname: params.get("client_nickname").cloned().unwrap_or_default(),
         uid: params
             .get("client_unique_identifier")
             .cloned()
@@ -615,8 +618,7 @@ pub(crate) fn apply_client_notification(
     if directory.client(id).is_none() {
         if name == "notifyclientupdated" {
             directory.buffer_pending_client_update(id, params);
-        } else if name == "notifyservergroupclientadded"
-            || name == "notifyservergroupclientdeleted"
+        } else if name == "notifyservergroupclientadded" || name == "notifyservergroupclientdeleted"
         {
             if let Some(group_id) = params.get("sgid").filter(|value| !value.is_empty()) {
                 directory.buffer_pending_group_op(
@@ -635,11 +637,7 @@ pub(crate) fn apply_client_notification(
         let add = name == "notifyservergroupclientadded";
         let changed = directory.update_client(id, |current| {
             if add {
-                if current
-                    .server_groups
-                    .iter()
-                    .any(|group| group == group_id)
-                {
+                if current.server_groups.iter().any(|group| group == group_id) {
                     return false;
                 }
                 current.server_groups.push(group_id.clone());
@@ -841,10 +839,7 @@ fn ordered_channels_from_index(
     ordered
 }
 
-fn ordered_sibling_ids(
-    mut ids: Vec<u64>,
-    channels: &HashMap<u64, ChannelInfo>,
-) -> Vec<u64> {
+fn ordered_sibling_ids(mut ids: Vec<u64>, channels: &HashMap<u64, ChannelInfo>) -> Vec<u64> {
     ids.sort_unstable();
     let mut by_predecessor: HashMap<u64, Vec<u64>> = HashMap::new();
     for channel_id in ids {
@@ -922,16 +917,30 @@ mod tests {
     #[test]
     fn welcome_updates_coalesce_per_client() {
         let mut directory = DirectoryCache::default();
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_input_muted", "1"), ("client_away", "1")]),
-            &mut directory,
-        ).is_none());
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_input_muted", "0"), ("client_away_message", "brb")]),
-            &mut directory,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[
+                    ("clid", "7"),
+                    ("client_input_muted", "1"),
+                    ("client_away", "1")
+                ]),
+                &mut directory,
+            )
+            .is_none()
+        );
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[
+                    ("clid", "7"),
+                    ("client_input_muted", "0"),
+                    ("client_away_message", "brb")
+                ]),
+                &mut directory,
+            )
+            .is_none()
+        );
         assert!(directory.client(7).is_none());
 
         let patch = directory.take_pending_client_updates(7).expect("patch");
@@ -949,20 +958,26 @@ mod tests {
         assert!(directory.take_pending_client_updates(7).is_none());
 
         // Non-update notifications for unknown clients are not buffered.
-        assert!(apply_client_notification(
-            "notifyclientmoved",
-            &row(&[("clid", "7"), ("ctid", "3")]),
-            &mut directory,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyclientmoved",
+                &row(&[("clid", "7"), ("ctid", "3")]),
+                &mut directory,
+            )
+            .is_none()
+        );
         assert!(directory.take_pending_client_updates(7).is_none());
 
         // Once the welcome finishes, updates for unknown clients are dropped.
         directory.finish_welcome();
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "9"), ("client_away", "1")]),
-            &mut directory,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "9"), ("client_away", "1")]),
+                &mut directory,
+            )
+            .is_none()
+        );
         assert!(directory.take_pending_client_updates(9).is_none());
     }
 
@@ -970,24 +985,30 @@ mod tests {
     fn pending_group_ops_coalesce_per_client() {
         let mut directory = DirectoryCache::default();
         // The last operation per group id wins; different ids are independent.
-        assert!(apply_client_notification(
-            "notifyservergroupclientadded",
-            &row(&[("clid", "12"), ("sgid", "8")]),
-            &mut directory,
-        )
-        .is_none());
-        assert!(apply_client_notification(
-            "notifyservergroupclientdeleted",
-            &row(&[("clid", "12"), ("sgid", "8")]),
-            &mut directory,
-        )
-        .is_none());
-        assert!(apply_client_notification(
-            "notifyservergroupclientadded",
-            &row(&[("clid", "12"), ("sgid", "9")]),
-            &mut directory,
-        )
-        .is_none());
+        assert!(
+            apply_client_notification(
+                "notifyservergroupclientadded",
+                &row(&[("clid", "12"), ("sgid", "8")]),
+                &mut directory,
+            )
+            .is_none()
+        );
+        assert!(
+            apply_client_notification(
+                "notifyservergroupclientdeleted",
+                &row(&[("clid", "12"), ("sgid", "8")]),
+                &mut directory,
+            )
+            .is_none()
+        );
+        assert!(
+            apply_client_notification(
+                "notifyservergroupclientadded",
+                &row(&[("clid", "12"), ("sgid", "9")]),
+                &mut directory,
+            )
+            .is_none()
+        );
 
         let ops = directory.take_pending_group_ops(12);
         assert_eq!(ops.len(), 2);
@@ -996,12 +1017,14 @@ mod tests {
         assert!(directory.take_pending_group_ops(12).is_empty());
 
         // Once the welcome finishes, buffered group operations are dropped.
-        assert!(apply_client_notification(
-            "notifyservergroupclientadded",
-            &row(&[("clid", "13"), ("sgid", "8")]),
-            &mut directory,
-        )
-        .is_none());
+        assert!(
+            apply_client_notification(
+                "notifyservergroupclientadded",
+                &row(&[("clid", "13"), ("sgid", "8")]),
+                &mut directory,
+            )
+            .is_none()
+        );
         directory.finish_welcome();
         assert!(directory.take_pending_group_ops(13).is_empty());
     }
@@ -1011,29 +1034,38 @@ mod tests {
         let mut directory = DirectoryCache::default();
         for id in 1..=MAX_PENDING_CLIENT_UPDATES as i32 {
             let clid = id.to_string();
-            assert!(apply_client_notification(
-                "notifyclientupdated",
-                &row(&[("clid", &clid), ("client_away", "1")]),
-                &mut directory,
-            ).is_none());
+            assert!(
+                apply_client_notification(
+                    "notifyclientupdated",
+                    &row(&[("clid", &clid), ("client_away", "1")]),
+                    &mut directory,
+                )
+                .is_none()
+            );
         }
         assert!(!directory.truncated());
 
         // A new id past the cap is dropped, and the snapshot reports the loss.
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "20000"), ("client_away", "1")]),
-            &mut directory,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "20000"), ("client_away", "1")]),
+                &mut directory,
+            )
+            .is_none()
+        );
         assert!(directory.take_pending_client_updates(20000).is_none());
         assert!(directory.truncated());
 
         // An already buffered id keeps merging past the cap.
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "1"), ("client_input_muted", "1")]),
-            &mut directory,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "1"), ("client_input_muted", "1")]),
+                &mut directory,
+            )
+            .is_none()
+        );
         let patch = directory.take_pending_client_updates(1).expect("patch");
         assert_eq!(
             patch.get("client_input_muted").map(String::as_str),
@@ -1058,14 +1090,16 @@ mod tests {
     #[test]
     fn channel_notifications_update_and_delete_live_rows() {
         let mut directory = DirectoryCache::default();
-        assert!(directory.insert_channel(
-            parse_channel(&row(&[
-                ("cid", "1"),
-                ("pid", "0"),
-                ("channel_name", "Lobby"),
-            ]))
-            .expect("channel"),
-        ));
+        assert!(
+            directory.insert_channel(
+                parse_channel(&row(&[
+                    ("cid", "1"),
+                    ("pid", "0"),
+                    ("channel_name", "Lobby"),
+                ]))
+                .expect("channel"),
+            )
+        );
 
         assert!(apply_channel_notification(
             "notifychanneledited",
@@ -1106,13 +1140,15 @@ mod tests {
     fn deleting_a_channel_removes_every_descendant() {
         let mut directory = DirectoryCache::default();
         for (id, parent) in [(1, 0), (2, 1), (3, 2), (4, 0), (5, 0)] {
-            assert!(directory.insert_channel(
-                parse_channel(&row(&[
-                    ("cid", &id.to_string()),
-                    ("pid", &parent.to_string()),
-                ]))
-                .expect("channel"),
-            ));
+            assert!(
+                directory.insert_channel(
+                    parse_channel(&row(&[
+                        ("cid", &id.to_string()),
+                        ("pid", &parent.to_string()),
+                    ]))
+                    .expect("channel"),
+                )
+            );
         }
         assert!(apply_channel_notification(
             "notifychannelmoved",
@@ -1160,23 +1196,28 @@ mod tests {
     #[test]
     fn client_updates_preserve_fields_the_notification_omits() {
         let mut directory = DirectoryCache::default();
-        assert!(directory.insert_client(
-            parse_client(&row(&[
-                ("clid", "7"),
-                ("cid", "42"),
-                ("client_nickname", "Alice"),
-                ("client_unique_identifier", "uid"),
-                ("client_servergroups", "6,9"),
-                ("client_type", "0"),
-            ]))
-            .expect("client"),
-        ));
+        assert!(
+            directory.insert_client(
+                parse_client(&row(&[
+                    ("clid", "7"),
+                    ("cid", "42"),
+                    ("client_nickname", "Alice"),
+                    ("client_unique_identifier", "uid"),
+                    ("client_servergroups", "6,9"),
+                    ("client_type", "0"),
+                ]))
+                .expect("client"),
+            )
+        );
 
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_nickname", "Alicia")]),
-            &mut directory,
-        ).is_some());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "7"), ("client_nickname", "Alicia")]),
+                &mut directory,
+            )
+            .is_some()
+        );
         let client = directory.client(7).expect("client");
         assert_eq!(client.nickname, "Alicia");
         assert_eq!(client.uid, "uid");
@@ -1185,68 +1226,104 @@ mod tests {
         assert_eq!(client.away, None);
         assert_eq!(client.input_muted, None);
 
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_input_muted", "1")]),
-            &mut directory,
-        ).is_some());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "7"), ("client_input_muted", "1")]),
+                &mut directory,
+            )
+            .is_some()
+        );
         let client = directory.client(7).expect("client");
         assert_eq!(client.input_muted, Some(true));
         assert_eq!(client.output_muted, None);
         assert_eq!(client.nickname, "Alicia");
         assert_eq!(client.channel_id, 42);
 
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_input_muted", "0")]),
-            &mut directory,
-        ).is_some());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "7"), ("client_input_muted", "0")]),
+                &mut directory,
+            )
+            .is_some()
+        );
         assert_eq!(
             directory.client(7).expect("client").input_muted,
             Some(false)
         );
 
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_away", "1")]),
-            &mut directory,
-        ).is_some());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "7"), ("client_away", "1")]),
+                &mut directory,
+            )
+            .is_some()
+        );
         assert_eq!(directory.client(7).expect("client").away, Some(true));
 
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_servergroups", "")]),
-            &mut directory,
-        ).is_some());
-        assert!(directory.client(7).expect("client").server_groups.is_empty());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "7"), ("client_servergroups", "")]),
+                &mut directory,
+            )
+            .is_some()
+        );
+        assert!(
+            directory
+                .client(7)
+                .expect("client")
+                .server_groups
+                .is_empty()
+        );
 
-        assert!(apply_client_notification(
-            "notifyservergroupclientadded",
-            &row(&[("clid", "7"), ("sgid", "8")]),
-            &mut directory,
-        ).is_some());
-        assert!(apply_client_notification(
-            "notifyservergroupclientadded",
-            &row(&[("clid", "7"), ("sgid", "8")]),
-            &mut directory,
-        ).is_none());
+        assert!(
+            apply_client_notification(
+                "notifyservergroupclientadded",
+                &row(&[("clid", "7"), ("sgid", "8")]),
+                &mut directory,
+            )
+            .is_some()
+        );
+        assert!(
+            apply_client_notification(
+                "notifyservergroupclientadded",
+                &row(&[("clid", "7"), ("sgid", "8")]),
+                &mut directory,
+            )
+            .is_none()
+        );
         assert_eq!(
             directory.client(7).expect("client").server_groups,
             vec!["8"]
         );
-        assert!(apply_client_notification(
-            "notifyservergroupclientdeleted",
-            &row(&[("clid", "7"), ("sgid", "8")]),
-            &mut directory,
-        ).is_some());
-        assert!(directory.client(7).expect("client").server_groups.is_empty());
+        assert!(
+            apply_client_notification(
+                "notifyservergroupclientdeleted",
+                &row(&[("clid", "7"), ("sgid", "8")]),
+                &mut directory,
+            )
+            .is_some()
+        );
+        assert!(
+            directory
+                .client(7)
+                .expect("client")
+                .server_groups
+                .is_empty()
+        );
 
         // A groups-only update leaves previously set flags alone.
-        assert!(apply_client_notification(
-            "notifyclientupdated",
-            &row(&[("clid", "7"), ("client_servergroups", "6")]),
-            &mut directory,
-        ).is_some());
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "7"), ("client_servergroups", "6")]),
+                &mut directory,
+            )
+            .is_some()
+        );
         let client = directory.client(7).expect("client");
         assert_eq!(client.server_groups, vec!["6"]);
         assert_eq!(client.input_muted, Some(false));
@@ -1264,14 +1341,16 @@ mod tests {
             (7, 2, 6),
             (1, 0, 0),
         ] {
-            assert!(directory.insert_channel(
-                parse_channel(&row(&[
-                    ("cid", &id.to_string()),
-                    ("pid", &parent.to_string()),
-                    ("channel_order", &order.to_string()),
-                ]))
-                .expect("channel"),
-            ));
+            assert!(
+                directory.insert_channel(
+                    parse_channel(&row(&[
+                        ("cid", &id.to_string()),
+                        ("pid", &parent.to_string()),
+                        ("channel_order", &order.to_string()),
+                    ]))
+                    .expect("channel"),
+                )
+            );
         }
         for id in [9, 4, 7] {
             assert!(directory.insert_client(ClientInfo {
@@ -1313,24 +1392,22 @@ mod tests {
     fn live_channel_creation_keeps_siblings_in_server_order() {
         let mut directory = DirectoryCache::default();
         for (id, order) in [(1, 0), (2, 1), (3, 2)] {
-            assert!(directory.insert_channel(
-                parse_channel(&row(&[
-                    ("cid", &id.to_string()),
-                    ("pid", "0"),
-                    ("channel_order", &order.to_string()),
-                ]))
-                .expect("channel"),
-            ));
+            assert!(
+                directory.insert_channel(
+                    parse_channel(&row(&[
+                        ("cid", &id.to_string()),
+                        ("pid", "0"),
+                        ("channel_order", &order.to_string()),
+                    ]))
+                    .expect("channel"),
+                )
+            );
         }
         directory.finish_welcome();
 
         assert!(apply_channel_notification(
             "notifychannelcreated",
-            &row(&[
-                ("cid", "4"),
-                ("cpid", "0"),
-                ("channel_order", "1"),
-            ]),
+            &row(&[("cid", "4"), ("cpid", "0"), ("channel_order", "1"),]),
             &mut directory,
         ));
         let channels = directory.snapshot().channels;
@@ -1407,15 +1484,27 @@ mod tests {
             ("channel_name".to_string(), "before".to_string()),
             ("channel_icon_id".to_string(), "-1".to_string()),
         ]);
-        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        assert!(apply_channel_notification(
+            "notifychannelcreated",
+            &params,
+            &mut directory
+        ));
         params.remove("channel_icon_id");
         params.insert("channel_name".to_string(), "after".to_string());
-        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        assert!(apply_channel_notification(
+            "notifychannelcreated",
+            &params,
+            &mut directory
+        ));
         let channel = directory.snapshot().channels.remove(0);
         assert_eq!(channel.name, "after");
         assert_eq!(channel.icon_id, Some(u32::MAX));
         params.insert("channel_icon_id".to_string(), "0".to_string());
-        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        assert!(apply_channel_notification(
+            "notifychannelcreated",
+            &params,
+            &mut directory
+        ));
         assert_eq!(directory.snapshot().channels[0].icon_id, Some(0));
     }
 
@@ -1427,17 +1516,36 @@ mod tests {
             ("cpid".to_string(), "0".to_string()),
             ("channel_icon_id".to_string(), "-1".to_string()),
         ]);
-        assert!(apply_channel_notification("notifychannelcreated", &params, &mut directory));
+        assert!(apply_channel_notification(
+            "notifychannelcreated",
+            &params,
+            &mut directory
+        ));
         assert_eq!(directory.snapshot().channels[0].icon_id, Some(u32::MAX));
         params.remove("channel_icon_id");
-        assert!(!apply_channel_notification("notifychanneledited", &params, &mut directory));
+        assert!(!apply_channel_notification(
+            "notifychanneledited",
+            &params,
+            &mut directory
+        ));
         assert_eq!(directory.snapshot().channels[0].icon_id, Some(u32::MAX));
         params.insert("channel_icon_id".to_string(), "0".to_string());
-        assert!(apply_channel_notification("notifychanneledited", &params, &mut directory));
+        assert!(apply_channel_notification(
+            "notifychanneledited",
+            &params,
+            &mut directory
+        ));
         assert_eq!(directory.snapshot().channels[0].icon_id, Some(0));
         // The voice protocol's notifychanneledited sends the id sign-extended to 64 bits.
-        params.insert("channel_icon_id".to_string(), "18446744072424443899".to_string());
-        assert!(apply_channel_notification("notifychanneledited", &params, &mut directory));
+        params.insert(
+            "channel_icon_id".to_string(),
+            "18446744072424443899".to_string(),
+        );
+        assert!(apply_channel_notification(
+            "notifychanneledited",
+            &params,
+            &mut directory
+        ));
         assert_eq!(directory.snapshot().channels[0].icon_id, Some(3009859579));
     }
 }

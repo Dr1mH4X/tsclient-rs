@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
+use crate::Client;
+use crate::Error;
 use crate::command::{build_command, build_command_ordered, unescape};
 use crate::directory::{parse_bool, parse_channel};
 use crate::helpers;
 use crate::types::*;
-use crate::Client;
-use crate::Error;
 
 /// Default timeout (ms) for commands that modify server state.
 const CMD_TIMEOUT_MS: u64 = 10_000;
@@ -22,11 +22,14 @@ pub async fn send_text_message(
     target_id: u64,
     message: &str,
 ) -> Result<(), Error> {
-    let cmd = build_command_ordered("sendtextmessage", &[
-        ("targetmode", &target_mode.to_string()),
-        ("target", &target_id.to_string()),
-        ("msg", message),
-    ]);
+    let cmd = build_command_ordered(
+        "sendtextmessage",
+        &[
+            ("targetmode", &target_mode.to_string()),
+            ("target", &target_id.to_string()),
+            ("msg", message),
+        ],
+    );
     client.send_command_no_wait(&cmd).await
 }
 
@@ -37,47 +40,52 @@ pub async fn client_move(
     channel_id: u64,
     password: &str,
 ) -> Result<(), Error> {
-    let mut params = vec![
-        ("clid", clid.to_string()),
-        ("cid", channel_id.to_string()),
-    ];
+    let mut params = vec![("clid", clid.to_string()), ("cid", channel_id.to_string())];
     if !password.is_empty() {
         params.push(("cpw", password.to_string()));
     }
-    let cmd = build_command_ordered("clientmove", &params.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    let cmd = build_command_ordered(
+        "clientmove",
+        &params
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>(),
+    );
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
 /// Send a poke message to a client.
 pub async fn poke(client: &Client, clid: i32, message: &str) -> Result<(), Error> {
-    let cmd = build_command_ordered("clientpoke", &[
-        ("clid", &clid.to_string()),
-        ("msg", message),
-    ]);
+    let cmd = build_command_ordered(
+        "clientpoke",
+        &[("clid", &clid.to_string()), ("msg", message)],
+    );
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
 /// Fetch raw clientinfo for a given clid.
-pub async fn get_client_info(
-    client: &Client,
-    clid: i32,
-) -> Result<HashMap<String, String>, Error> {
-    let data = client.exec_command_with_response(
-        &format!("clientinfo clid={clid}"),
-        QUERY_TIMEOUT_MS,
-    ).await?;
-    data.into_iter().next().ok_or_else(|| Error::Teamspeak(format!("no data returned for client {clid}")))
+pub async fn get_client_info(client: &Client, clid: i32) -> Result<HashMap<String, String>, Error> {
+    let data = client
+        .exec_command_with_response(&format!("clientinfo clid={clid}"), QUERY_TIMEOUT_MS)
+        .await?;
+    data.into_iter()
+        .next()
+        .ok_or_else(|| Error::Teamspeak(format!("no data returned for client {clid}")))
 }
 
 /// List all channels on the server.
 pub async fn list_channels(client: &Client) -> Result<Vec<ChannelInfo>, Error> {
-    let data = client.exec_command_with_response("channellist -icon", QUERY_TIMEOUT_MS).await?;
+    let data = client
+        .exec_command_with_response("channellist -icon", QUERY_TIMEOUT_MS)
+        .await?;
     Ok(data.iter().filter_map(parse_channel).collect())
 }
 
 /// List all clients currently connected to the server.
 pub async fn list_clients(client: &Client) -> Result<Vec<ClientInfo>, Error> {
-    let data = client.exec_command_with_response("clientlist -uid -away -voice -groups", QUERY_TIMEOUT_MS).await?;
+    let data = client
+        .exec_command_with_response("clientlist -uid -away -voice -groups", QUERY_TIMEOUT_MS)
+        .await?;
     Ok(data
         .into_iter()
         .map(|item| {
@@ -89,10 +97,19 @@ pub async fn list_clients(client: &Client) -> Result<Vec<ClientInfo>, Error> {
             };
             ClientInfo {
                 id: helpers::parse_i10(item.get("clid").map(|s| s.as_str()).unwrap_or("0")),
-                nickname: unescape(item.get("client_nickname").map(|s| s.as_str()).unwrap_or("")),
-                uid: item.get("client_unique_identifier").cloned().unwrap_or_default(),
+                nickname: unescape(
+                    item.get("client_nickname")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                ),
+                uid: item
+                    .get("client_unique_identifier")
+                    .cloned()
+                    .unwrap_or_default(),
                 channel_id: helpers::parse_u64(item.get("cid").map(|s| s.as_str()).unwrap_or("0")),
-                r#type: helpers::parse_i10(item.get("client_type").map(|s| s.as_str()).unwrap_or("0")),
+                r#type: helpers::parse_i10(
+                    item.get("client_type").map(|s| s.as_str()).unwrap_or("0"),
+                ),
                 server_groups,
                 away: parse_bool(item.get("client_away")),
                 away_message: item.get("client_away_message").cloned(),
@@ -115,11 +132,14 @@ pub async fn client_kick(
     reasonmsg: &str,
 ) -> Result<(), Error> {
     let reasonid: i32 = reason.into();
-    let cmd = build_command_ordered("clientkick", &[
-        ("clid", &clid.to_string()),
-        ("reasonid", &reasonid.to_string()),
-        ("reasonmsg", reasonmsg),
-    ]);
+    let cmd = build_command_ordered(
+        "clientkick",
+        &[
+            ("clid", &clid.to_string()),
+            ("reasonid", &reasonid.to_string()),
+            ("reasonmsg", reasonmsg),
+        ],
+    );
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
@@ -130,21 +150,21 @@ pub async fn ban_client(
     time: u64,
     banreason: &str,
 ) -> Result<(), Error> {
-    let cmd = build_command_ordered("banclient", &[
-        ("clid", &clid.to_string()),
-        ("time", &time.to_string()),
-        ("banreason", banreason),
-    ]);
+    let cmd = build_command_ordered(
+        "banclient",
+        &[
+            ("clid", &clid.to_string()),
+            ("time", &time.to_string()),
+            ("banreason", banreason),
+        ],
+    );
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
 /// Update client properties via `clientupdate`.
 ///
 /// Example: `client_update(client, &[("client_description", "hello world")]).await`
-pub async fn client_update(
-    client: &Client,
-    params: &[(&str, &str)],
-) -> Result<(), Error> {
+pub async fn client_update(client: &Client, params: &[(&str, &str)]) -> Result<(), Error> {
     let cmd = build_command_ordered("clientupdate", params);
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
@@ -182,9 +202,14 @@ pub async fn download_icon(
     if icon_id == 0 {
         return Err(Error::FileTransfer("icon ID must be non-zero".into()));
     }
-    let info = client.file_transfer_init_download(0, &icon_file_name(icon_id), "").await?;
+    let info = client
+        .file_transfer_init_download(0, &icon_file_name(icon_id), "")
+        .await?;
     if info.size == 0 || info.size > max_bytes as u64 {
-        return Err(Error::FileTransfer(format!("invalid icon size {} (limit {max_bytes})", info.size)));
+        return Err(Error::FileTransfer(format!(
+            "invalid icon size {} (limit {max_bytes})",
+            info.size
+        )));
     }
     let mut data = Vec::new();
     crate::transfer::download_file_data(host, &info, &mut data).await?;

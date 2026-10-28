@@ -1,8 +1,8 @@
 //! Second-stage crypto initialization (Ed25519 ECDH) — mirrors `teamspeak-js/src/handshake/crypt-init2.ts`
 
-use crate::crypto::primitives::{get_shared_secret2, verify_sign};
-use crate::crypto::{import_public_key, Crypt};
 use crate::Error;
+use crate::crypto::primitives::{get_shared_secret2, verify_sign};
+use crate::crypto::{Crypt, import_public_key};
 
 use super::license::parse_licenses;
 
@@ -19,10 +19,14 @@ pub fn crypto_init2(
         return Err(Error::Teamspeak("alpha is not initialized".into()));
     }
 
-    let license_bytes = base64_decode(license).ok_or_else(|| Error::Teamspeak("invalid license base64".into()))?;
-    let omega_bytes = base64_decode(omega).ok_or_else(|| Error::Teamspeak("invalid omega base64".into()))?;
-    let proof_bytes = base64_decode(proof).ok_or_else(|| Error::Teamspeak("invalid proof base64".into()))?;
-    let beta_bytes = base64_decode(beta).ok_or_else(|| Error::Teamspeak("invalid beta base64".into()))?;
+    let license_bytes =
+        base64_decode(license).ok_or_else(|| Error::Teamspeak("invalid license base64".into()))?;
+    let omega_bytes =
+        base64_decode(omega).ok_or_else(|| Error::Teamspeak("invalid omega base64".into()))?;
+    let proof_bytes =
+        base64_decode(proof).ok_or_else(|| Error::Teamspeak("invalid proof base64".into()))?;
+    let beta_bytes =
+        base64_decode(beta).ok_or_else(|| Error::Teamspeak("invalid beta base64".into()))?;
 
     let server_pub_key = import_public_key(&omega_bytes)?;
 
