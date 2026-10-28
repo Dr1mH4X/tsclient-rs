@@ -1123,6 +1123,7 @@ impl Client {
                 throttle.wait(None).await?;
                 let (rc, rx) = self.inner.lock().unwrap().cmd_track.register_command(cmd);
                 registered = Some(rc);
+                self.logger.debug(&format!("command {} awaiting response rc={rc}", cmd.split_whitespace().next().unwrap_or("")), &[]);
                 let handler = self.final_cmd_handler.lock().unwrap().clone();
                 if let Err(error) = handler(commands::append_return_code(cmd, rc)).await {
                     self.inner.lock().unwrap().cmd_track.discard_unsent(rc);
@@ -1140,6 +1141,7 @@ impl Client {
                 if let Some(delay) = error.flood_retry_delay() {
                     // Match the reference client's recovery margin; only an explicit refusal is retried.
                     let hold = delay.saturating_mul(2);
+                    self.logger.debug(&format!("server requested command pause: {}ms", delay.as_millis()), &[]);
                     if refused < 3 && hold < deadline.saturating_duration_since(tokio::time::Instant::now()) {
                         self.throttle.lock().await.hold(hold);
                         continue;
