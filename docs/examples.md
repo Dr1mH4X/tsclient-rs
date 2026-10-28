@@ -237,3 +237,5 @@ cargo run --example channel_icons
 ## 读取服务器报告的权限
 
 先通过 `client.exec_command_with_response("permissionlist", 5000)` 读取服务器的权限名称表，再使用对应 id 调用 `client.permission_value(id)`。返回 `None` 表示未知或已撤销，界面应禁用相应管理操作；最终操作仍由服务器校验。
+
+`Error::ServerError` 的 `extra_message` 可读取服务端附加说明。命令执行器自动处理带等待时间的防刷拒绝；超时或没有等待时间的拒绝直接返回，不重发已执行结果未知的请求。

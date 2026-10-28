@@ -99,3 +99,5 @@ or resurrected by a late row.
 `client.permission_value(permid)` 返回服务器通过 `notifyclientneededpermissions` 最近推送的本端有效权限；未报告或撤销时返回 `None`，断开连接后清空。`on_own_permissions_changed` 收到 `Event::OwnPermissionsChanged` 后，调用方可重新读取受影响的操作权限。权限 id 由服务器的 `permissionlist` 数据确定，不能跨服务器版本写死。
 
 文件传输协商中的 `notifystatusfiletransfer` 拒绝结果以 `Error::ServerError` 返回，保留数字错误码与服务器文案，调用方可以区分频道密码错误和权限不足。
+
+命令错误保留服务端 `extra_msg`。只有错误 524 携带明确等待时间时才在原调用时限内重试，最多三次；节流等待计入调用超时。

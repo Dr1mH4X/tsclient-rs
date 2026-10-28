@@ -1109,51 +1109,34 @@ impl Client {
         cmd: &str,
         timeout_ms: u64,
     ) -> Result<Vec<HashMap<String, String>>, Error> {
-        let (rc, mut rx) = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.cmd_track.register_command(cmd)
-        };
-        let with_rc = commands::append_return_code(cmd, rc);
-
-        self.throttle.lock().await.wait(None).await?;
-
-        let handler = self.final_cmd_handler.lock().unwrap().clone();
-        if let Err(err) = handler(with_rc).await {
-            let mut inner = self.inner.lock().unwrap();
-            inner.cmd_track.unregister(rc);
-            return Err(err);
-        }
-
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            &mut rx,
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => {
-                let mut inner = self.inner.lock().unwrap();
-                inner.cmd_track.unregister(rc);
-                return Err(Error::Teamspeak("command channel closed".into()));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        for refused in 0..=3 {
+            let (rc, rx) = self.inner.lock().unwrap().cmd_track.register_command(cmd);
+            let attempt = async {
+                self.throttle.lock().await.wait(None).await?;
+                let handler = self.final_cmd_handler.lock().unwrap().clone();
+                handler(commands::append_return_code(cmd, rc)).await?;
+                rx.await.map_err(|_| Error::Teamspeak("command channel closed".into()))
+            };
+            let result = tokio::time::timeout_at(deadline, attempt).await;
+            self.inner.lock().unwrap().cmd_track.unregister(rc);
+            let result = result.map_err(|_| Error::CommandTimeout {
+                command: cmd.split_whitespace().next().unwrap_or("").to_string(),
+            })??;
+            if let Some(error) = result.err {
+                if let Some(delay) = error.flood_retry_delay() {
+                    // Match the reference client's recovery margin; only an explicit refusal is retried.
+                    let hold = delay.saturating_mul(2);
+                    if refused < 3 && hold < deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                        self.throttle.lock().await.hold(hold);
+                        continue;
+                    }
+                }
+                return Err(error);
             }
-            Err(_) => {
-                // Give up on this return_code: leaving it registered would let
-                // its late reply drop the rows of a later command.
-                let mut inner = self.inner.lock().unwrap();
-                inner.cmd_track.unregister(rc);
-                return Err(Error::CommandTimeout {
-                    command: cmd.to_string(),
-                });
-            }
-        };
-
-        let mut inner = self.inner.lock().unwrap();
-        inner.cmd_track.unregister(rc);
-
-        if let Some(err) = result.err {
-            return Err(err);
+            return Ok(result.data);
         }
-        Ok(result.data)
+        unreachable!("bounded retries return on the final attempt")
     }
 
     // ---- Events ---------------------------------------------------------------
@@ -1303,7 +1286,7 @@ impl Client {
             FtNotification::Upload(info) => Ok(info),
             FtNotification::Download(_) => Err(Error::FileTransfer("unexpected download response".into())),
             FtNotification::Status(st) => {
-                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message })
+                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message, extra_message:None })
             }
         }
     }
@@ -1332,7 +1315,7 @@ impl Client {
             FtNotification::Download(info) => Ok(info),
             FtNotification::Upload(_) => Err(Error::FileTransfer("unexpected upload response".into())),
             FtNotification::Status(st) => {
-                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message })
+                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message, extra_message:None })
             }
         }
     }
@@ -2095,6 +2078,36 @@ mod tests {
             let error=client.file_transfer_init_download(1,"/fixture","").await.unwrap_err();
             assert!(matches!(error,Error::ServerError{id,..} if id==status.to_string()));
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_flood_refusal_retries_with_a_new_return_code() {
+        for (id, extra, expected) in [("524", Some("retry in 1ms"), 2), ("1024", Some("retry in 1ms"), 1), ("524", None, 1), ("524", Some("please wait 600 seconds"), 1)] {
+            let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&sent);
+            let inner = Arc::clone(&client.inner);
+            *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+                let rc = line.split("return_code=").last().unwrap().parse::<i32>().unwrap();
+                let mut sent = recorded.lock().unwrap();
+                sent.push(rc);
+                let error = (sent.len() == 1).then(|| Error::ServerError {id: id.into(), server_message: "refused".into(), extra_message: extra.map(str::to_string)});
+                inner.lock().unwrap().cmd_track.resolve(rc, error);
+                Box::pin(async {Ok(())})
+            });
+            let result = client.exec_command("setclientchannelgroup cgid=1 cid=2 cldbid=3", 1000).await;
+            assert_eq!(sent.lock().unwrap().len(), expected);
+            assert_eq!(result.is_ok(), expected == 2);
+            if expected == 2 { let sent = sent.lock().unwrap(); assert_ne!(sent[0], sent[1]); }
+        }
+    }
+
+    #[tokio::test]
+    async fn command_deadline_includes_waiting_for_the_throttle() {
+        let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        client.throttle.lock().await.hold(Duration::from_secs(1));
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| panic!("timed out command must not be sent"));
+        assert!(matches!(client.exec_command("clientinfo clid=1", 10).await, Err(Error::CommandTimeout {..})));
     }
 
 }

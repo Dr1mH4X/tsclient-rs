@@ -187,6 +187,7 @@ pub fn parse_server_error(params: &HashMap<String, String>) -> (Option<Error>, O
         Some(Error::ServerError {
             id: id.to_string(),
             server_message: msg.to_string(),
+            extra_message: params.get("extra_msg").filter(|s| !s.is_empty()).cloned(),
         })
     } else {
         None
