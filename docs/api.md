@@ -94,7 +94,7 @@ or resurrected by a late row.
 
 ## 查询通知与有效权限
 
-`exec_command_with_response` 收集当前命令对应的权限组、权限列表及频道文件列表通知，返回其中的数据行；普通成员状态通知不会混入查询。通知仍正常更新客户端状态。命令串行发送时，通知行归属于随后返回确认的查询，与 JS 参考实现的内联响应规则一致。
+`exec_command_with_response` 收集当前命令对应的内联通知（权限组、权限列表、频道文件列表、封禁与客户端数据库查询等），返回其中的数据行；普通成员状态通知不会混入查询。通知仍正常更新客户端状态。命令串行发送时，通知行归属于随后返回确认的查询，与 JS 参考实现的内联响应规则一致。
 
 `client.permission_value(permid)` 返回服务器通过 `notifyclientneededpermissions` 最近推送的本端有效权限；未报告或撤销时返回 `None`，断开连接后清空。`on_own_permissions_changed` 收到 `Event::OwnPermissionsChanged` 后，调用方可重新读取受影响的操作权限。权限 id 由服务器的 `permissionlist` 数据确定，不能跨服务器版本写死。
 

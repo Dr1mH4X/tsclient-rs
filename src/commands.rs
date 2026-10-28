@@ -70,18 +70,48 @@ impl CommandTracker {
     pub fn register_command(&mut self, command: &str) -> (i32, oneshot::Receiver<CommandResult>) {
         let (rc, response) = self.register();
         let expected = match command.split_whitespace().next().unwrap_or("") {
-            "servergrouplist" => Some("notifyservergrouplist"),
-            "channelgrouplist" => Some("notifychannelgrouplist"),
-            "servergrouppermlist" => Some("notifyservergrouppermlist"),
-            "channelgrouppermlist" => Some("notifychannelgrouppermlist"),
-            "clientpermlist" => Some("notifyclientpermlist"),
-            "channelpermlist" => Some("notifychannelpermlist"),
+            "apikeyadd" => Some("notifyapikeyadd"),
+            "apikeylist" => Some("notifyapikeylist"),
+            "banfind" => Some("notifybanfind"),
+            "banlist" => Some("notifybanlist"),
             "channelclientpermlist" => Some("notifychannelclientpermlist"),
-            "servergroupclientlist" => Some("notifyservergroupclientlist"),
+            "channelgroupadd" | "channelgroupcopy" | "channelgrouplist" => {
+                Some("notifychannelgrouplist")
+            }
             "channelgroupclientlist" => Some("notifychannelgroupclientlist"),
-            "permissionlist" => Some("notifypermissionlist"),
-            "permget" => Some("notifypermget"),
+            "channelgrouppermlist" => Some("notifychannelgrouppermlist"),
+            "channelpermlist" => Some("notifychannelpermlist"),
+            "clientdbfind" => Some("notifyclientdbfind"),
+            "clientdblist" => Some("notifyclientdblist"),
+            "clientgetdbidfromuid" => Some("notifyclientdbidfromuid"),
+            "clientgetids" => Some("notifyclientids"),
+            "clientgetnamefromdbid" => Some("notifyclientnamefromdbid"),
+            "clientgetnamefromuid" => Some("notifyclientnamefromuid"),
+            "clientgetuidfromclid" => Some("notifyclientuidfromclid"),
+            "clientsetserverquerylogin" => Some("notifyclientserverqueryloginpassword"),
+            "clientpermlist" => Some("notifyclientpermlist"),
+            "complainlist" => Some("notifycomplainlist"),
+            "ftgetfileinfo" => Some("notifyfileinfo"),
             "ftgetfilelist" => Some("notifyfilelist"),
+            "ftlist" => Some("notifyfiletransferlist"),
+            "logview" => Some("notifyserverlog"),
+            "messageget" => Some("notifymessage"),
+            "messagelist" => Some("notifymessagelist"),
+            "permfind" => Some("notifypermfind"),
+            "permget" => Some("notifypermget"),
+            "permissionlist" => Some("notifypermissionlist"),
+            "permoverview" => Some("notifypermoverview"),
+            "privilegekeyadd" | "tokenadd" => Some("notifytokenadd"),
+            "privilegekeylist" | "tokenlist" => Some("notifytokenlist"),
+            "servergetvariables" => Some("notifyserverupdated"),
+            "servergroupadd" | "servergroupcopy" | "servergrouplist" => {
+                Some("notifyservergrouplist")
+            }
+            "servergroupclientlist" => Some("notifyservergroupclientlist"),
+            "servergrouppermlist" => Some("notifyservergrouppermlist"),
+            "servergroupsbyclientid" => Some("notifyservergroupsbyclientid"),
+            "serverrequestconnectioninfo" => Some("notifyserverconnectioninfo"),
+            "servertemppasswordlist" => Some("notifyservertemppasswordlist"),
             _ => None,
         };
         if let Some(expected) = expected {
@@ -220,7 +250,7 @@ pub fn parse_server_error(params: &HashMap<String, String>) -> (Option<Error>, O
 
 /// Append a return_code parameter to a command string if not already present.
 pub fn append_return_code(cmd: &str, rc: i32) -> String {
-    if cmd.contains("return_code=") {
+    if cmd.split_whitespace().any(|part| part.starts_with("return_code=")) {
         cmd.to_string()
     } else {
         format!("{} return_code={}", cmd, rc)
@@ -335,9 +365,23 @@ mod tests {
         tracker.buffer_notification("notifyfilelist", row("file"));
         tracker.resolve(rc, None);
         assert_eq!(keys(&response.try_recv().unwrap().data), vec!["file"]);
+        for (cmd, notify) in [
+            ("banlist", "notifybanlist"),
+            ("clientdblist", "notifyclientdblist"),
+            ("privilegekeyadd tokentype=0 tokenid1=6 tokenid2=0", "notifytokenadd"),
+        ] {
+            let (rc, mut response) = tracker.register_command(cmd);
+            tracker.buffer_notification(notify, row(cmd));
+            tracker.resolve(rc, None);
+            assert_eq!(keys(&response.try_recv().unwrap().data), vec![cmd]);
+        }
         let (rc, mut response) = tracker.register_command("clientinfo clid=1");
         tracker.buffer_notification("notifyfilelist", row("unsolicited"));
         tracker.resolve(rc, None);
         assert!(response.try_recv().unwrap().data.is_empty());
+        assert_eq!(
+            super::append_return_code("sendtextmessage msg=a\\sreturn_code=1", 7),
+            "sendtextmessage msg=a\\sreturn_code=1 return_code=7"
+        );
     }
 }

@@ -1118,6 +1118,7 @@ impl Client {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         for refused in 0..=3 {
             let mut registered = None;
+            let mut sent = false;
             let attempt = async {
                 let mut throttle = self.throttle.lock().await;
                 throttle.wait(None).await?;
@@ -1125,15 +1126,20 @@ impl Client {
                 registered = Some(rc);
                 self.logger.debug(&format!("command {} awaiting response rc={rc}", cmd.split_whitespace().next().unwrap_or("")), &[]);
                 let handler = self.final_cmd_handler.lock().unwrap().clone();
-                if let Err(error) = handler(commands::append_return_code(cmd, rc)).await {
-                    self.inner.lock().unwrap().cmd_track.discard_unsent(rc);
-                    return Err(error);
-                }
+                handler(commands::append_return_code(cmd, rc)).await?;
+                sent = true;
                 drop(throttle);
                 rx.await.map_err(|_| Error::Teamspeak("command channel closed".into()))
             };
             let result = tokio::time::timeout_at(deadline, attempt).await;
-            if let Some(rc) = registered { self.inner.lock().unwrap().cmd_track.unregister(rc); }
+            if let Some(rc) = registered {
+                let mut inner = self.inner.lock().unwrap();
+                if sent {
+                    inner.cmd_track.unregister(rc);
+                } else {
+                    inner.cmd_track.discard_unsent(rc);
+                }
+            }
             let result = result.map_err(|_| Error::CommandTimeout {
                 command: cmd.split_whitespace().next().unwrap_or("").to_string(),
             })??;
@@ -1420,7 +1426,6 @@ impl Client {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.crypt = new_crypt;
-            inner.own_permissions.clear();
             inner.cmd_track.reset();
             inner.ft_track.reset();
             inner.directory.clear();
@@ -2132,6 +2137,8 @@ mod tests {
         client.inner.lock().unwrap().cmd_track.signal_welcome_complete();
         *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| Box::pin(async {Err(Error::Teamspeak("send failed".into()))}));
         assert!(client.exec_command("servergrouplist", 1000).await.is_err());
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| Box::pin(std::future::pending()));
+        assert!(matches!(client.exec_command("servergrouplist", 10).await, Err(Error::CommandTimeout {..})));
         let inner = Arc::clone(&client.inner);
         *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
             let rc = line.split("return_code=").last().unwrap().parse().unwrap();
@@ -2141,12 +2148,13 @@ mod tests {
             Box::pin(async {Ok(())})
         });
         assert_eq!(client.exec_command_with_response("ftgetfilelist cid=1 path=/", 1000).await.unwrap()[0]["name"], "fixture");
+        assert!(client.exec_command("sendtextmessage msg=hi\\sreturn_code=1", 1000).await.is_ok());
         assert!(client.exec_command("servergrouplist return_code=123", 1000).await.is_err());
     }
 
     #[tokio::test]
     async fn disconnected_permissions_stay_empty_and_clearing_notifies_subscribers() {
-        let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        let mut client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.on_own_permissions_changed(Arc::new(move |_| {let _ = tx.send(());}));
         let sender = client.handler.lock().unwrap().create_packet_sender();
@@ -2158,6 +2166,10 @@ mod tests {
             inner.reset_directory_availability();
             inner.handle_command_str("notifyclientneededpermissions permid=42 permvalue=75", &sender);
         }
+        tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(client.permission_value(42), None);
+        client.inner.lock().unwrap().own_permissions.insert(42, 75);
+        client.reset_for_connect();
         tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
         assert_eq!(client.permission_value(42), None);
     }
