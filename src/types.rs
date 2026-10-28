@@ -154,6 +154,7 @@ pub enum Event {
     ClientMoved(ClientMovedEvent),
     DirectorySnapshot(DirectorySnapshot),
     Poked(PokeEvent),
+    OwnPermissionsChanged,
     VoiceData(VoiceData),
     Connected,
     Disconnected(Option<Error>),

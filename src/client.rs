@@ -194,6 +194,7 @@ struct EventHandlers {
     client_moved: Vec<EventHandler>,
     directory_snapshot: Vec<OrderedDirectoryHandler>,
     poked: Vec<EventHandler>,
+    own_permissions_changed: Vec<EventHandler>,
     voice_data: Vec<EventHandler>,
     connected: Vec<Arc<dyn Fn() + Send + Sync>>,
     disconnected: Vec<EventHandler>,
@@ -210,6 +211,7 @@ impl EventHandlers {
             client_moved: Vec::new(),
             directory_snapshot: Vec::new(),
             poked: Vec::new(),
+            own_permissions_changed: Vec::new(),
             voice_data: Vec::new(),
             connected: Vec::new(),
             disconnected: Vec::new(),
@@ -230,6 +232,7 @@ pub(crate) struct ClientInner {
     pub(crate) client_init_options: ClientInitOptions,
     pub(crate) status: ClientStatus,
     pub(crate) cmd_track: CommandTracker,
+    own_permissions: HashMap<u32,i32>,
     pub(crate) ft_track: FileTransferTracker,
     pub(crate) directory: server_directory::DirectoryCache,
     pub(crate) directory_ready: bool,
@@ -272,6 +275,7 @@ impl ClientInner {
             client_init_options,
             status: ClientStatus::Disconnected,
             cmd_track: CommandTracker::new(),
+            own_permissions: HashMap::new(),
             ft_track: FileTransferTracker::new(),
             directory: server_directory::DirectoryCache::default(),
             directory_ready: false,
@@ -370,6 +374,25 @@ impl ClientInner {
         };
 
         if cmd.name.starts_with("notify") {
+            self.cmd_track
+                .buffer_notification(&cmd.name, cmd.params.clone());
+            if cmd.name == "notifyclientneededpermissions" && self.status != ClientStatus::Disconnected {
+                if let Some(id) = cmd.params.get("permid").and_then(|v| v.parse::<u32>().ok()) {
+                    match cmd
+                        .params
+                        .get("permvalue")
+                        .and_then(|v| v.parse::<i32>().ok())
+                    {
+                        Some(value) => {
+                            self.own_permissions.insert(id, value);
+                        }
+                        None => {
+                            self.own_permissions.remove(&id);
+                        }
+                    }
+                }
+                self.dispatch_event(Event::OwnPermissionsChanged);
+            }
             let was_truncated = self.directory.truncated();
             let channel_changed = server_directory::apply_channel_notification(
                 &cmd.name,
@@ -645,6 +668,14 @@ impl ClientInner {
                         handler.enqueue(snapshot.clone());
                     }
                 }
+                Event::OwnPermissionsChanged => {
+                    for handler in &self.event_handlers.own_permissions_changed {
+                        let handler = Arc::clone(handler);
+                        tokio::spawn(async move {
+                            handler(Event::OwnPermissionsChanged);
+                        });
+                    }
+                }
                 Event::Poked(evt) => {
                     for h in &self.event_handlers.poked {
                         let h = Arc::clone(h);
@@ -710,6 +741,10 @@ impl ClientInner {
     fn reset_directory_availability(&mut self) {
         self.directory_ready = false;
         self.directory_wakers.clear();
+        if !self.own_permissions.is_empty() {
+            self.own_permissions.clear();
+            self.dispatch_event(Event::OwnPermissionsChanged);
+        }
         self.directory_publication = DirectoryPublication::default();
     }
 
@@ -1077,54 +1112,75 @@ impl Client {
         cmd: &str,
         timeout_ms: u64,
     ) -> Result<Vec<HashMap<String, String>>, Error> {
-        let (rc, mut rx) = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.cmd_track.register()
-        };
-        let with_rc = commands::append_return_code(cmd, rc);
-
-        self.throttle.lock().await.wait(None).await?;
-
-        let handler = self.final_cmd_handler.lock().unwrap().clone();
-        if let Err(err) = handler(with_rc).await {
-            let mut inner = self.inner.lock().unwrap();
-            inner.cmd_track.unregister(rc);
-            return Err(err);
+        if cmd.split_whitespace().any(|part| part.starts_with("return_code=")) {
+            return Err(Error::Teamspeak("return_code is managed by the client".into()));
         }
-
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            &mut rx,
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        for refused in 0..=3 {
+            let mut registered = None;
+            let mut sent = false;
+            let attempt = async {
+                let mut throttle = self.throttle.lock().await;
+                throttle.wait(None).await?;
+                let (rc, rx) = self.inner.lock().unwrap().cmd_track.register_command(cmd);
+                registered = Some(rc);
+                self.logger.debug(&format!("command {} awaiting response rc={rc}", cmd.split_whitespace().next().unwrap_or("")), &[]);
+                let handler = self.final_cmd_handler.lock().unwrap().clone();
+                handler(commands::append_return_code(cmd, rc)).await?;
+                sent = true;
+                drop(throttle);
+                rx.await.map_err(|_| Error::Teamspeak("command channel closed".into()))
+            };
+            let result = tokio::time::timeout_at(deadline, attempt).await;
+            if let Some(rc) = registered {
                 let mut inner = self.inner.lock().unwrap();
-                inner.cmd_track.unregister(rc);
-                return Err(Error::Teamspeak("command channel closed".into()));
+                if sent {
+                    inner.cmd_track.unregister(rc);
+                } else {
+                    inner.cmd_track.discard_unsent(rc);
+                }
             }
-            Err(_) => {
-                // Give up on this return_code: leaving it registered would let
-                // its late reply drop the rows of a later command.
-                let mut inner = self.inner.lock().unwrap();
-                inner.cmd_track.unregister(rc);
-                return Err(Error::CommandTimeout {
-                    command: cmd.to_string(),
-                });
+            let result = result.map_err(|_| Error::CommandTimeout {
+                command: cmd.split_whitespace().next().unwrap_or("").to_string(),
+            })??;
+            if let Some(error) = result.err {
+                if let Some(delay) = error.flood_retry_delay() {
+                    // Match the reference client's recovery margin; only an explicit refusal is retried.
+                    let hold = delay.saturating_mul(2);
+                    self.logger.debug(&format!("server requested command pause: {}ms", delay.as_millis()), &[]);
+                    if refused < 3 && hold < deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                        self.throttle.lock().await.hold(hold);
+                        continue;
+                    }
+                }
+                return Err(error);
             }
-        };
-
-        let mut inner = self.inner.lock().unwrap();
-        inner.cmd_track.unregister(rc);
-
-        if let Some(err) = result.err {
-            return Err(err);
+            return Ok(result.data);
         }
-        Ok(result.data)
+        unreachable!("bounded retries return on the final attempt")
     }
 
     // ---- Events ---------------------------------------------------------------
+
+    /// 服务器最近推送的本端有效权限；未报告或已撤销时为 None。
+    pub fn permission_value(&self, permission_id: u32) -> Option<i32> {
+        self.inner
+            .lock()
+            .unwrap()
+            .own_permissions
+            .get(&permission_id)
+            .copied()
+    }
+
+    pub fn on_own_permissions_changed(&self, handler: EventHandler) -> &Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .own_permissions_changed
+            .push(handler);
+        self
+    }
 
     pub fn on_text_message(&self, handler: EventHandler) -> &Self {
         self.inner.lock().unwrap().event_handlers.text_message.push(handler);
@@ -1251,7 +1307,7 @@ impl Client {
             FtNotification::Upload(info) => Ok(info),
             FtNotification::Download(_) => Err(Error::FileTransfer("unexpected download response".into())),
             FtNotification::Status(st) => {
-                Err(Error::FileTransfer(format!("{} (status={})", st.message, st.status)))
+                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message, extra_message:None })
             }
         }
     }
@@ -1280,7 +1336,7 @@ impl Client {
             FtNotification::Download(info) => Ok(info),
             FtNotification::Upload(_) => Err(Error::FileTransfer("unexpected upload response".into())),
             FtNotification::Status(st) => {
-                Err(Error::FileTransfer(format!("{} (status={})", st.message, st.status)))
+                Err(Error::ServerError { id:st.status.to_string(), server_message:st.message, extra_message:None })
             }
         }
     }
@@ -1994,4 +2050,128 @@ mod tests {
             .expect("directory handler");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+    #[test]
+    fn effective_permissions_update_and_revoke_without_polluting_commands() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".into(),
+            "test".into(),
+            ClientOptions::default(),
+        );
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.status = ClientStatus::Connected;
+            inner.cmd_track.signal_welcome_complete();
+            let (rc, mut result) = inner.cmd_track.register_command("servergrouplist");
+            inner.handle_command_str(
+                "notifyclientneededpermissions permid=42 permvalue=75",
+                &sender,
+            );
+            inner.handle_command_str("notifyservergrouplist sgid=6 name=Admin type=1", &sender);
+            inner.cmd_track.resolve(rc, None);
+            let rows = result.try_recv().unwrap().data;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["sgid"], "6");
+        }
+        assert_eq!(client.permission_value(42), Some(75));
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyclientneededpermissions permid=42", &sender);
+        assert_eq!(client.permission_value(42), None);
+    }
+    #[tokio::test]
+    async fn transfer_status_preserves_the_server_error_code() {
+        for status in [781,2568] {
+            let client=Client::new(crate::crypto::generate_identity(0),"127.0.0.1:9987".into(),"test".into(),ClientOptions::default());
+            let inner=Arc::clone(&client.inner);
+            *client.final_cmd_handler.lock().unwrap()=Arc::new(move |_| {
+                let inner=Arc::clone(&inner);
+                Box::pin(async move {
+                    let mut inner=inner.lock().unwrap();
+                    inner.cmd_track.resolve(1,None);
+                    inner.ft_track.notify(1,FtNotification::Status(FileTransferStatusInfo {message:"fixture refusal".into(),status,client_file_transfer_id:1}));
+                    Ok(())
+                })
+            });
+            let error=client.file_transfer_init_download(1,"/fixture","").await.unwrap_err();
+            assert!(matches!(error,Error::ServerError{id,..} if id==status.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_flood_refusal_retries_with_a_new_return_code() {
+        for (id, extra, expected) in [("524", Some("retry in 1ms"), 2), ("1024", Some("retry in 1ms"), 1), ("524", None, 1), ("524", Some("please wait 600 seconds"), 1)] {
+            let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&sent);
+            let inner = Arc::clone(&client.inner);
+            *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+                let rc = line.split("return_code=").last().unwrap().parse::<i32>().unwrap();
+                let mut sent = recorded.lock().unwrap();
+                sent.push(rc);
+                let error = (sent.len() == 1).then(|| Error::ServerError {id: id.into(), server_message: "refused".into(), extra_message: extra.map(str::to_string)});
+                inner.lock().unwrap().cmd_track.resolve(rc, error);
+                Box::pin(async {Ok(())})
+            });
+            let result = client.exec_command("setclientchannelgroup cgid=1 cid=2 cldbid=3", 1000).await;
+            assert_eq!(sent.lock().unwrap().len(), expected);
+            assert_eq!(result.is_ok(), expected == 2);
+            if expected == 2 { let sent = sent.lock().unwrap(); assert_ne!(sent[0], sent[1]); }
+        }
+    }
+
+    #[tokio::test]
+    async fn command_deadline_includes_waiting_for_the_throttle() {
+        let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        client.throttle.lock().await.hold(Duration::from_secs(1));
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| panic!("timed out command must not be sent"));
+        assert!(matches!(client.exec_command("clientinfo clid=1", 10).await, Err(Error::CommandTimeout {..})));
+    }
+
+    #[tokio::test]
+    async fn failed_send_does_not_block_the_next_notification_query() {
+        let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        client.inner.lock().unwrap().cmd_track.signal_welcome_complete();
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| Box::pin(async {Err(Error::Teamspeak("send failed".into()))}));
+        assert!(client.exec_command("servergrouplist", 1000).await.is_err());
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| Box::pin(std::future::pending()));
+        assert!(matches!(client.exec_command("servergrouplist", 10).await, Err(Error::CommandTimeout {..})));
+        let inner = Arc::clone(&client.inner);
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            let mut inner = inner.lock().unwrap();
+            inner.cmd_track.buffer_notification("notifyfilelist", [("name".into(), "fixture".into())].into_iter().collect());
+            inner.cmd_track.resolve(rc, None);
+            Box::pin(async {Ok(())})
+        });
+        assert_eq!(client.exec_command_with_response("ftgetfilelist cid=1 path=/", 1000).await.unwrap()[0]["name"], "fixture");
+        assert!(client.exec_command("sendtextmessage msg=hi\\sreturn_code=1", 1000).await.is_ok());
+        assert!(client.exec_command("servergrouplist return_code=123", 1000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnected_permissions_stay_empty_and_clearing_notifies_subscribers() {
+        let mut client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.on_own_permissions_changed(Arc::new(move |_| {let _ = tx.send(());}));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.status = ClientStatus::Connected;
+            inner.own_permissions.insert(42, 75);
+            inner.status = ClientStatus::Disconnected;
+            inner.reset_directory_availability();
+            inner.handle_command_str("notifyclientneededpermissions permid=42 permvalue=75", &sender);
+        }
+        tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(client.permission_value(42), None);
+        client.inner.lock().unwrap().own_permissions.insert(42, 75);
+        client.reset_for_connect();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(client.permission_value(42), None);
+    }
+
 }

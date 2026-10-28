@@ -39,6 +39,7 @@ pub struct CommandTracker {
     rows: HashMap<i32, Vec<HashMap<String, String>>>,
     /// return_codes whose caller gave up (timeout or send failure).
     abandoned: HashSet<i32>,
+    notifications: HashMap<i32, &'static str>,
     next_rc: i32,
     welcome_complete: bool,
 }
@@ -50,6 +51,7 @@ impl CommandTracker {
             order: VecDeque::new(),
             rows: HashMap::new(),
             abandoned: HashSet::new(),
+            notifications: HashMap::new(),
             next_rc: 0,
             welcome_complete: false,
         }
@@ -65,6 +67,68 @@ impl CommandTracker {
         (rc, rx)
     }
 
+    pub fn register_command(&mut self, command: &str) -> (i32, oneshot::Receiver<CommandResult>) {
+        let (rc, response) = self.register();
+        let expected = match command.split_whitespace().next().unwrap_or("") {
+            "apikeyadd" => Some("notifyapikeyadd"),
+            "apikeylist" => Some("notifyapikeylist"),
+            "banfind" => Some("notifybanfind"),
+            "banlist" => Some("notifybanlist"),
+            "channelclientpermlist" => Some("notifychannelclientpermlist"),
+            "channelgroupadd" | "channelgroupcopy" | "channelgrouplist" => {
+                Some("notifychannelgrouplist")
+            }
+            "channelgroupclientlist" => Some("notifychannelgroupclientlist"),
+            "channelgrouppermlist" => Some("notifychannelgrouppermlist"),
+            "channelpermlist" => Some("notifychannelpermlist"),
+            "clientdbfind" => Some("notifyclientdbfind"),
+            "clientdblist" => Some("notifyclientdblist"),
+            "clientgetdbidfromuid" => Some("notifyclientdbidfromuid"),
+            "clientgetids" => Some("notifyclientids"),
+            "clientgetnamefromdbid" => Some("notifyclientnamefromdbid"),
+            "clientgetnamefromuid" => Some("notifyclientnamefromuid"),
+            "clientgetuidfromclid" => Some("notifyclientuidfromclid"),
+            "clientsetserverquerylogin" => Some("notifyclientserverqueryloginpassword"),
+            "clientpermlist" => Some("notifyclientpermlist"),
+            "complainlist" => Some("notifycomplainlist"),
+            "ftgetfileinfo" => Some("notifyfileinfo"),
+            "ftgetfilelist" => Some("notifyfilelist"),
+            "ftlist" => Some("notifyfiletransferlist"),
+            "logview" => Some("notifyserverlog"),
+            "messageget" => Some("notifymessage"),
+            "messagelist" => Some("notifymessagelist"),
+            "permfind" => Some("notifypermfind"),
+            "permget" => Some("notifypermget"),
+            "permissionlist" => Some("notifypermissionlist"),
+            "permoverview" => Some("notifypermoverview"),
+            "privilegekeyadd" | "tokenadd" => Some("notifytokenadd"),
+            "privilegekeylist" | "tokenlist" => Some("notifytokenlist"),
+            "servergetvariables" => Some("notifyserverupdated"),
+            "servergroupadd" | "servergroupcopy" | "servergrouplist" => {
+                Some("notifyservergrouplist")
+            }
+            "servergroupclientlist" => Some("notifyservergroupclientlist"),
+            "servergrouppermlist" => Some("notifyservergrouppermlist"),
+            "servergroupsbyclientid" => Some("notifyservergroupsbyclientid"),
+            "serverrequestconnectioninfo" => Some("notifyserverconnectioninfo"),
+            "servertemppasswordlist" => Some("notifyservertemppasswordlist"),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            self.notifications.insert(rc, expected);
+        }
+        (rc, response)
+    }
+
+    pub fn buffer_notification(&mut self, name: &str, params: HashMap<String, String>) {
+        let Some(rc) = self.order.front() else {
+            return;
+        };
+        if self.notifications.get(rc).copied() == Some(name) {
+            self.buffer(params);
+        }
+    }
+
     /// The caller stopped waiting for `rc`. Keep the slot in `order` until the
     /// server's `error` line for it arrives (or a later command resolves past
     /// it), so in-flight rows are not misattributed to the next command.
@@ -72,6 +136,15 @@ impl CommandTracker {
         if self.pending.remove(&rc).is_some() {
             self.abandoned.insert(rc);
         }
+    }
+
+    /// Remove a request which never reached the transport; no late reply is expected.
+    pub fn discard_unsent(&mut self, rc: i32) {
+        self.pending.remove(&rc);
+        self.order.retain(|id| *id != rc);
+        self.rows.remove(&rc);
+        self.notifications.remove(&rc);
+        self.abandoned.remove(&rc);
     }
 
     pub fn signal_welcome_complete(&mut self) {
@@ -106,6 +179,7 @@ impl CommandTracker {
             }
             self.order.pop_front();
             self.abandoned.remove(&front);
+            self.notifications.remove(&front);
             if let Some(mut carried) = self.rows.remove(&front) {
                 rows.append(&mut carried);
             }
@@ -113,6 +187,7 @@ impl CommandTracker {
 
         self.order.retain(|queued| *queued != rc);
         self.abandoned.remove(&rc);
+        self.notifications.remove(&rc);
         match self.rows.remove(&rc) {
             Some(mut own) => rows.append(&mut own),
             None => {}
@@ -135,6 +210,7 @@ impl CommandTracker {
     pub fn on_untracked_reply(&mut self) {}
 
     pub fn reset(&mut self) {
+        self.notifications.clear();
         self.pending.clear();
         self.order.clear();
         self.rows.clear();
@@ -155,6 +231,7 @@ pub fn parse_server_error(params: &HashMap<String, String>) -> (Option<Error>, O
         Some(Error::ServerError {
             id: id.to_string(),
             server_message: msg.to_string(),
+            extra_message: params.get("extra_msg").filter(|s| !s.is_empty()).cloned(),
         })
     } else {
         None
@@ -173,7 +250,7 @@ pub fn parse_server_error(params: &HashMap<String, String>) -> (Option<Error>, O
 
 /// Append a return_code parameter to a command string if not already present.
 pub fn append_return_code(cmd: &str, rc: i32) -> String {
-    if cmd.contains("return_code=") {
+    if cmd.split_whitespace().any(|part| part.starts_with("return_code=")) {
         cmd.to_string()
     } else {
         format!("{} return_code={}", cmd, rc)
@@ -278,5 +355,33 @@ mod tests {
 
         let result = rx_b.try_recv().expect("command resolved");
         assert_eq!(keys(&result.data), vec!["b"]);
+    }
+    #[test]
+    fn notification_answers_only_enter_the_matching_query() {
+        let mut tracker = tracker_past_welcome();
+        let (rc, mut response) = tracker.register_command("ftgetfilelist cid=2 path=/");
+        tracker.buffer_notification("notifyclientupdated", row("unrelated"));
+        tracker.buffer_notification("notifyservergrouplist", row("wrong-query"));
+        tracker.buffer_notification("notifyfilelist", row("file"));
+        tracker.resolve(rc, None);
+        assert_eq!(keys(&response.try_recv().unwrap().data), vec!["file"]);
+        for (cmd, notify) in [
+            ("banlist", "notifybanlist"),
+            ("clientdblist", "notifyclientdblist"),
+            ("privilegekeyadd tokentype=0 tokenid1=6 tokenid2=0", "notifytokenadd"),
+        ] {
+            let (rc, mut response) = tracker.register_command(cmd);
+            tracker.buffer_notification(notify, row(cmd));
+            tracker.resolve(rc, None);
+            assert_eq!(keys(&response.try_recv().unwrap().data), vec![cmd]);
+        }
+        let (rc, mut response) = tracker.register_command("clientinfo clid=1");
+        tracker.buffer_notification("notifyfilelist", row("unsolicited"));
+        tracker.resolve(rc, None);
+        assert!(response.try_recv().unwrap().data.is_empty());
+        assert_eq!(
+            super::append_return_code("sendtextmessage msg=a\\sreturn_code=1", 7),
+            "sendtextmessage msg=a\\sreturn_code=1 return_code=7"
+        );
     }
 }
