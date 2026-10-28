@@ -74,6 +74,11 @@ impl CommandTracker {
             "channelgrouplist" => Some("notifychannelgrouplist"),
             "servergrouppermlist" => Some("notifyservergrouppermlist"),
             "channelgrouppermlist" => Some("notifychannelgrouppermlist"),
+            "clientpermlist" => Some("notifyclientpermlist"),
+            "channelpermlist" => Some("notifychannelpermlist"),
+            "channelclientpermlist" => Some("notifychannelclientpermlist"),
+            "servergroupclientlist" => Some("notifyservergroupclientlist"),
+            "channelgroupclientlist" => Some("notifychannelgroupclientlist"),
             "permissionlist" => Some("notifypermissionlist"),
             "permget" => Some("notifypermget"),
             "ftgetfilelist" => Some("notifyfilelist"),
@@ -101,6 +106,15 @@ impl CommandTracker {
         if self.pending.remove(&rc).is_some() {
             self.abandoned.insert(rc);
         }
+    }
+
+    /// Remove a request which never reached the transport; no late reply is expected.
+    pub fn discard_unsent(&mut self, rc: i32) {
+        self.pending.remove(&rc);
+        self.order.retain(|id| *id != rc);
+        self.rows.remove(&rc);
+        self.notifications.remove(&rc);
+        self.abandoned.remove(&rc);
     }
 
     pub fn signal_welcome_complete(&mut self) {

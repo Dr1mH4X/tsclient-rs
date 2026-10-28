@@ -376,7 +376,7 @@ impl ClientInner {
         if cmd.name.starts_with("notify") {
             self.cmd_track
                 .buffer_notification(&cmd.name, cmd.params.clone());
-            if cmd.name == "notifyclientneededpermissions" {
+            if cmd.name == "notifyclientneededpermissions" && self.status != ClientStatus::Disconnected {
                 if let Some(id) = cmd.params.get("permid").and_then(|v| v.parse::<u32>().ok()) {
                     match cmd
                         .params
@@ -741,7 +741,10 @@ impl ClientInner {
     fn reset_directory_availability(&mut self) {
         self.directory_ready = false;
         self.directory_wakers.clear();
-        self.own_permissions.clear();
+        if !self.own_permissions.is_empty() {
+            self.own_permissions.clear();
+            self.dispatch_event(Event::OwnPermissionsChanged);
+        }
         self.directory_publication = DirectoryPublication::default();
     }
 
@@ -1109,17 +1112,27 @@ impl Client {
         cmd: &str,
         timeout_ms: u64,
     ) -> Result<Vec<HashMap<String, String>>, Error> {
+        if cmd.split_whitespace().any(|part| part.starts_with("return_code=")) {
+            return Err(Error::Teamspeak("return_code is managed by the client".into()));
+        }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         for refused in 0..=3 {
-            let (rc, rx) = self.inner.lock().unwrap().cmd_track.register_command(cmd);
+            let mut registered = None;
             let attempt = async {
-                self.throttle.lock().await.wait(None).await?;
+                let mut throttle = self.throttle.lock().await;
+                throttle.wait(None).await?;
+                let (rc, rx) = self.inner.lock().unwrap().cmd_track.register_command(cmd);
+                registered = Some(rc);
                 let handler = self.final_cmd_handler.lock().unwrap().clone();
-                handler(commands::append_return_code(cmd, rc)).await?;
+                if let Err(error) = handler(commands::append_return_code(cmd, rc)).await {
+                    self.inner.lock().unwrap().cmd_track.discard_unsent(rc);
+                    return Err(error);
+                }
+                drop(throttle);
                 rx.await.map_err(|_| Error::Teamspeak("command channel closed".into()))
             };
             let result = tokio::time::timeout_at(deadline, attempt).await;
-            self.inner.lock().unwrap().cmd_track.unregister(rc);
+            if let Some(rc) = registered { self.inner.lock().unwrap().cmd_track.unregister(rc); }
             let result = result.map_err(|_| Error::CommandTimeout {
                 command: cmd.split_whitespace().next().unwrap_or("").to_string(),
             })??;
@@ -2041,6 +2054,7 @@ mod tests {
         let sender = client.handler.lock().unwrap().create_packet_sender();
         {
             let mut inner = client.inner.lock().unwrap();
+            inner.status = ClientStatus::Connected;
             inner.cmd_track.signal_welcome_complete();
             let (rc, mut result) = inner.cmd_track.register_command("servergrouplist");
             inner.handle_command_str(
@@ -2108,6 +2122,42 @@ mod tests {
         client.throttle.lock().await.hold(Duration::from_secs(1));
         *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| panic!("timed out command must not be sent"));
         assert!(matches!(client.exec_command("clientinfo clid=1", 10).await, Err(Error::CommandTimeout {..})));
+    }
+
+    #[tokio::test]
+    async fn failed_send_does_not_block_the_next_notification_query() {
+        let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        client.inner.lock().unwrap().cmd_track.signal_welcome_complete();
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(|_| Box::pin(async {Err(Error::Teamspeak("send failed".into()))}));
+        assert!(client.exec_command("servergrouplist", 1000).await.is_err());
+        let inner = Arc::clone(&client.inner);
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            let mut inner = inner.lock().unwrap();
+            inner.cmd_track.buffer_notification("notifyfilelist", [("name".into(), "fixture".into())].into_iter().collect());
+            inner.cmd_track.resolve(rc, None);
+            Box::pin(async {Ok(())})
+        });
+        assert_eq!(client.exec_command_with_response("ftgetfilelist cid=1 path=/", 1000).await.unwrap()[0]["name"], "fixture");
+        assert!(client.exec_command("servergrouplist return_code=123", 1000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnected_permissions_stay_empty_and_clearing_notifies_subscribers() {
+        let client = Client::new(crate::crypto::generate_identity(0), "127.0.0.1:9987".into(), "test".into(), ClientOptions::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.on_own_permissions_changed(Arc::new(move |_| {let _ = tx.send(());}));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.status = ClientStatus::Connected;
+            inner.own_permissions.insert(42, 75);
+            inner.status = ClientStatus::Disconnected;
+            inner.reset_directory_availability();
+            inner.handle_command_str("notifyclientneededpermissions permid=42 permvalue=75", &sender);
+        }
+        tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(client.permission_value(42), None);
     }
 
 }
