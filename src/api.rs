@@ -15,6 +15,41 @@ const CMD_TIMEOUT_MS: u64 = 10_000;
 /// Shorter timeout (ms) for read-only queries.
 const QUERY_TIMEOUT_MS: u64 = 5_000;
 
+/// Send a plugin command to clients in the channel (0), server (1), or a specific client (2).
+pub async fn send_plugin_command(
+    client: &Client,
+    name: &str,
+    data: &str,
+    target: PluginCommandTarget,
+    target_id: Option<i32>,
+) -> Result<(), Error> {
+    let mode_str = (target as i32).to_string();
+    let target_id_str;
+    let mut params = vec![
+        ("name", name),
+        ("data", data),
+        ("targetmode", mode_str.as_str()),
+    ];
+    match target {
+        PluginCommandTarget::Client => {
+            let id = target_id.ok_or_else(|| {
+                Error::Teamspeak("target_id is required for PluginCommandTarget::Client".to_string())
+            })?;
+            target_id_str = id.to_string();
+            params.push(("target", target_id_str.as_str()));
+        }
+        PluginCommandTarget::CurrentChannel | PluginCommandTarget::Server => {
+            if target_id.is_some() {
+                return Err(Error::Teamspeak(
+                    "target_id is only allowed for PluginCommandTarget::Client".to_string(),
+                ));
+            }
+        }
+    }
+    let cmd = build_command_ordered("plugincmd", &params);
+    client.exec_command(&cmd, CMD_TIMEOUT_MS).await
+}
+
 /// Send a text message to a client (target_mode=1), channel (2), or server (3).
 pub async fn send_text_message(
     client: &Client,

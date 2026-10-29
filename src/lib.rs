@@ -58,8 +58,8 @@ pub use types::{
     AbortSignal, AddrResolver, ChannelInfo, ClientInfo, ClientLeftViewEvent, ClientMovedEvent,
     ClientOptions, CommandMiddleware, ConsoleLogger as consoleLogger, DirectorySnapshot,
     EscapedString, Event, EventMiddleware, FileDownloadInfo, FileTransferStatusInfo,
-    FileUploadInfo, KickReason, Logger, NoopLogger as noopLogger, PokeEvent, ResolvedAddr,
-    TextMessage, VoiceData,
+    FileUploadInfo, KickReason, Logger, NoopLogger as noopLogger, PluginCommandEvent,
+    PluginCommandTarget, PokeEvent, ResolvedAddr, TextMessage, VoiceData,
 };
 
 // ---- Errors ---------------------------------------------------------------------
@@ -81,7 +81,8 @@ pub use api::{
     get_channel_description as getChannelDescription, get_channel_info,
     get_channel_info as getChannelInfo, get_client_info as getClientInfo, icon_file_name,
     icon_file_name as iconFileName, list_channels as listChannels, list_clients as listClients,
-    poke, send_text_message as sendTextMessage,
+    poke, send_plugin_command, send_plugin_command as sendPluginCommand,
+    send_text_message as sendTextMessage,
 };
 
 pub use command::escape;
