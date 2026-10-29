@@ -439,11 +439,7 @@ fn parse_channel_row(
     Some(parse_channel_fields(id, parent_id, params))
 }
 
-fn parse_channel_fields(
-    id: u64,
-    parent_id: u64,
-    params: &HashMap<String, String>,
-) -> ChannelInfo {
+fn parse_channel_fields(id: u64, parent_id: u64, params: &HashMap<String, String>) -> ChannelInfo {
     ChannelInfo {
         id,
         parent_id,
@@ -506,70 +502,70 @@ pub fn apply_channel_notification(
                 return false;
             }
             directory.update_channel(id, |current| {
-            let mut changed = false;
-            if let Some(value) = params.get("channel_name") {
-                if current.name.as_str() != value {
-                    current.name = value.clone();
-                    changed = true;
+                let mut changed = false;
+                if let Some(value) = params.get("channel_name") {
+                    if current.name.as_str() != value {
+                        current.name = value.clone();
+                        changed = true;
+                    }
                 }
-            }
-            if let Some(value) = params
-                .get("channel_topic")
-                .or_else(|| params.get("channel_description"))
-            {
-                if current.description.as_str() != value {
-                    current.description = value.clone();
-                    changed = true;
+                if let Some(value) = params
+                    .get("channel_topic")
+                    .or_else(|| params.get("channel_description"))
+                {
+                    if current.description.as_str() != value {
+                        current.description = value.clone();
+                        changed = true;
+                    }
                 }
-            }
-            if let Some(value) = params.get("channel_order").or_else(|| params.get("order")) {
-                let order = parse_u64(value);
-                if current.order != order {
-                    current.order = order;
-                    changed = true;
+                if let Some(value) = params.get("channel_order").or_else(|| params.get("order")) {
+                    let order = parse_u64(value);
+                    if current.order != order {
+                        current.order = order;
+                        changed = true;
+                    }
                 }
-            }
-            if let Some(value) = parse_bool(params.get("channel_flag_password")) {
-                if current.password_protected != Some(value) {
-                    current.password_protected = Some(value);
-                    changed = true;
+                if let Some(value) = parse_bool(params.get("channel_flag_password")) {
+                    if current.password_protected != Some(value) {
+                        current.password_protected = Some(value);
+                        changed = true;
+                    }
                 }
-            }
-            if let Some(value) = params
-                .get("channel_maxclients")
-                .and_then(|value| value.parse::<u16>().ok())
-            {
-                if current.max_clients != Some(value) {
-                    current.max_clients = Some(value);
-                    changed = true;
+                if let Some(value) = params
+                    .get("channel_maxclients")
+                    .and_then(|value| value.parse::<u16>().ok())
+                {
+                    if current.max_clients != Some(value) {
+                        current.max_clients = Some(value);
+                        changed = true;
+                    }
                 }
-            }
-            if let Some(value) = parse_bool(params.get("channel_flag_maxclients_unlimited")) {
-                let limited = !value;
-                if current.max_clients_limited != Some(limited) {
-                    current.max_clients_limited = Some(limited);
-                    changed = true;
+                if let Some(value) = parse_bool(params.get("channel_flag_maxclients_unlimited")) {
+                    let limited = !value;
+                    if current.max_clients_limited != Some(limited) {
+                        current.max_clients_limited = Some(limited);
+                        changed = true;
+                    }
                 }
-            }
-            if let Some(value) = params
-                .get("channel_icon_id")
-                .and_then(|value| parse_icon_id(value))
-            {
-                if current.icon_id != Some(value) {
-                    current.icon_id = Some(value);
-                    changed = true;
+                if let Some(value) = params
+                    .get("channel_icon_id")
+                    .and_then(|value| parse_icon_id(value))
+                {
+                    if current.icon_id != Some(value) {
+                        current.icon_id = Some(value);
+                        changed = true;
+                    }
                 }
-            }
-            if let Some(value) = params
-                .get("channel_codec")
-                .and_then(|value| value.parse::<i32>().ok())
-            {
-                if current.codec != Some(value) {
-                    current.codec = Some(value);
-                    changed = true;
+                if let Some(value) = params
+                    .get("channel_codec")
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
+                    if current.codec != Some(value) {
+                        current.codec = Some(value);
+                        changed = true;
+                    }
                 }
-            }
-            changed
+                changed
             })
         }
         "notifychannelmoved" => directory.update_channel(id, |current| {
