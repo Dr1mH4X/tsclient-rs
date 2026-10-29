@@ -26,7 +26,7 @@ Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.co
 - **Live directory** — Read the channel tree and visible clients from the welcome stream and channel/client events
 - **Voice data** — Send Opus voice packets (codec 4 & 5)
 - **File transfers** — Upload, download, and delete files on the server
-- **频道图标** — 读取实时频道图标 id，并通过文件传输下载自定义图标
+- **Channel icons** — Read real-time channel icon IDs and download custom icons via file transfer
 - **Address resolution** — SRV records, TSDNS, and direct address support
 - **Middleware** — Pluggable command and event middleware chains
 - **Built-in rate limiter** — Token-bucket throttling to prevent server-side flood kicks
@@ -69,12 +69,8 @@ Items marked `#[allow(dead_code)]` or `#[allow(unused_imports)]` in the source.
 
 Protocol knowledge was primarily informed by the [TSLib](https://github.com/Splamy/TS3AudioBot) implementation in [TS3AudioBot](https://github.com/Splamy/TS3AudioBot) by Splamy. Huge thanks to the TS3AudioBot project and its contributors.
 
-## Disclaimer
-
-TeamSpeak is a registered trademark of [TeamSpeak Systems GmbH](https://teamspeak.com/). This project is not affiliated with, endorsed by, or associated with TeamSpeak Systems GmbH in any way.
-
-This library is a **clean-room implementation** developed from publicly available documentation, protocol analysis of network traffic, and independent research. No proprietary TeamSpeak SDK code, headers, or libraries were used in its creation.
-
 ## License
 
 [MIT](LICENSE)
+
+> TeamSpeak is a registered trademark of [TeamSpeak Systems GmbH](https://teamspeak.com/). This project is not affiliated with, endorsed by, or associated with TeamSpeak Systems GmbH in any way.
