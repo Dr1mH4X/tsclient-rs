@@ -75,6 +75,7 @@ impl CommandTracker {
             "banfind" => Some("notifybanfind"),
             "banlist" => Some("notifybanlist"),
             "channelclientpermlist" => Some("notifychannelclientpermlist"),
+            "channelgetdescription" => Some("notifychanneledited"),
             "channelgroupadd" | "channelgroupcopy" | "channelgrouplist" => {
                 Some("notifychannelgrouplist")
             }
@@ -370,6 +371,7 @@ mod tests {
         assert_eq!(keys(&response.try_recv().unwrap().data), vec!["file"]);
         for (cmd, notify) in [
             ("banlist", "notifybanlist"),
+            ("channelgetdescription cid=1", "notifychanneledited"),
             ("clientdblist", "notifyclientdblist"),
             (
                 "privilegekeyadd tokentype=0 tokenid1=6 tokenid2=0",

@@ -409,6 +409,16 @@ pub fn parse_channel(params: &HashMap<String, String>) -> Option<ChannelInfo> {
     parse_channel_row(params, false)
 }
 
+/// Parse one `channelinfo` row, using the requested `id` (`channelinfo` omits `cid`).
+pub fn parse_channel_info(id: u64, params: &HashMap<String, String>) -> ChannelInfo {
+    let parent_id = params
+        .get("pid")
+        .or_else(|| params.get("cpid"))
+        .map(|value| parse_u64(value))
+        .unwrap_or(0);
+    parse_channel_fields(id, parent_id, params)
+}
+
 fn parse_channel_notification(params: &HashMap<String, String>) -> Option<ChannelInfo> {
     parse_channel_row(params, true)
 }
@@ -425,9 +435,18 @@ fn parse_channel_row(
     if require_parent && parent.is_none() {
         return None;
     }
-    Some(ChannelInfo {
+    let parent_id = parent.map(|value| parse_u64(value)).unwrap_or(0);
+    Some(parse_channel_fields(id, parent_id, params))
+}
+
+fn parse_channel_fields(
+    id: u64,
+    parent_id: u64,
+    params: &HashMap<String, String>,
+) -> ChannelInfo {
+    ChannelInfo {
         id,
-        parent_id: parent.map(|value| parse_u64(value)).unwrap_or(0),
+        parent_id,
         order: params
             .get("channel_order")
             .or_else(|| params.get("order"))
@@ -435,8 +454,8 @@ fn parse_channel_row(
             .unwrap_or(0),
         name: params.get("channel_name").cloned().unwrap_or_default(),
         description: params
-            .get("channel_topic")
-            .or_else(|| params.get("channel_description"))
+            .get("channel_description")
+            .or_else(|| params.get("channel_topic"))
             .cloned()
             .unwrap_or_default(),
         password_protected: parse_bool(params.get("channel_flag_password")),
@@ -451,7 +470,7 @@ fn parse_channel_row(
         icon_id: params
             .get("channel_icon_id")
             .and_then(|value| parse_icon_id(value)),
-    })
+    }
 }
 
 /// Apply a channel notification to the live directory.
@@ -480,7 +499,13 @@ pub fn apply_channel_notification(
             }
             directory.insert_channel(channel)
         }
-        "notifychanneledited" => directory.update_channel(id, |current| {
+        "notifychanneledited" => {
+            if params.get("reasonid").map(String::as_str) == Some("9")
+                && !params.contains_key("invokerid")
+            {
+                return false;
+            }
+            directory.update_channel(id, |current| {
             let mut changed = false;
             if let Some(value) = params.get("channel_name") {
                 if current.name.as_str() != value {
@@ -545,7 +570,8 @@ pub fn apply_channel_notification(
                 }
             }
             changed
-        }),
+            })
+        }
         "notifychannelmoved" => directory.update_channel(id, |current| {
             let mut changed = false;
             if let Some(value) = params.get("cpid").or_else(|| params.get("pid")) {
@@ -912,6 +938,21 @@ mod tests {
         assert_eq!(channel.max_clients, Some(25));
         assert_eq!(channel.max_clients_limited, Some(true));
         assert_eq!(channel.codec, Some(5));
+
+        let info = parse_channel_info(
+            42,
+            &row(&[
+                ("pid", "1"),
+                ("channel_order", "17"),
+                ("channel_name", "Lobby Room"),
+                ("channel_topic", "A|B"),
+                ("channel_description", "Full Description"),
+            ]),
+        );
+        assert_eq!(info.id, 42);
+        assert_eq!(info.parent_id, 1);
+        assert_eq!(info.name, "Lobby Room");
+        assert_eq!(info.description, "Full Description");
     }
 
     #[test]
@@ -1119,6 +1160,17 @@ mod tests {
         assert_eq!(channel.order, 9);
         assert_eq!(channel.parent_id, 0);
         assert_eq!(channel.password_protected, Some(true));
+
+        assert!(!apply_channel_notification(
+            "notifychanneledited",
+            &row(&[
+                ("cid", "1"),
+                ("reasonid", "9"),
+                ("channel_description", "fetched description"),
+            ]),
+            &mut directory,
+        ));
+        assert_eq!(directory.channels[&1].description, "new");
 
         assert!(apply_channel_notification(
             "notifychannelmoved",
