@@ -57,6 +57,8 @@ or resurrected by a late row.
 | `poke(client, clid, message)`                          | Poke a client                              |
 | `client.send_voice(data, codec)`                       | Send Opus voice data                       |
 | `listChannels(client)`                                 | List all channels                          |
+| `getChannelInfo(client, channelId)` / `client.get_channel_info(channel_id)` | Get detailed channel configuration and description |
+| `getChannelDescription(client, channelId)` / `client.get_channel_description(channel_id)` | Fetch a channel's description via `channelgetdescription` |
 | `listClients(client)`                                  | List all connected clients                 |
 | `client.directory_snapshot()`                          | Read the complete channel/client directory |
 | `getClientInfo(client, clid)`                          | Get detailed client information            |

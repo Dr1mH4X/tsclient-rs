@@ -140,6 +140,12 @@ banClient(&client, clid, 3600, "Spamming").await?;
 // List all channels
 let channels = listChannels(&client).await?;
 
+// Get detailed channel configuration (includes description)
+let channel_info = getChannelInfo(&client, channel_id).await?;
+
+// Fetch only a channel's description via channelgetdescription
+let description = getChannelDescription(&client, channel_id).await?;
+
 // List all connected clients
 let clients = listClients(&client).await?;
 

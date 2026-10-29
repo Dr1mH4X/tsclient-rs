@@ -509,8 +509,8 @@ impl ClientInner {
             _ => {
                 let params = if cmd.name.contains('=') {
                     let eq_idx = cmd.name.find('=').unwrap();
-                    let k = cmd.name[..eq_idx].to_string();
-                    let v = cmd.name[eq_idx + 1..].to_string();
+                    let k = crate::command::unescape(&cmd.name[..eq_idx]);
+                    let v = crate::command::unescape(&cmd.name[eq_idx + 1..]);
                     let mut p = HashMap::new();
                     p.insert(k, v);
                     p.extend(cmd.params);
@@ -1368,6 +1368,16 @@ impl Client {
 
     pub fn send_voice(&self, data: Vec<u8>, codec: i32) {
         self.handler.lock().unwrap().send_voice_packet(data, codec);
+    }
+
+    /// Fetch detailed configuration information for a channel via `channelinfo`.
+    pub async fn get_channel_info(&self, channel_id: u64) -> Result<ChannelInfo, Error> {
+        crate::api::get_channel_info(self, channel_id).await
+    }
+
+    /// Fetch a channel's description via `channelgetdescription`.
+    pub async fn get_channel_description(&self, channel_id: u64) -> Result<String, Error> {
+        crate::api::get_channel_description(self, channel_id).await
     }
 
     // ---- File Transfer --------------------------------------------------------
@@ -2409,5 +2419,135 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(client.permission_value(42), None);
+    }
+
+    #[tokio::test]
+    async fn get_channel_info_parses_nameless_row_and_fills_channel_id() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".into(),
+            "test".into(),
+            ClientOptions::default(),
+        );
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .cmd_track
+            .signal_welcome_complete();
+        let seen_cmd = Arc::new(Mutex::new(String::new()));
+        let recorded = Arc::clone(&seen_cmd);
+        let inner = Arc::clone(&client.inner);
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            *recorded.lock().unwrap() = line.clone();
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            let mut inner = inner.lock().unwrap();
+            inner.handle_command_str(
+                "channel_name=Lobby\\s1 pid=2 channel_order=5 channel_topic=Topic \
+                 channel_description=Rules\\sand\\sinfo channel_flag_password=1 \
+                 channel_maxclients=16 channel_flag_maxclients_unlimited=0 \
+                 channel_codec=4 channel_icon_id=-1",
+                &sender,
+            );
+            inner.cmd_track.resolve(rc, None);
+            Box::pin(async { Ok(()) })
+        });
+
+        let info = client.get_channel_info(42).await.unwrap();
+        assert!(
+            seen_cmd
+                .lock()
+                .unwrap()
+                .starts_with("channelinfo cid=42 return_code=")
+        );
+        assert_eq!(info.id, 42);
+        assert_eq!(info.parent_id, 2);
+        assert_eq!(info.order, 5);
+        assert_eq!(info.name, "Lobby 1");
+        assert_eq!(info.description, "Rules and info");
+        assert_eq!(info.password_protected, Some(true));
+        assert_eq!(info.max_clients, Some(16));
+        assert_eq!(info.max_clients_limited, Some(true));
+        assert_eq!(info.codec, Some(4));
+        assert_eq!(info.icon_id, Some(u32::MAX));
+    }
+
+    #[tokio::test]
+    async fn get_channel_description_matches_target_channel_and_preserves_directory() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".into(),
+            "test".into(),
+            ClientOptions::default(),
+        );
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.status = ClientStatus::Connected;
+            inner.directory_ready = true;
+            inner.cmd_track.signal_welcome_complete();
+            inner.directory.insert_channel(ChannelInfo {
+                id: 7,
+                parent_id: 0,
+                order: 0,
+                name: "Lobby".into(),
+                description: "Cached Topic".into(),
+                password_protected: None,
+                max_clients: None,
+                max_clients_limited: None,
+                codec: None,
+                icon_id: None,
+            });
+            inner.directory_publication.dirty = false;
+        }
+
+        let seen_cmd = Arc::new(Mutex::new(String::new()));
+        let recorded = Arc::clone(&seen_cmd);
+        let inner = Arc::clone(&client.inner);
+        let sender_for_cmd = client.handler.lock().unwrap().create_packet_sender();
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            *recorded.lock().unwrap() = line.clone();
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            let mut inner = inner.lock().unwrap();
+            inner.handle_command_str(
+                "notifychanneledited cid=7 reasonid=10 invokerid=2 channel_topic=Updated\\sTopic",
+                &sender_for_cmd,
+            );
+            inner.handle_command_str(
+                "notifychanneledited cid=8 reasonid=9 channel_description=Other\\schannel",
+                &sender_for_cmd,
+            );
+            inner.handle_command_str(
+                "notifychanneledited cid=7 reasonid=9 channel_description=Channel\\srules\\nhere",
+                &sender_for_cmd,
+            );
+            inner.cmd_track.resolve(rc, None);
+            Box::pin(async { Ok(()) })
+        });
+
+        let desc = client.get_channel_description(7).await.unwrap();
+        assert!(
+            seen_cmd
+                .lock()
+                .unwrap()
+                .starts_with("channelgetdescription cid=7 return_code=")
+        );
+        assert_eq!(desc, "Channel rules\nhere");
+        let snapshot = client.directory_snapshot().unwrap();
+        assert_eq!(snapshot.channels[0].description, "Updated Topic");
+
+        let inner = Arc::clone(&client.inner);
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            let mut inner = inner.lock().unwrap();
+            inner.handle_command_str(
+                "notifychanneledited cid=7 reasonid=10 invokerid=2 channel_topic=Only\\sTopic",
+                &sender,
+            );
+            inner.cmd_track.resolve(rc, None);
+            Box::pin(async { Ok(()) })
+        });
+        assert!(client.get_channel_description(7).await.is_err());
     }
 }

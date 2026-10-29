@@ -77,9 +77,11 @@ pub use errors::{
 pub use api::{
     ban_client as banClient, client_kick as clientKick, client_move as clientMove,
     client_update as clientUpdate, download_icon, download_icon as downloadIcon,
-    file_transfer_delete_file as fileTransferDeleteFile, get_client_info as getClientInfo,
-    icon_file_name, icon_file_name as iconFileName, list_channels as listChannels,
-    list_clients as listClients, poke, send_text_message as sendTextMessage,
+    file_transfer_delete_file as fileTransferDeleteFile, get_channel_description,
+    get_channel_description as getChannelDescription, get_channel_info,
+    get_channel_info as getChannelInfo, get_client_info as getClientInfo, icon_file_name,
+    icon_file_name as iconFileName, list_channels as listChannels, list_clients as listClients,
+    poke, send_text_message as sendTextMessage,
 };
 
 pub use command::escape;

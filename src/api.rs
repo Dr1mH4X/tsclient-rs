@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::Client;
 use crate::Error;
 use crate::command::{build_command, build_command_ordered, unescape};
-use crate::directory::{parse_bool, parse_channel};
+use crate::directory::{parse_bool, parse_channel, parse_channel_info};
 use crate::helpers;
 use crate::types::*;
 
@@ -71,6 +71,34 @@ pub async fn get_client_info(client: &Client, clid: i32) -> Result<HashMap<Strin
     data.into_iter()
         .next()
         .ok_or_else(|| Error::Teamspeak(format!("no data returned for client {clid}")))
+}
+
+/// Fetch detailed configuration information for a channel via `channelinfo`.
+pub async fn get_channel_info(client: &Client, channel_id: u64) -> Result<ChannelInfo, Error> {
+    let cmd = build_command_ordered("channelinfo", &[("cid", &channel_id.to_string())]);
+    let data = client
+        .exec_command_with_response(&cmd, QUERY_TIMEOUT_MS)
+        .await?;
+    let row = data
+        .first()
+        .ok_or_else(|| Error::Teamspeak(format!("no data returned for channel {channel_id}")))?;
+    Ok(parse_channel_info(channel_id, row))
+}
+
+/// Fetch a channel's description via `channelgetdescription`.
+pub async fn get_channel_description(client: &Client, channel_id: u64) -> Result<String, Error> {
+    let cid = channel_id.to_string();
+    let cmd = build_command_ordered("channelgetdescription", &[("cid", &cid)]);
+    let data = client
+        .exec_command_with_response(&cmd, QUERY_TIMEOUT_MS)
+        .await?;
+    data.into_iter()
+        .find(|row| {
+            row.get("cid").map(String::as_str) == Some(cid.as_str())
+                && row.contains_key("channel_description")
+        })
+        .and_then(|mut row| row.remove("channel_description"))
+        .ok_or_else(|| Error::Teamspeak(format!("no data returned for channel {channel_id}")))
 }
 
 /// List all channels on the server.
