@@ -54,7 +54,7 @@ pub fn handle_notification(
         "notifyclientmoved" => handle_client_moved(params, clients),
         "notifytextmessage" => handle_text_message(params, clients),
         "notifyclientpoke" => handle_client_poked(params),
-        "notifyplugincmd" | "notifyplugincommand" => handle_plugin_command(params),
+        "notifyplugincmd" | "notifyplugincommand" => handle_plugin_command(params, clients),
         "notifystartupload" => {
             let info = handle_start_upload(params);
             NotificationResult::StartUpload { info }
@@ -218,14 +218,30 @@ fn handle_client_poked(params: &HashMap<String, String>) -> NotificationResult {
     }
 }
 
-fn handle_plugin_command(params: &HashMap<String, String>) -> NotificationResult {
+fn handle_plugin_command(
+    params: &HashMap<String, String>,
+    clients: &DirectoryCache,
+) -> NotificationResult {
+    let invoker_id = parse_u16(params.get("invokerid").map(|s| s.as_str()).unwrap_or(""));
+    let invoker_info = clients.client(invoker_id);
+    let invoker_name = params
+        .get("invokername")
+        .cloned()
+        .or_else(|| invoker_info.map(|i| i.nickname.clone()))
+        .unwrap_or_default();
+    let invoker_uid = params
+        .get("invokeruid")
+        .cloned()
+        .or_else(|| invoker_info.map(|i| i.uid.clone()))
+        .unwrap_or_default();
+
     NotificationResult::PluginCommand {
         event: PluginCommandEvent {
             name: params.get("name").cloned().unwrap_or_default(),
             data: params.get("data").cloned().unwrap_or_default(),
-            invoker_id: parse_u16(params.get("invokerid").map(|s| s.as_str()).unwrap_or("")),
-            invoker_name: params.get("invokername").cloned().unwrap_or_default(),
-            invoker_uid: params.get("invokeruid").cloned().unwrap_or_default(),
+            invoker_id,
+            invoker_name,
+            invoker_uid,
         },
     }
 }
@@ -435,6 +451,37 @@ mod tests {
                 assert_eq!(event.invoker_id, 10);
                 assert_eq!(event.invoker_name, "Bob");
                 assert_eq!(event.invoker_uid, "xyz=");
+            }
+            _ => panic!("expected PluginCommand"),
+        }
+
+        // Test fallback to directory when invokername and invokeruid are omitted
+        clients.insert_client(ClientInfo {
+            id: 99,
+            nickname: "CachedUser".to_string(),
+            uid: "cached_uid_123".to_string(),
+            server_groups: vec![],
+            channel_id: 1,
+            r#type: 0,
+            away: None,
+            away_message: None,
+            input_muted: None,
+            output_muted: None,
+            channel_commander: None,
+        });
+        let cmd_no_invoker = crate::command::parse_command(
+            "notifyplugincmd name=query_test data=payload invokerid=99",
+        )
+        .expect("parse command");
+        let result_fallback =
+            handle_notification(&cmd_no_invoker.name, &cmd_no_invoker.params, 0, &mut clients, "");
+        match result_fallback {
+            NotificationResult::PluginCommand { event } => {
+                assert_eq!(event.name, "query_test");
+                assert_eq!(event.data, "payload");
+                assert_eq!(event.invoker_id, 99);
+                assert_eq!(event.invoker_name, "CachedUser");
+                assert_eq!(event.invoker_uid, "cached_uid_123");
             }
             _ => panic!("expected PluginCommand"),
         }

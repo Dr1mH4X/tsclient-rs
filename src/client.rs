@@ -2627,6 +2627,7 @@ mod tests {
             Box::pin(async { Ok(()) })
         });
 
+        // 1. Client target with id (targetmode=2 target=15)
         crate::api::send_plugin_command(
             &client,
             "test_cmd",
@@ -2636,10 +2637,94 @@ mod tests {
         )
         .await
         .expect("send_plugin_command succeeded");
-
         let executed = seen_cmd.lock().unwrap().clone();
         assert!(
             executed.starts_with("plugincmd name=test_cmd data=val\\s1 targetmode=2 target=15")
         );
+
+        // 2. Channel target (targetmode=0)
+        crate::api::send_plugin_command(
+            &client,
+            "test_cmd",
+            "hello",
+            crate::types::PluginCommandTarget::CurrentChannel,
+            None,
+        )
+        .await
+        .expect("send_plugin_command succeeded");
+        let executed = seen_cmd.lock().unwrap().clone();
+        assert!(executed.starts_with("plugincmd name=test_cmd data=hello targetmode=0"));
+
+        // 3. Server target (targetmode=1)
+        crate::api::send_plugin_command(
+            &client,
+            "test_cmd",
+            "hello",
+            crate::types::PluginCommandTarget::Server,
+            None,
+        )
+        .await
+        .expect("send_plugin_command succeeded");
+        let executed = seen_cmd.lock().unwrap().clone();
+        assert!(executed.starts_with("plugincmd name=test_cmd data=hello targetmode=1"));
+
+        // 4. Escaping and empty payload
+        crate::api::send_plugin_command(
+            &client,
+            "b2 plug",
+            "a b|c/d",
+            crate::types::PluginCommandTarget::CurrentChannel,
+            None,
+        )
+        .await
+        .expect("send_plugin_command succeeded");
+        let executed = seen_cmd.lock().unwrap().clone();
+        assert!(
+            executed.starts_with("plugincmd name=b2\\splug data=a\\sb\\pc\\/d targetmode=0")
+        );
+
+        crate::api::send_plugin_command(
+            &client,
+            "plug",
+            "",
+            crate::types::PluginCommandTarget::CurrentChannel,
+            None,
+        )
+        .await
+        .expect("send_plugin_command succeeded");
+        let executed = seen_cmd.lock().unwrap().clone();
+        assert!(executed.starts_with("plugincmd name=plug data= targetmode=0"));
+
+        // 5. Client target missing id -> error
+        let err = crate::api::send_plugin_command(
+            &client,
+            "test_cmd",
+            "val",
+            crate::types::PluginCommandTarget::Client,
+            None,
+        )
+        .await;
+        assert!(err.is_err());
+
+        // 6. Non-Client target with unexpected target_id -> error
+        let err = crate::api::send_plugin_command(
+            &client,
+            "test_cmd",
+            "val",
+            crate::types::PluginCommandTarget::CurrentChannel,
+            Some(10),
+        )
+        .await;
+        assert!(err.is_err());
+
+        let err = crate::api::send_plugin_command(
+            &client,
+            "test_cmd",
+            "val",
+            crate::types::PluginCommandTarget::Server,
+            Some(10),
+        )
+        .await;
+        assert!(err.is_err());
     }
 }

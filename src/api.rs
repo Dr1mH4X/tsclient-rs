@@ -15,30 +15,6 @@ const CMD_TIMEOUT_MS: u64 = 10_000;
 /// Shorter timeout (ms) for read-only queries.
 const QUERY_TIMEOUT_MS: u64 = 5_000;
 
-/// Build the raw `plugincmd` wire command string.
-pub fn build_plugin_command(
-    name: &str,
-    data: &str,
-    target: PluginCommandTarget,
-    target_id: Option<i32>,
-) -> Result<String, Error> {
-    let mode_str = (target as i32).to_string();
-    let target_id_str;
-    let mut params = vec![
-        ("name", name),
-        ("data", data),
-        ("targetmode", mode_str.as_str()),
-    ];
-    if target == PluginCommandTarget::Client {
-        let id = target_id.ok_or_else(|| {
-            Error::Teamspeak("target_id is required for PluginCommandTarget::Client".to_string())
-        })?;
-        target_id_str = id.to_string();
-        params.push(("target", target_id_str.as_str()));
-    }
-    Ok(build_command_ordered("plugincmd", &params))
-}
-
 /// Send a plugin command to clients in the channel (0), server (1), or a specific client (2).
 pub async fn send_plugin_command(
     client: &Client,
@@ -47,8 +23,31 @@ pub async fn send_plugin_command(
     target: PluginCommandTarget,
     target_id: Option<i32>,
 ) -> Result<(), Error> {
-    let cmd = build_plugin_command(name, data, target, target_id)?;
-    client.exec_command(&cmd, QUERY_TIMEOUT_MS).await
+    let mode_str = (target as i32).to_string();
+    let target_id_str;
+    let mut params = vec![
+        ("name", name),
+        ("data", data),
+        ("targetmode", mode_str.as_str()),
+    ];
+    match target {
+        PluginCommandTarget::Client => {
+            let id = target_id.ok_or_else(|| {
+                Error::Teamspeak("target_id is required for PluginCommandTarget::Client".to_string())
+            })?;
+            target_id_str = id.to_string();
+            params.push(("target", target_id_str.as_str()));
+        }
+        PluginCommandTarget::CurrentChannel | PluginCommandTarget::Server => {
+            if target_id.is_some() {
+                return Err(Error::Teamspeak(
+                    "target_id is only allowed for PluginCommandTarget::Client".to_string(),
+                ));
+            }
+        }
+    }
+    let cmd = build_command_ordered("plugincmd", &params);
+    client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
 /// Send a text message to a client (target_mode=1), channel (2), or server (3).
@@ -281,49 +280,12 @@ pub async fn download_icon(
 }
 
 #[cfg(test)]
-mod tests {
+mod icon_tests {
     use super::*;
 
     #[test]
     fn icon_file_names_use_unsigned_decimal_ids() {
         assert_eq!(icon_file_name(3009859579), "/icon_3009859579");
         assert_eq!(icon_file_name(u32::MAX), "/icon_4294967295");
-    }
-
-    #[test]
-    fn test_build_plugin_command() {
-        // Channel target (targetmode=0)
-        let cmd = build_plugin_command("plug", "hello", PluginCommandTarget::CurrentChannel, None)
-            .expect("build command");
-        assert_eq!(cmd, "plugincmd name=plug data=hello targetmode=0");
-
-        // Server target (targetmode=1)
-        let cmd = build_plugin_command("plug", "hello", PluginCommandTarget::Server, None)
-            .expect("build command");
-        assert_eq!(cmd, "plugincmd name=plug data=hello targetmode=1");
-
-        // Client target (targetmode=2 target=10)
-        let cmd = build_plugin_command("plug", "hello", PluginCommandTarget::Client, Some(10))
-            .expect("build command");
-        assert_eq!(cmd, "plugincmd name=plug data=hello targetmode=2 target=10");
-
-        // Client target requires target_id
-        assert!(build_plugin_command("plug", "hello", PluginCommandTarget::Client, None).is_err());
-
-        // Escape test
-        let cmd = build_plugin_command(
-            "b2 plug",
-            "a b|c/d",
-            PluginCommandTarget::CurrentChannel,
-            None,
-        )
-        .expect("build command");
-        assert_eq!(cmd, "plugincmd name=b2\\splug data=a\\sb\\pc\\/d targetmode=0");
-
-        // Empty data test
-        let cmd =
-            build_plugin_command("plug", "", PluginCommandTarget::CurrentChannel, None)
-                .expect("build command");
-        assert_eq!(cmd, "plugincmd name=plug data= targetmode=0");
     }
 }
