@@ -199,6 +199,7 @@ struct EventHandlers {
     connected: Vec<Arc<dyn Fn() + Send + Sync>>,
     disconnected: Vec<EventHandler>,
     kicked: Vec<EventHandler>,
+    plugin_command: Vec<EventHandler>,
 }
 
 impl EventHandlers {
@@ -216,6 +217,7 @@ impl EventHandlers {
             connected: Vec::new(),
             disconnected: Vec::new(),
             kicked: Vec::new(),
+            plugin_command: Vec::new(),
         }
     }
 }
@@ -594,6 +596,9 @@ impl ClientInner {
                 self.ft_track
                     .notify(info.client_file_transfer_id, FtNotification::Status(info));
             }
+            NotificationResult::PluginCommand { event } => {
+                self.dispatch_event(Event::PluginCommand(event));
+            }
             NotificationResult::Unknown => {}
         }
     }
@@ -731,6 +736,15 @@ impl ClientInner {
                         let m = msg.clone();
                         tokio::spawn(async move {
                             h(Event::Kicked(m));
+                        });
+                    }
+                }
+                Event::PluginCommand(evt) => {
+                    for h in &self.event_handlers.plugin_command {
+                        let h = Arc::clone(h);
+                        let e = evt.clone();
+                        tokio::spawn(async move {
+                            h(Event::PluginCommand(e));
                         });
                     }
                 }
@@ -1333,6 +1347,16 @@ impl Client {
             .unwrap()
             .event_handlers
             .kicked
+            .push(handler);
+        self
+    }
+
+    pub fn on_plugin_command(&self, handler: EventHandler) -> &Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .plugin_command
             .push(handler);
         self
     }
@@ -2549,5 +2573,73 @@ mod tests {
             Box::pin(async { Ok(()) })
         });
         assert!(client.get_channel_description(7).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_command_dispatches_event() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.on_plugin_command(Arc::new(move |event| {
+            if let Event::PluginCommand(ref ev) = event {
+                let _ = tx.send(ev.clone());
+            }
+        }));
+
+        client.inner.lock().unwrap().handle_command_str(
+            "notifyplugincmd name=my_plugin data=hello\\sworld invokerid=42 invokername=Alice invokeruid=abc123=",
+            &sender,
+        );
+
+        let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for plugin command event")
+            .expect("event received");
+
+        assert_eq!(received.name, "my_plugin");
+        assert_eq!(received.data, "hello world");
+        assert_eq!(received.invoker_id, 42);
+        assert_eq!(received.invoker_name, "Alice");
+        assert_eq!(received.invoker_uid, "abc123=");
+    }
+
+    #[tokio::test]
+    async fn send_plugin_command_executes_correct_command() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let seen_cmd = Arc::new(Mutex::new(String::new()));
+        let recorded = Arc::clone(&seen_cmd);
+        let inner = Arc::clone(&client.inner);
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            *recorded.lock().unwrap() = line.clone();
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            let mut inner = inner.lock().unwrap();
+            inner.cmd_track.resolve(rc, None);
+            Box::pin(async { Ok(()) })
+        });
+
+        crate::api::send_plugin_command(
+            &client,
+            "test_cmd",
+            "val 1",
+            crate::types::PluginCommandTarget::Client,
+            Some(15),
+        )
+        .await
+        .expect("send_plugin_command succeeded");
+
+        let executed = seen_cmd.lock().unwrap().clone();
+        assert!(
+            executed.starts_with("plugincmd name=test_cmd data=val\\s1 targetmode=2 target=15")
+        );
     }
 }

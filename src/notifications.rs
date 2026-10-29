@@ -34,6 +34,9 @@ pub enum NotificationResult {
     FileTransferStatus {
         info: FileTransferStatusInfo,
     },
+    PluginCommand {
+        event: PluginCommandEvent,
+    },
     Unknown,
 }
 
@@ -51,6 +54,7 @@ pub fn handle_notification(
         "notifyclientmoved" => handle_client_moved(params, clients),
         "notifytextmessage" => handle_text_message(params, clients),
         "notifyclientpoke" => handle_client_poked(params),
+        "notifyplugincmd" | "notifyplugincommand" => handle_plugin_command(params),
         "notifystartupload" => {
             let info = handle_start_upload(params);
             NotificationResult::StartUpload { info }
@@ -210,6 +214,18 @@ fn handle_client_poked(params: &HashMap<String, String>) -> NotificationResult {
             invoker_name: unescape(params.get("invokername").map(|s| s.as_str()).unwrap_or("")),
             invoker_uid: params.get("invokeruid").cloned().unwrap_or_default(),
             message: unescape(params.get("msg").map(|s| s.as_str()).unwrap_or("")),
+        },
+    }
+}
+
+fn handle_plugin_command(params: &HashMap<String, String>) -> NotificationResult {
+    NotificationResult::PluginCommand {
+        event: PluginCommandEvent {
+            name: params.get("name").cloned().unwrap_or_default(),
+            data: params.get("data").cloned().unwrap_or_default(),
+            invoker_id: parse_u16(params.get("invokerid").map(|s| s.as_str()).unwrap_or("")),
+            invoker_name: params.get("invokername").cloned().unwrap_or_default(),
+            invoker_uid: params.get("invokeruid").cloned().unwrap_or_default(),
         },
     }
 }
@@ -383,6 +399,44 @@ mod tests {
                 assert_eq!(message.invoker_groups, vec!["1"]);
             }
             _ => panic!("expected TextMessage"),
+        }
+    }
+
+    #[test]
+    fn test_plugin_command_notification() {
+        let cmd = crate::command::parse_command(
+            "notifyplugincmd name=test_plugin data=foo\\sbar invokerid=42 invokername=Alice invokeruid=abc123=",
+        )
+        .expect("parse command");
+        let mut clients = DirectoryCache::default();
+        let result = handle_notification(&cmd.name, &cmd.params, 0, &mut clients, "");
+        match result {
+            NotificationResult::PluginCommand { event } => {
+                assert_eq!(event.name, "test_plugin");
+                assert_eq!(event.data, "foo bar");
+                assert_eq!(event.invoker_id, 42);
+                assert_eq!(event.invoker_name, "Alice");
+                assert_eq!(event.invoker_uid, "abc123=");
+            }
+            _ => panic!("expected PluginCommand"),
+        }
+
+        // Test alias notifyplugincommand and empty payload
+        let cmd_alias = crate::command::parse_command(
+            "notifyplugincommand name=another data= invokerid=10 invokername=Bob invokeruid=xyz=",
+        )
+        .expect("parse command");
+        let result_alias =
+            handle_notification(&cmd_alias.name, &cmd_alias.params, 0, &mut clients, "");
+        match result_alias {
+            NotificationResult::PluginCommand { event } => {
+                assert_eq!(event.name, "another");
+                assert_eq!(event.data, "");
+                assert_eq!(event.invoker_id, 10);
+                assert_eq!(event.invoker_name, "Bob");
+                assert_eq!(event.invoker_uid, "xyz=");
+            }
+            _ => panic!("expected PluginCommand"),
         }
     }
 }
