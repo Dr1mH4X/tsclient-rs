@@ -157,6 +157,40 @@ let response = client.exec_command_with_response("serverconnectinfo", 5000).awai
 
 // Fire-and-forget command
 client.send_command_no_wait("clientupdate").await?;
+
+// Send plugin command (target: CurrentChannel=0, Server=1, Client=2)
+sendPluginCommand(
+    &client,
+    "my_plugin",
+    "payload_data",
+    PluginCommandTarget::CurrentChannel,
+    None,
+).await?;
+
+// Send private plugin command to a specific client
+sendPluginCommand(
+    &client,
+    "my_plugin",
+    "private_data",
+    PluginCommandTarget::Client,
+    Some(clid),
+).await?;
+```
+
+## Plugin Command Listening
+
+```rust
+use std::sync::Arc;
+use tsclient_rs::*;
+
+client.on_plugin_command(Arc::new(|event| {
+    if let Event::PluginCommand(ref cmd) = event {
+        println!(
+            "Plugin command '{}' from {} (clid={}, uid={}): {}",
+            cmd.name, cmd.invoker_name, cmd.invoker_id, cmd.invoker_uid, cmd.data
+        );
+    }
+}));
 ```
 
 ## File Transfer Example
