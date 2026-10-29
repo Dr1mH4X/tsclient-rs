@@ -29,7 +29,6 @@
 | `client.on_kicked(handler)`               | Fires when the bot is kicked       |
 | `client.on_poked(handler)`                | Fires when poked by a client       |
 | `client.on_voice_data(handler)`           | Fires on incoming voice data       |
-| `client.on_plugin_command(handler)`       | Fires on a plugin command (`send_plugin_command`) |
 
 Directory snapshots are coalesced and delivered serially per handler. A slow
 handler retains only the newest pending state. The live directory cache is
@@ -56,7 +55,6 @@ or resurrected by a late row.
 | `sendTextMessage(client, targetMode, targetId, msg)`   | Send a text message                        |
 | `clientMove(client, clid, channelId, password?)`       | Move a client to a channel                 |
 | `poke(client, clid, message)`                          | Poke a client                              |
-| `sendPluginCommand(client, name, data, target, targetId?)` / `send_plugin_command(...)` | Send a plugin command to channel (0), server (1), or a client (2) |
 | `client.send_voice(data, codec)`                       | Send Opus voice data                       |
 | `listChannels(client)`                                 | List all channels                          |
 | `getChannelInfo(client, channelId)` / `client.get_channel_info(channel_id)` | Get detailed channel configuration and description |

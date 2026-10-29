@@ -27,25 +27,6 @@ impl From<KickReason> for i32 {
     }
 }
 
-/// Target destination for [`send_plugin_command`](crate::sendPluginCommand).
-///
-/// Matches TeamSpeak 3 / 6 wire targetmode:
-/// - `CurrentChannel` (0): broadcast to clients in sender's channel, including sender.
-/// - `Server` (1): broadcast to every client on the server, including sender.
-/// - `Client` (2): send private plugin command to a specific client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginCommandTarget {
-    CurrentChannel = 0,
-    Server = 1,
-    Client = 2,
-}
-
-impl From<PluginCommandTarget> for i32 {
-    fn from(t: PluginCommandTarget) -> Self {
-        t as i32
-    }
-}
-
 // ---- Event data structs ------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -162,15 +143,6 @@ pub struct VoiceData {
     pub data: Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginCommandEvent {
-    pub name: String,
-    pub data: String,
-    pub invoker_id: i32,
-    pub invoker_name: String,
-    pub invoker_uid: String,
-}
-
 // ---- Event enum (replaces TS EventMap mapped type) --------------------------
 
 #[derive(Debug, Clone)]
@@ -187,7 +159,6 @@ pub enum Event {
     Connected,
     Disconnected(Option<Error>),
     Kicked(String),
-    PluginCommand(PluginCommandEvent),
 }
 
 // ---- Client state -----------------------------------------------------------
