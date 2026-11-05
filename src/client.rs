@@ -184,6 +184,74 @@ impl SerialEventHandler {
     }
 }
 
+/// Cap on raw notifications queued per handler; past it the queue resets
+/// and signals an overflow event instead of dropping individual signaling packets.
+const MAX_QUEUED_RAW_NOTIFICATIONS: usize = 256;
+
+/// Delivers raw notifications to one handler in strict dispatch order:
+/// a drain task pops a bounded FIFO. When queue reaches 256, it clears
+/// pending items and delivers `Event::NotificationOverflow`.
+struct SerialRawNotificationHandler {
+    handler: EventHandler,
+    pending: Arc<Mutex<VecDeque<Event>>>,
+    wake: Arc<Notify>,
+    started: bool,
+    logger: Arc<dyn Logger>,
+}
+
+impl SerialRawNotificationHandler {
+    fn new(handler: EventHandler, logger: Arc<dyn Logger>) -> Self {
+        Self {
+            handler,
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            wake: Arc::new(Notify::new()),
+            started: false,
+            logger,
+        }
+    }
+
+    fn enqueue(&mut self, event: Event) {
+        if !self.started {
+            self.started = true;
+            self.start();
+        }
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.len() >= MAX_QUEUED_RAW_NOTIFICATIONS {
+                self.logger.warn(
+                    "raw notification queue full (256); resetting queue and signaling overflow",
+                    &[],
+                );
+                pending.clear();
+                pending.push_back(Event::NotificationOverflow {
+                    queue: "raw_notification".to_string(),
+                });
+            } else {
+                pending.push_back(event);
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    fn start(&mut self) {
+        let handler = Arc::clone(&self.handler);
+        let pending = Arc::clone(&self.pending);
+        let wake = Arc::clone(&self.wake);
+        tokio::spawn(async move {
+            loop {
+                wake.notified().await;
+                loop {
+                    let next = pending.lock().unwrap().pop_front();
+                    let Some(event) = next else { break };
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        handler(event);
+                    }));
+                }
+            }
+        });
+    }
+}
+
 // ---- Event handler storage ------------------------------------------------------
 
 struct EventHandlers {
@@ -200,7 +268,7 @@ struct EventHandlers {
     disconnected: Vec<EventHandler>,
     kicked: Vec<EventHandler>,
     plugin_command: Vec<EventHandler>,
-    raw_notification: Vec<EventHandler>,
+    raw_notification: Vec<SerialRawNotificationHandler>,
 }
 
 impl EventHandlers {
@@ -770,13 +838,15 @@ impl ClientInner {
                     }
                 }
                 Event::RawNotification { name, items } => {
-                    for h in &self.event_handlers.raw_notification {
-                        let h = Arc::clone(h);
-                        let n = name.clone();
-                        let it = items.clone();
-                        tokio::spawn(async move {
-                            h(Event::RawNotification { name: n, items: it });
-                        });
+                    let event = Event::RawNotification { name, items };
+                    for handler in &mut self.event_handlers.raw_notification {
+                        handler.enqueue(event.clone());
+                    }
+                }
+                Event::NotificationOverflow { queue } => {
+                    let event = Event::NotificationOverflow { queue };
+                    for handler in &mut self.event_handlers.raw_notification {
+                        handler.enqueue(event.clone());
                     }
                 }
             }
@@ -1397,12 +1467,13 @@ impl Client {
     }
 
     pub fn on_raw_notification(&self, handler: EventHandler) -> &Self {
+        let logger = Arc::clone(&self.logger);
         self.inner
             .lock()
             .unwrap()
             .event_handlers
             .raw_notification
-            .push(handler);
+            .push(SerialRawNotificationHandler::new(handler, logger));
         self
     }
 
@@ -2880,5 +2951,111 @@ mod tests {
         assert!(executed.starts_with(
             "streamsignaling id=stream-1 clid=7 json={\"cmd\":\"answer\",\"args\":{\"answer\":\"v=0\\r\\na=mid:0\\p1\\r\\n\"}} return_code="
         ));
+    }
+
+    #[tokio::test]
+    async fn raw_notifications_maintain_strict_fifo_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        let handler: EventHandler = {
+            let seen = Arc::clone(&seen);
+            let done_tx = Arc::clone(&done_tx);
+            Arc::new(move |event| {
+                if let Event::RawNotification { items, .. } = event {
+                    let seq = items[0].get("seq").unwrap().parse::<i32>().unwrap();
+                    seen.lock().unwrap().push(seq);
+                    if seen.lock().unwrap().len() == 20 {
+                        if let Some(done) = done_tx.lock().unwrap().take() {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            })
+        };
+
+        let mut serial = SerialRawNotificationHandler::new(handler, Arc::new(crate::types::NoopLogger));
+        for i in 1..=20 {
+            serial.enqueue(Event::RawNotification {
+                name: "notifystreamsignaling".to_string(),
+                items: vec![HashMap::from([("seq".to_string(), i.to_string())])],
+            });
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("raw notification FIFO did not finish")
+            .ok();
+
+        let expected: Vec<i32> = (1..=20).collect();
+        assert_eq!(*seen.lock().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn raw_notification_queue_overflow_resets_and_emits_notification_overflow() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        let handler: EventHandler = {
+            let events = Arc::clone(&events);
+            let done_tx = Arc::clone(&done_tx);
+            Arc::new(move |event| {
+                // Introduce slight delay to allow backlog to form
+                std::thread::sleep(Duration::from_millis(1));
+                let is_overflow = matches!(event, Event::NotificationOverflow { .. });
+                events.lock().unwrap().push(event);
+                if is_overflow {
+                    if let Some(done) = done_tx.lock().unwrap().take() {
+                        let _ = done.send(());
+                    }
+                }
+            })
+        };
+
+        let mut serial = SerialRawNotificationHandler::new(handler, Arc::new(crate::types::NoopLogger));
+        for i in 0..(MAX_QUEUED_RAW_NOTIFICATIONS + 10) {
+            serial.enqueue(Event::RawNotification {
+                name: "notifystream".to_string(),
+                items: vec![HashMap::from([("idx".to_string(), i.to_string())])],
+            });
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("overflow event received")
+            .ok();
+
+        let received = events.lock().unwrap();
+        assert!(received.iter().any(|ev| matches!(ev, Event::NotificationOverflow { queue } if queue == "raw_notification")));
+    }
+
+    #[tokio::test]
+    async fn send_raw_command_validates_cmd_key_and_nul() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+
+        // 1. Invalid command name
+        assert!(client.send_raw_command("", &[("k", "v")]).await.is_err());
+        assert!(client.send_raw_command("cmd with space", &[("k", "v")]).await.is_err());
+        assert!(client.send_raw_command("cmd=1", &[("k", "v")]).await.is_err());
+        assert!(client.send_raw_command("cmd|pipe", &[("k", "v")]).await.is_err());
+        assert!(client.send_raw_command("cmd\0nul", &[("k", "v")]).await.is_err());
+
+        // 2. Invalid parameter key
+        assert!(client.send_raw_command("testcmd", &[("", "v")]).await.is_err());
+        assert!(client.send_raw_command("testcmd", &[("key with space", "v")]).await.is_err());
+        assert!(client.send_raw_command("testcmd", &[("key=bad", "v")]).await.is_err());
+        assert!(client.send_raw_command("testcmd", &[("key|bad", "v")]).await.is_err());
+        assert!(client.send_raw_command("testcmd", &[("key\nbad", "v")]).await.is_err());
+        assert!(client.send_raw_command("testcmd", &[("key\0bad", "v")]).await.is_err());
+
+        // 3. NUL in parameter value
+        assert!(client.send_raw_command("testcmd", &[("key", "val\0with_nul")]).await.is_err());
     }
 }

@@ -193,6 +193,9 @@ pub enum Event {
         name: String,
         items: Vec<HashMap<String, String>>,
     },
+    NotificationOverflow {
+        queue: String,
+    },
 }
 
 // ---- Client state -----------------------------------------------------------

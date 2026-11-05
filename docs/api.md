@@ -50,6 +50,13 @@ before a client's row are replayed once the row inserts the client, and
 clients an enterview introduced or a left view removed are never replaced
 or resurrected by a late row.
 
+Raw notifications (`Event::RawNotification`) are delivered serially per
+handler in strict FIFO dispatch order, ensuring sequential delivery of
+stateful signaling like WebRTC SDP and ICE candidates. Each handler has
+a bounded backlog of 256 items; if a slow handler exceeds capacity, the
+queue resets to prevent memory bloat and emits `Event::NotificationOverflow`
+so consumers can safely teardown and reconnect.
+
 ## Commands
 
 | Function                                               | Description                                |
