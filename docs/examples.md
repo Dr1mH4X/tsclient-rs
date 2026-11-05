@@ -155,6 +155,9 @@ let info = getClientInfo(&client, clid).await?;
 // Execute raw command with response
 let response = client.exec_command_with_response("serverconnectinfo", 5000).await?;
 
+// Build and execute custom protocol command with automatic parameter escaping
+client.send_raw_command("requeststreaminfo", &[("clid", "42")]).await?;
+
 // Fire-and-forget command
 client.send_command_no_wait("clientupdate").await?;
 

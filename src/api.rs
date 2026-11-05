@@ -50,6 +50,40 @@ pub async fn send_plugin_command(
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
+fn validate_command_ident(ident: &str, field_name: &str) -> Result<(), Error> {
+    if ident.is_empty() {
+        return Err(Error::Teamspeak(format!("{field_name} cannot be empty")));
+    }
+    if ident
+        .chars()
+        .any(|c| c.is_whitespace() || c == '=' || c == '|' || c == '\\' || c == '\0')
+    {
+        return Err(Error::Teamspeak(format!(
+            "invalid character in {field_name}: {ident}"
+        )));
+    }
+    Ok(())
+}
+
+/// Build and execute an arbitrary protocol command with escaped key-value parameters.
+pub async fn send_raw_command(
+    client: &Client,
+    cmd: &str,
+    params: &[(&str, &str)],
+) -> Result<(), Error> {
+    validate_command_ident(cmd, "command name")?;
+    for &(k, v) in params {
+        validate_command_ident(k, "parameter key")?;
+        if v.contains('\0') {
+            return Err(Error::Teamspeak(format!(
+                "parameter value for '{k}' cannot contain NUL byte"
+            )));
+        }
+    }
+    let built = build_command_ordered(cmd, params);
+    client.exec_command(&built, CMD_TIMEOUT_MS).await
+}
+
 /// Send a text message to a client (target_mode=1), channel (2), or server (3).
 pub async fn send_text_message(
     client: &Client,

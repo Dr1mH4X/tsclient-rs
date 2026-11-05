@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -188,6 +189,13 @@ pub enum Event {
     Disconnected(Option<Error>),
     Kicked(String),
     PluginCommand(PluginCommandEvent),
+    RawNotification {
+        name: String,
+        items: Vec<HashMap<String, String>>,
+    },
+    NotificationOverflow {
+        queue: String,
+    },
 }
 
 // ---- Client state -----------------------------------------------------------
