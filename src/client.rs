@@ -200,6 +200,7 @@ struct EventHandlers {
     disconnected: Vec<EventHandler>,
     kicked: Vec<EventHandler>,
     plugin_command: Vec<EventHandler>,
+    raw_notification: Vec<EventHandler>,
 }
 
 impl EventHandlers {
@@ -218,6 +219,7 @@ impl EventHandlers {
             disconnected: Vec::new(),
             kicked: Vec::new(),
             plugin_command: Vec::new(),
+            raw_notification: Vec::new(),
         }
     }
 }
@@ -365,163 +367,185 @@ impl ClientInner {
             if trimmed.is_empty() {
                 continue;
             }
-            for row in split_command_rows(trimmed) {
-                self.handle_command_str(&row, sender);
-            }
+            self.handle_command_str(trimmed, sender);
         }
     }
 
     fn handle_command_str(&mut self, s: &str, sender: &PacketSender) {
-        let cmd = match parse_command(s) {
-            Some(c) => c,
-            None => return,
-        };
+        let mut raw_notification: Option<(String, Vec<HashMap<String, String>>)> = None;
+        for row in split_command_rows(s) {
+            let cmd = match parse_command(&row) {
+                Some(c) => c,
+                None => continue,
+            };
 
-        if cmd.name.starts_with("notify") {
-            self.cmd_track
-                .buffer_notification(&cmd.name, cmd.params.clone());
-            if cmd.name == "notifyclientneededpermissions"
-                && self.status != ClientStatus::Disconnected
-            {
-                if let Some(id) = cmd.params.get("permid").and_then(|v| v.parse::<u32>().ok()) {
-                    match cmd
-                        .params
-                        .get("permvalue")
-                        .and_then(|v| v.parse::<i32>().ok())
-                    {
-                        Some(value) => {
-                            self.own_permissions.insert(id, value);
-                        }
-                        None => {
-                            self.own_permissions.remove(&id);
+            if cmd.name.starts_with("notify") {
+                self.cmd_track
+                    .buffer_notification(&cmd.name, cmd.params.clone());
+                if cmd.name == "notifyclientneededpermissions"
+                    && self.status != ClientStatus::Disconnected
+                {
+                    if let Some(id) = cmd.params.get("permid").and_then(|v| v.parse::<u32>().ok()) {
+                        match cmd
+                            .params
+                            .get("permvalue")
+                            .and_then(|v| v.parse::<i32>().ok())
+                        {
+                            Some(value) => {
+                                self.own_permissions.insert(id, value);
+                            }
+                            None => {
+                                self.own_permissions.remove(&id);
+                            }
                         }
                     }
+                    self.dispatch_event(Event::OwnPermissionsChanged);
                 }
-                self.dispatch_event(Event::OwnPermissionsChanged);
-            }
-            let was_truncated = self.directory.truncated();
-            let channel_changed = server_directory::apply_channel_notification(
-                &cmd.name,
-                &cmd.params,
-                &mut self.directory,
-            );
-            let updated_client = server_directory::apply_client_notification(
-                &cmd.name,
-                &cmd.params,
-                &mut self.directory,
-            );
-            let result = handle_notification(
-                &cmd.name,
-                &cmd.params,
-                self.clid,
-                &mut self.directory,
-                &self.nickname,
-            );
-            self.process_notification_result(result, &cmd.params, sender);
-            let client_changed = updated_client.is_some();
-            if let Some(info) = updated_client {
-                self.dispatch_event(Event::ClientUpdated(info));
-            }
-            if channel_changed || client_changed || (!was_truncated && self.directory.truncated()) {
-                self.mark_directory_changed();
-            }
-            return;
-        }
-
-        match cmd.name.as_str() {
-            "clientinitiv" => {
-                crate::handshake::handle_handshake_init_iv(self, sender, &cmd.params);
-                sender.set_crypt(self.crypt.clone());
-            }
-            "initivexpand2" => {
-                crate::handshake::handle_handshake_expand2(self, sender, &cmd.params);
-                sender.set_crypt(self.crypt.clone());
-            }
-            "initserver" => {
-                crate::handshake::handle_init_server(self, sender, &cmd.params);
-            }
-            "channellist" => {
-                if !self.directory_ready {
-                    if let Some(channel) = server_directory::parse_channel(&cmd.params) {
-                        self.directory.insert_channel(channel);
-                    }
-                }
-                self.cmd_track.buffer(cmd.params.clone());
-            }
-            "channelclientlist" => {
                 let was_truncated = self.directory.truncated();
-                if let Some(client) = server_directory::parse_client(&cmd.params) {
-                    let id = client.id;
-                    let mut changed = false;
-                    // A row is a snapshot from before it was sent: live
-                    // events own the state of clients they introduced or
-                    // removed, and a buffered welcome patch replays over a
-                    // fresh insert only.
-                    if !self.directory.client_departed(id) && self.directory.client(id).is_none() {
-                        changed = self.directory.insert_client(client);
-                        if let Some(params) = self.directory.take_pending_client_updates(id) {
-                            if let Some(info) = server_directory::apply_client_notification(
-                                "notifyclientupdated",
-                                &params,
-                                &mut self.directory,
-                            ) {
-                                changed = true;
-                                self.dispatch_event(Event::ClientUpdated(info));
-                            }
-                        }
-                        for (sgid, add) in self.directory.take_pending_group_ops(id) {
-                            let name = if add {
-                                "notifyservergroupclientadded"
-                            } else {
-                                "notifyservergroupclientdeleted"
-                            };
-                            let op = HashMap::from([
-                                ("clid".to_string(), id.to_string()),
-                                ("sgid".to_string(), sgid),
-                            ]);
-                            if let Some(info) = server_directory::apply_client_notification(
-                                name,
-                                &op,
-                                &mut self.directory,
-                            ) {
-                                changed = true;
-                                self.dispatch_event(Event::ClientUpdated(info));
-                            }
-                        }
+                let channel_changed = server_directory::apply_channel_notification(
+                    &cmd.name,
+                    &cmd.params,
+                    &mut self.directory,
+                );
+                let updated_client = server_directory::apply_client_notification(
+                    &cmd.name,
+                    &cmd.params,
+                    &mut self.directory,
+                );
+                let result = handle_notification(
+                    &cmd.name,
+                    &cmd.params,
+                    self.clid,
+                    &mut self.directory,
+                    &self.nickname,
+                );
+                match result {
+                    NotificationResult::RawNotification { name, items } => {
+                        raw_notification
+                            .get_or_insert_with(|| (name, Vec::new()))
+                            .1
+                            .extend(items);
                     }
-                    if (changed || (!was_truncated && self.directory.truncated()))
-                        && self.directory_ready
-                    {
-                        self.mark_directory_changed();
+                    other => {
+                        self.process_notification_result(other, sender);
                     }
                 }
-                self.cmd_track.buffer(cmd.params.clone());
-            }
-            "channellistfinished" => {
-                self.directory.finish_welcome();
-                self.directory_ready = true;
-                for (_, waker) in self.directory_wakers.drain(..) {
-                    let _ = waker.send(());
+                let client_changed = updated_client.is_some();
+                if let Some(info) = updated_client {
+                    self.dispatch_event(Event::ClientUpdated(info));
                 }
-                self.mark_directory_changed();
+                if channel_changed
+                    || client_changed
+                    || (!was_truncated && self.directory.truncated())
+                {
+                    self.mark_directory_changed();
+                }
+                continue;
             }
-            "error" => {
-                self.handle_error(&cmd.params);
+
+            match cmd.name.as_str() {
+                "clientinitiv" => {
+                    crate::handshake::handle_handshake_init_iv(self, sender, &cmd.params);
+                    sender.set_crypt(self.crypt.clone());
+                }
+                "initivexpand2" => {
+                    crate::handshake::handle_handshake_expand2(self, sender, &cmd.params);
+                    sender.set_crypt(self.crypt.clone());
+                }
+                "initserver" => {
+                    crate::handshake::handle_init_server(self, sender, &cmd.params);
+                }
+                "channellist" => {
+                    if !self.directory_ready {
+                        if let Some(channel) = server_directory::parse_channel(&cmd.params) {
+                            self.directory.insert_channel(channel);
+                        }
+                    }
+                    self.cmd_track.buffer(cmd.params.clone());
+                }
+                "channelclientlist" => {
+                    let was_truncated = self.directory.truncated();
+                    if let Some(client) = server_directory::parse_client(&cmd.params) {
+                        let id = client.id;
+                        let mut changed = false;
+                        // A row is a snapshot from before it was sent: live
+                        // events own the state of clients they introduced or
+                        // removed, and a buffered welcome patch replays over a
+                        // fresh insert only.
+                        if !self.directory.client_departed(id)
+                            && self.directory.client(id).is_none()
+                        {
+                            changed = self.directory.insert_client(client);
+                            if let Some(params) = self.directory.take_pending_client_updates(id) {
+                                if let Some(info) = server_directory::apply_client_notification(
+                                    "notifyclientupdated",
+                                    &params,
+                                    &mut self.directory,
+                                ) {
+                                    changed = true;
+                                    self.dispatch_event(Event::ClientUpdated(info));
+                                }
+                            }
+                            for (sgid, add) in self.directory.take_pending_group_ops(id) {
+                                let name = if add {
+                                    "notifyservergroupclientadded"
+                                } else {
+                                    "notifyservergroupclientdeleted"
+                                };
+                                let op = HashMap::from([
+                                    ("clid".to_string(), id.to_string()),
+                                    ("sgid".to_string(), sgid),
+                                ]);
+                                if let Some(info) = server_directory::apply_client_notification(
+                                    name,
+                                    &op,
+                                    &mut self.directory,
+                                ) {
+                                    changed = true;
+                                    self.dispatch_event(Event::ClientUpdated(info));
+                                }
+                            }
+                        }
+                        if (changed || (!was_truncated && self.directory.truncated()))
+                            && self.directory_ready
+                        {
+                            self.mark_directory_changed();
+                        }
+                    }
+                    self.cmd_track.buffer(cmd.params.clone());
+                }
+                "channellistfinished" => {
+                    self.directory.finish_welcome();
+                    self.directory_ready = true;
+                    for (_, waker) in self.directory_wakers.drain(..) {
+                        let _ = waker.send(());
+                    }
+                    self.mark_directory_changed();
+                }
+                "error" => {
+                    self.handle_error(&cmd.params);
+                }
+                _ => {
+                    let params = if cmd.name.contains('=') {
+                        let eq_idx = cmd.name.find('=').unwrap();
+                        let k = crate::command::unescape(&cmd.name[..eq_idx]);
+                        let v = crate::command::unescape(&cmd.name[eq_idx + 1..]);
+                        let mut p = HashMap::new();
+                        p.insert(k, v);
+                        p.extend(cmd.params);
+                        p
+                    } else {
+                        cmd.params
+                    };
+                    self.cmd_track.buffer(params);
+                }
             }
-            _ => {
-                let params = if cmd.name.contains('=') {
-                    let eq_idx = cmd.name.find('=').unwrap();
-                    let k = crate::command::unescape(&cmd.name[..eq_idx]);
-                    let v = crate::command::unescape(&cmd.name[eq_idx + 1..]);
-                    let mut p = HashMap::new();
-                    p.insert(k, v);
-                    p.extend(cmd.params);
-                    p
-                } else {
-                    cmd.params
-                };
-                self.cmd_track.buffer(params);
-            }
+        }
+        if let Some((name, items)) = raw_notification {
+            self.process_notification_result(
+                NotificationResult::RawNotification { name, items },
+                sender,
+            );
         }
     }
 
@@ -543,12 +567,7 @@ impl ClientInner {
         }
     }
 
-    fn process_notification_result(
-        &mut self,
-        result: NotificationResult,
-        _params: &HashMap<String, String>,
-        sender: &PacketSender,
-    ) {
+    fn process_notification_result(&mut self, result: NotificationResult, sender: &PacketSender) {
         match result {
             NotificationResult::ClientEnter { info } => {
                 let is_self =
@@ -599,7 +618,9 @@ impl ClientInner {
             NotificationResult::PluginCommand { event } => {
                 self.dispatch_event(Event::PluginCommand(event));
             }
-            NotificationResult::Unknown => {}
+            NotificationResult::RawNotification { name, items } => {
+                self.dispatch_event(Event::RawNotification { name, items });
+            }
         }
     }
 
@@ -745,6 +766,16 @@ impl ClientInner {
                         let e = evt.clone();
                         tokio::spawn(async move {
                             h(Event::PluginCommand(e));
+                        });
+                    }
+                }
+                Event::RawNotification { name, items } => {
+                    for h in &self.event_handlers.raw_notification {
+                        let h = Arc::clone(h);
+                        let n = name.clone();
+                        let it = items.clone();
+                        tokio::spawn(async move {
+                            h(Event::RawNotification { name: n, items: it });
                         });
                     }
                 }
@@ -1147,6 +1178,10 @@ impl Client {
         Ok(())
     }
 
+    pub async fn send_raw_command(&self, cmd: &str, params: &[(&str, &str)]) -> Result<(), Error> {
+        crate::api::send_raw_command(self, cmd, params).await
+    }
+
     pub async fn exec_command_with_response(
         &self,
         cmd: &str,
@@ -1357,6 +1392,16 @@ impl Client {
             .unwrap()
             .event_handlers
             .plugin_command
+            .push(handler);
+        self
+    }
+
+    pub fn on_raw_notification(&self, handler: EventHandler) -> &Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .raw_notification
             .push(handler);
         self
     }
@@ -2726,5 +2771,114 @@ mod tests {
         )
         .await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_signaling_and_multi_item_notifications_dispatch_raw_notification() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.on_raw_notification(Arc::new(move |event| {
+            if let Event::RawNotification { name, items } = event {
+                let _ = tx.send((name, items));
+            }
+        }));
+
+        let sdp = "v=0\r\no=- 98765 2 IN IP4 127.0.0.1\r\ns=-\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n";
+        let json_payload = format!(
+            r#"{{"cmd":"joinResponse","args":{{"decision":1,"offer":"{}"}}}}"#,
+            sdp
+        );
+        let wire_line = crate::command::build_command_ordered(
+            "notifystreamsignaling",
+            &[("id", "stream-42"), ("clid", "7"), ("json", &json_payload)],
+        );
+
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_lines(&wire_line, &sender);
+
+        let (name, items) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for raw notification")
+            .expect("raw notification received");
+
+        assert_eq!(name, "notifystreamsignaling");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].get("id").map(String::as_str), Some("stream-42"));
+        assert_eq!(items[0].get("clid").map(String::as_str), Some("7"));
+        assert_eq!(
+            items[0].get("json").map(String::as_str),
+            Some(json_payload.as_str())
+        );
+
+        // Multi-item notification separated by `|`
+        client.inner.lock().unwrap().handle_command_lines(
+            "notifystreaminfo id=s1 clid=10 name=Desktop\\sOne audio=1|id=s2 clid=11 name=Desktop\\sTwo audio=0",
+            &sender,
+        );
+
+        let (name, items) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for multi-item raw notification")
+            .expect("multi-item raw notification received");
+
+        assert_eq!(name, "notifystreaminfo");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].get("id").map(String::as_str), Some("s1"));
+        assert_eq!(items[0].get("clid").map(String::as_str), Some("10"));
+        assert_eq!(
+            items[0].get("name").map(String::as_str),
+            Some("Desktop One")
+        );
+        assert_eq!(items[0].get("audio").map(String::as_str), Some("1"));
+        assert_eq!(items[1].get("id").map(String::as_str), Some("s2"));
+        assert_eq!(items[1].get("clid").map(String::as_str), Some("11"));
+        assert_eq!(
+            items[1].get("name").map(String::as_str),
+            Some("Desktop Two")
+        );
+        assert_eq!(items[1].get("audio").map(String::as_str), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn send_raw_command_escapes_parameters_and_executes() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let seen_cmd = Arc::new(Mutex::new(String::new()));
+        let recorded = Arc::clone(&seen_cmd);
+        let inner = Arc::clone(&client.inner);
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            *recorded.lock().unwrap() = line.clone();
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            let mut inner = inner.lock().unwrap();
+            inner.cmd_track.resolve(rc, None);
+            Box::pin(async { Ok(()) })
+        });
+
+        let json_payload = "{\"cmd\":\"answer\",\"args\":{\"answer\":\"v=0\r\na=mid:0|1\r\n\"}}";
+        client
+            .send_raw_command(
+                "streamsignaling",
+                &[("id", "stream-1"), ("clid", "7"), ("json", json_payload)],
+            )
+            .await
+            .expect("send_raw_command succeeded");
+
+        let executed = seen_cmd.lock().unwrap().clone();
+        assert!(executed.starts_with(
+            "streamsignaling id=stream-1 clid=7 json={\"cmd\":\"answer\",\"args\":{\"answer\":\"v=0\\r\\na=mid:0\\p1\\r\\n\"}} return_code="
+        ));
     }
 }

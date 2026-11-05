@@ -50,6 +50,16 @@ pub async fn send_plugin_command(
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
+/// Build and execute an arbitrary protocol command with escaped key-value parameters.
+pub async fn send_raw_command(
+    client: &Client,
+    cmd: &str,
+    params: &[(&str, &str)],
+) -> Result<(), Error> {
+    let built = build_command_ordered(cmd, params);
+    client.exec_command(&built, CMD_TIMEOUT_MS).await
+}
+
 /// Send a text message to a client (target_mode=1), channel (2), or server (3).
 pub async fn send_text_message(
     client: &Client,

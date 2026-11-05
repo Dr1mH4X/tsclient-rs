@@ -81,8 +81,8 @@ pub use api::{
     get_channel_description as getChannelDescription, get_channel_info,
     get_channel_info as getChannelInfo, get_client_info as getClientInfo, icon_file_name,
     icon_file_name as iconFileName, list_channels as listChannels, list_clients as listClients,
-    poke, send_plugin_command, send_plugin_command as sendPluginCommand,
-    send_text_message as sendTextMessage,
+    poke, send_plugin_command, send_plugin_command as sendPluginCommand, send_raw_command,
+    send_raw_command as sendRawCommand, send_text_message as sendTextMessage,
 };
 
 pub use command::escape;

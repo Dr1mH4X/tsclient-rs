@@ -37,7 +37,10 @@ pub enum NotificationResult {
     PluginCommand {
         event: PluginCommandEvent,
     },
-    Unknown,
+    RawNotification {
+        name: String,
+        items: Vec<HashMap<String, String>>,
+    },
 }
 
 /// Parse a `notify*` command into a [`NotificationResult`].
@@ -67,7 +70,10 @@ pub fn handle_notification(
             let info = handle_file_transfer_status(params);
             NotificationResult::FileTransferStatus { info }
         }
-        _ => NotificationResult::Unknown,
+        _ => NotificationResult::RawNotification {
+            name: cmd_name.to_string(),
+            items: vec![params.clone()],
+        },
     }
 }
 
@@ -484,6 +490,32 @@ mod tests {
                 assert_eq!(event.invoker_uid, "cached_uid_123");
             }
             _ => panic!("expected PluginCommand"),
+        }
+    }
+
+    #[test]
+    fn test_stream_signaling_raw_notification_unescapes_json_and_sdp() {
+        let sdp = "v=0\r\no=- 12345 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
+        let json_payload = format!(r#"{{"cmd":"answer","args":{{"answer":"{}"}}}}"#, sdp);
+        let wire_line = crate::command::build_command_ordered(
+            "notifystreamsignaling",
+            &[("id", "stream-1"), ("clid", "42"), ("json", &json_payload)],
+        );
+        let cmd = crate::command::parse_command(&wire_line).expect("parse command");
+        let mut clients = DirectoryCache::default();
+        let result = handle_notification(&cmd.name, &cmd.params, 0, &mut clients, "");
+        match result {
+            NotificationResult::RawNotification { name, items } => {
+                assert_eq!(name, "notifystreamsignaling");
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].get("id").map(String::as_str), Some("stream-1"));
+                assert_eq!(items[0].get("clid").map(String::as_str), Some("42"));
+                assert_eq!(
+                    items[0].get("json").map(String::as_str),
+                    Some(json_payload.as_str())
+                );
+            }
+            _ => panic!("expected RawNotification"),
         }
     }
 }

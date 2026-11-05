@@ -30,6 +30,7 @@
 | `client.on_poked(handler)`                | Fires when poked by a client       |
 | `client.on_voice_data(handler)`           | Fires on incoming voice data       |
 | `client.on_plugin_command(handler)`       | Fires on a plugin command (`send_plugin_command`) |
+| `client.on_raw_notification(handler)`     | Fires on unmodeled `notify*` messages (`Event::RawNotification`) |
 
 Directory snapshots are coalesced and delivered serially per handler. A slow
 handler retains only the newest pending state. The live directory cache is
@@ -66,6 +67,7 @@ or resurrected by a late row.
 | `getClientInfo(client, clid)`                          | Get detailed client information            |
 | `client.exec_command(cmd, timeout?)`                   | Execute a raw command                      |
 | `client.exec_command_with_response(cmd, timeout?)`     | Execute a command and return response data |
+| `client.send_raw_command(cmd, params)` / `sendRawCommand(client, cmd, params)` | Build and execute an arbitrary command with escaped parameters |
 | `client.send_command_no_wait(cmd)`                     | Fire-and-forget command                    |
 
 ## File Transfers
