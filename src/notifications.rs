@@ -479,8 +479,13 @@ mod tests {
             "notifyplugincmd name=query_test data=payload invokerid=99",
         )
         .expect("parse command");
-        let result_fallback =
-            handle_notification(&cmd_no_invoker.name, &cmd_no_invoker.params, 0, &mut clients, "");
+        let result_fallback = handle_notification(
+            &cmd_no_invoker.name,
+            &cmd_no_invoker.params,
+            0,
+            &mut clients,
+            "",
+        );
         match result_fallback {
             NotificationResult::PluginCommand { event } => {
                 assert_eq!(event.name, "query_test");

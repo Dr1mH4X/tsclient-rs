@@ -33,7 +33,9 @@ pub async fn send_plugin_command(
     match target {
         PluginCommandTarget::Client => {
             let id = target_id.ok_or_else(|| {
-                Error::Teamspeak("target_id is required for PluginCommandTarget::Client".to_string())
+                Error::Teamspeak(
+                    "target_id is required for PluginCommandTarget::Client".to_string(),
+                )
             })?;
             target_id_str = id.to_string();
             params.push(("target", target_id_str.as_str()));

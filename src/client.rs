@@ -2795,9 +2795,7 @@ mod tests {
         .await
         .expect("send_plugin_command succeeded");
         let executed = seen_cmd.lock().unwrap().clone();
-        assert!(
-            executed.starts_with("plugincmd name=b2\\splug data=a\\sb\\pc\\/d targetmode=0")
-        );
+        assert!(executed.starts_with("plugincmd name=b2\\splug data=a\\sb\\pc\\/d targetmode=0"));
 
         crate::api::send_plugin_command(
             &client,
@@ -2975,7 +2973,8 @@ mod tests {
             })
         };
 
-        let mut serial = SerialRawNotificationHandler::new(handler, Arc::new(crate::types::NoopLogger));
+        let mut serial =
+            SerialRawNotificationHandler::new(handler, Arc::new(crate::types::NoopLogger));
         for i in 1..=20 {
             serial.enqueue(Event::RawNotification {
                 name: "notifystreamsignaling".to_string(),
@@ -3014,7 +3013,8 @@ mod tests {
             })
         };
 
-        let mut serial = SerialRawNotificationHandler::new(handler, Arc::new(crate::types::NoopLogger));
+        let mut serial =
+            SerialRawNotificationHandler::new(handler, Arc::new(crate::types::NoopLogger));
         for i in 0..(MAX_QUEUED_RAW_NOTIFICATIONS + 10) {
             serial.enqueue(Event::RawNotification {
                 name: "notifystream".to_string(),
@@ -3028,7 +3028,9 @@ mod tests {
             .ok();
 
         let received = events.lock().unwrap();
-        assert!(received.iter().any(|ev| matches!(ev, Event::NotificationOverflow { queue } if queue == "raw_notification")));
+        assert!(received.iter().any(
+            |ev| matches!(ev, Event::NotificationOverflow { queue } if queue == "raw_notification")
+        ));
     }
 
     #[tokio::test]
@@ -3042,20 +3044,75 @@ mod tests {
 
         // 1. Invalid command name
         assert!(client.send_raw_command("", &[("k", "v")]).await.is_err());
-        assert!(client.send_raw_command("cmd with space", &[("k", "v")]).await.is_err());
-        assert!(client.send_raw_command("cmd=1", &[("k", "v")]).await.is_err());
-        assert!(client.send_raw_command("cmd|pipe", &[("k", "v")]).await.is_err());
-        assert!(client.send_raw_command("cmd\0nul", &[("k", "v")]).await.is_err());
+        assert!(
+            client
+                .send_raw_command("cmd with space", &[("k", "v")])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_raw_command("cmd=1", &[("k", "v")])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_raw_command("cmd|pipe", &[("k", "v")])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_raw_command("cmd\0nul", &[("k", "v")])
+                .await
+                .is_err()
+        );
 
         // 2. Invalid parameter key
-        assert!(client.send_raw_command("testcmd", &[("", "v")]).await.is_err());
-        assert!(client.send_raw_command("testcmd", &[("key with space", "v")]).await.is_err());
-        assert!(client.send_raw_command("testcmd", &[("key=bad", "v")]).await.is_err());
-        assert!(client.send_raw_command("testcmd", &[("key|bad", "v")]).await.is_err());
-        assert!(client.send_raw_command("testcmd", &[("key\nbad", "v")]).await.is_err());
-        assert!(client.send_raw_command("testcmd", &[("key\0bad", "v")]).await.is_err());
+        assert!(
+            client
+                .send_raw_command("testcmd", &[("", "v")])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_raw_command("testcmd", &[("key with space", "v")])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_raw_command("testcmd", &[("key=bad", "v")])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_raw_command("testcmd", &[("key|bad", "v")])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_raw_command("testcmd", &[("key\nbad", "v")])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_raw_command("testcmd", &[("key\0bad", "v")])
+                .await
+                .is_err()
+        );
 
         // 3. NUL in parameter value
-        assert!(client.send_raw_command("testcmd", &[("key", "val\0with_nul")]).await.is_err());
+        assert!(
+            client
+                .send_raw_command("testcmd", &[("key", "val\0with_nul")])
+                .await
+                .is_err()
+        );
     }
 }
