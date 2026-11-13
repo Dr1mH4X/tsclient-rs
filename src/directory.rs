@@ -762,7 +762,7 @@ pub(crate) fn apply_client_notification(
     }
 }
 
-fn parse_icon_id(value: &str) -> Option<u32> {
+pub(crate) fn parse_icon_id(value: &str) -> Option<u32> {
     let value = value.trim().parse::<i128>().ok()?;
     // notifychanneledited 发送的是有符号 32 位 id 零扩展到 64 位后的无符号值；
     // 查询协议则发送有符号或无符号的 32 位形式。

@@ -9,6 +9,7 @@
 | `client.wait_connected(signal?)`           | Block until the handshake completes      |
 | `client.wait_directory_ready(signal?)`     | Block until the welcome directory is complete |
 | `client.directory_ready()`                 | Whether the welcome directory is complete |
+| `client.server_info()`                     | Get cached virtual server snapshot (`Option<ServerInfo>`) |
 | `client.disconnect()`                      | Gracefully disconnect (awaits bg tasks)  |
 | `client.status()`                          | Get current `ClientStatus`               |
 | `client.client_id()`                       | Get assigned client ID on the server     |
@@ -29,6 +30,8 @@
 | `client.on_client_moved(handler)`         | Fires when a client moves channels |
 | `client.on_client_updated(handler)`       | Fires when a known client's state changes |
 | `client.on_directory_snapshot(handler)`   | Fires with the live channel/client directory |
+| `client.on_server_info_updated(handler)`  | Fires serially when cached `ServerInfo` changes (`Event::ServerInfoUpdated`) |
+| `client.on_server_edited(handler)`        | Fires on `notifyserveredited` (`Event::ServerEdited`) |
 | `client.on_kicked(handler)`               | Fires when the bot is kicked       |
 | `client.on_poked(handler)`                | Fires when poked by a client       |
 | `client.on_voice_data(handler)`           | Fires on incoming voice data       |
@@ -75,6 +78,8 @@ so consumers can safely teardown and reconnect.
 | `listClients(client)`                                  | List all connected clients                 |
 | `client.directory_snapshot()`                          | Read the complete channel/client directory |
 | `getClientInfo(client, clid)`                          | Get detailed client information            |
+| `getServerInfo(client)` / `client.get_server_info()`   | Query `serverinfo`, merge non-counter properties into cache, and return `ServerInfo` |
+| `getServerVariables(client)` / `client.get_server_variables()` | Query `servergetvariables`, merge non-counter properties, and return updated `ServerInfo` |
 | `client.exec_command(cmd, timeout?)`                   | Execute a raw command                      |
 | `client.exec_command_with_response(cmd, timeout?)`     | Execute a command and return response data |
 | `client.send_raw_command(cmd, params)` / `sendRawCommand(client, cmd, params)` | Build and execute an arbitrary command with escaped parameters |
@@ -89,6 +94,14 @@ so consumers can safely teardown and reconnect.
 | `fileTransferDeleteFile(client, ...)`     | Delete files on the server        |
 | `uploadFileData(host, info, reader)`      | Transfer file data to the server  |
 | `downloadFileData(host, info, writer)`    | Receive file data from the server |
+
+## 服务器信息与图标
+
+`ServerInfo` 汇集虚拟服务器的常用强类型字段（`name`、`unique_identifier`、`welcome_message`、`icon_id`、`max_clients`、`hostbanner_gfx_url`、`platform`、`version`），并通过 `raw` / `get_raw(key)` 保留其余 `virtualserver_*` 原始属性。
+
+- 连接建立时 `initserver` 写入初始快照（此时实测服务端通常不下发 `virtualserver_unique_identifier`，可通过 `get_server_info()` / `getServerInfo()` 补齐），并在 `on_connected` 之前可读；断开连接后重置为 `None`。
+- `notifyserveredited` 总是派发 `Event::ServerEdited(ServerEditedEvent)`（包含操作者与变更键值；TS6 修改欢迎语等场景下 `changes` 可能为空），同时局部合并进缓存；`notifyserverupdated` 与 `serverinfo` 会过滤 15 个易变计数器（如 `virtualserver_uptime`、`virtualserver_clientsonline`）后合并进缓存，实际发生变化时串行派发 `Event::ServerInfoUpdated(ServerInfo)`。
+- `ServerInfo.icon_id` 复用 `ChannelInfo.icon_id` 的无符号 32 位解析规则，可直接传入 `icon_file_name(id)` 与 `download_icon` 下载服务器图标。
 
 ## 频道图标
 

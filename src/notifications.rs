@@ -37,6 +37,12 @@ pub enum NotificationResult {
     PluginCommand {
         event: PluginCommandEvent,
     },
+    ServerEdited {
+        event: ServerEditedEvent,
+    },
+    ServerUpdated {
+        params: HashMap<String, String>,
+    },
     RawNotification {
         name: String,
         items: Vec<HashMap<String, String>>,
@@ -57,6 +63,10 @@ pub fn handle_notification(
         "notifyclientmoved" => handle_client_moved(params, clients),
         "notifytextmessage" => handle_text_message(params, clients),
         "notifyclientpoke" => handle_client_poked(params),
+        "notifyserveredited" => handle_server_edited(params),
+        "notifyserverupdated" => NotificationResult::ServerUpdated {
+            params: params.clone(),
+        },
         "notifyplugincmd" | "notifyplugincommand" => handle_plugin_command(params, clients),
         "notifystartupload" => {
             let info = handle_start_upload(params);
@@ -220,6 +230,22 @@ fn handle_client_poked(params: &HashMap<String, String>) -> NotificationResult {
             invoker_name: unescape(params.get("invokername").map(|s| s.as_str()).unwrap_or("")),
             invoker_uid: params.get("invokeruid").cloned().unwrap_or_default(),
             message: unescape(params.get("msg").map(|s| s.as_str()).unwrap_or("")),
+        },
+    }
+}
+
+fn handle_server_edited(params: &HashMap<String, String>) -> NotificationResult {
+    let changes = params
+        .iter()
+        .filter(|(k, _)| k.starts_with("virtualserver_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    NotificationResult::ServerEdited {
+        event: ServerEditedEvent {
+            invoker_id: parse_u16(params.get("invokerid").map(|s| s.as_str()).unwrap_or("")),
+            invoker_name: params.get("invokername").cloned().unwrap_or_default(),
+            invoker_uid: params.get("invokeruid").cloned().unwrap_or_default(),
+            changes,
         },
     }
 }
@@ -521,6 +547,77 @@ mod tests {
                 );
             }
             _ => panic!("expected RawNotification"),
+        }
+    }
+
+    #[test]
+    fn test_server_edited_and_updated_notifications() {
+        let mut clients = DirectoryCache::default();
+
+        let edited_cmd = crate::command::parse_command(
+            "notifyserveredited invokerid=5 invokername=Admin invokeruid=uid-admin virtualserver_name=Updated\\sServer virtualserver_icon_id=0",
+        )
+        .expect("parse command");
+        let edited = handle_notification(&edited_cmd.name, &edited_cmd.params, 0, &mut clients, "");
+        match edited {
+            NotificationResult::ServerEdited { event } => {
+                assert_eq!(event.invoker_id, 5);
+                assert_eq!(event.invoker_name, "Admin");
+                assert_eq!(event.invoker_uid, "uid-admin");
+                assert_eq!(
+                    event.changes.get("virtualserver_name").map(String::as_str),
+                    Some("Updated Server")
+                );
+                assert_eq!(
+                    event
+                        .changes
+                        .get("virtualserver_icon_id")
+                        .map(String::as_str),
+                    Some("0")
+                );
+            }
+            _ => panic!("expected ServerEdited"),
+        }
+
+        let edited_empty_cmd = crate::command::parse_command(
+            "notifyserveredited invokerid=7 invokername=Mod invokeruid=uid-mod",
+        )
+        .expect("parse command");
+        let edited_empty = handle_notification(
+            &edited_empty_cmd.name,
+            &edited_empty_cmd.params,
+            0,
+            &mut clients,
+            "",
+        );
+        match edited_empty {
+            NotificationResult::ServerEdited { event } => {
+                assert_eq!(event.invoker_id, 7);
+                assert!(event.changes.is_empty());
+            }
+            _ => panic!("expected ServerEdited"),
+        }
+
+        let updated_cmd = crate::command::parse_command(
+            "notifyserverupdated virtualserver_name=Live\\sRoom virtualserver_clientsonline=12",
+        )
+        .expect("parse command");
+        let updated =
+            handle_notification(&updated_cmd.name, &updated_cmd.params, 0, &mut clients, "");
+        match updated {
+            NotificationResult::ServerUpdated { params } => {
+                assert_eq!(
+                    params.get("virtualserver_name").map(String::as_str),
+                    Some("Live Room")
+                );
+                assert_eq!(
+                    params
+                        .get("virtualserver_clientsonline")
+                        .map(String::as_str),
+                    Some("12")
+                );
+            }
+            _ => panic!("expected ServerUpdated"),
         }
     }
 }

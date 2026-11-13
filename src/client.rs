@@ -133,12 +133,12 @@ impl OrderedDirectoryHandler {
 /// coalesced `DirectorySnapshot` event carries the whole state regardless.
 const MAX_QUEUED_CLIENT_UPDATES: usize = 256;
 
-/// Delivers client updates to one handler in dispatch order: a drain task
+/// Delivers state updates to one handler in dispatch order: a drain task
 /// pops a bounded FIFO, so an older record can never overtake a newer one
 /// and a slow handler cannot accumulate unbounded work.
 struct SerialEventHandler {
     handler: EventHandler,
-    pending: Arc<Mutex<VecDeque<ClientInfo>>>,
+    pending: Arc<Mutex<VecDeque<Event>>>,
     wake: Arc<Notify>,
     started: bool,
 }
@@ -153,7 +153,7 @@ impl SerialEventHandler {
         }
     }
 
-    fn enqueue(&mut self, info: ClientInfo) {
+    fn enqueue(&mut self, event: Event) {
         if !self.started {
             self.started = true;
             self.start();
@@ -163,7 +163,7 @@ impl SerialEventHandler {
             if pending.len() >= MAX_QUEUED_CLIENT_UPDATES {
                 pending.pop_front();
             }
-            pending.push_back(info);
+            pending.push_back(event);
         }
         self.wake.notify_one();
     }
@@ -177,9 +177,9 @@ impl SerialEventHandler {
                 wake.notified().await;
                 loop {
                     let next = pending.lock().unwrap().pop_front();
-                    let Some(info) = next else { break };
+                    let Some(event) = next else { break };
                     let _ = catch_unwind(AssertUnwindSafe(|| {
-                        handler(Event::ClientUpdated(info));
+                        handler(event);
                     }));
                 }
             }
@@ -264,6 +264,8 @@ struct EventHandlers {
     client_leave: Vec<EventHandler>,
     client_moved: Vec<EventHandler>,
     directory_snapshot: Vec<OrderedDirectoryHandler>,
+    server_info_updated: Vec<SerialEventHandler>,
+    server_edited: Vec<EventHandler>,
     poked: Vec<EventHandler>,
     own_permissions_changed: Vec<EventHandler>,
     voice_data: Vec<EventHandler>,
@@ -283,6 +285,8 @@ impl EventHandlers {
             client_leave: Vec::new(),
             client_moved: Vec::new(),
             directory_snapshot: Vec::new(),
+            server_info_updated: Vec::new(),
+            server_edited: Vec::new(),
             poked: Vec::new(),
             own_permissions_changed: Vec::new(),
             voice_data: Vec::new(),
@@ -312,6 +316,7 @@ pub(crate) struct ClientInner {
     pub(crate) directory: server_directory::DirectoryCache,
     pub(crate) directory_ready: bool,
     directory_publication: DirectoryPublication,
+    server_properties: Option<HashMap<String, String>>,
     pub(crate) connected_wakers: Vec<(u64, oneshot::Sender<()>)>,
     directory_wakers: Vec<(u64, oneshot::Sender<()>)>,
     next_waker_id: u64,
@@ -361,6 +366,7 @@ impl ClientInner {
             directory: server_directory::DirectoryCache::default(),
             directory_ready: false,
             directory_publication: DirectoryPublication::default(),
+            server_properties: None,
             connected_wakers: Vec::new(),
             directory_wakers: Vec::new(),
             next_waker_id: 0,
@@ -739,6 +745,16 @@ impl ClientInner {
             NotificationResult::PluginCommand { event } => {
                 self.dispatch_event(Event::PluginCommand(event));
             }
+            NotificationResult::ServerEdited { event } => {
+                let updated = self.update_server_info(&event.changes, true);
+                self.dispatch_event(Event::ServerEdited(event));
+                if let Some(info) = updated {
+                    self.dispatch_event(Event::ServerInfoUpdated(info));
+                }
+            }
+            NotificationResult::ServerUpdated { params } => {
+                self.merge_server_info(&params, false);
+            }
             NotificationResult::RawNotification { name, items } => {
                 self.dispatch_event(Event::RawNotification { name, items });
             }
@@ -803,7 +819,7 @@ impl ClientInner {
                 }
                 Event::ClientUpdated(info) => {
                     for handler in &mut self.event_handlers.client_updated {
-                        handler.enqueue(info.clone());
+                        handler.enqueue(Event::ClientUpdated(info.clone()));
                     }
                 }
                 Event::ClientLeave(evt) => {
@@ -827,6 +843,20 @@ impl ClientInner {
                 Event::DirectorySnapshot(snapshot) => {
                     for handler in &mut self.event_handlers.directory_snapshot {
                         handler.enqueue(snapshot.clone());
+                    }
+                }
+                Event::ServerInfoUpdated(info) => {
+                    for handler in &mut self.event_handlers.server_info_updated {
+                        handler.enqueue(Event::ServerInfoUpdated(info.clone()));
+                    }
+                }
+                Event::ServerEdited(evt) => {
+                    for h in &self.event_handlers.server_edited {
+                        let h = Arc::clone(h);
+                        let e = evt.clone();
+                        tokio::spawn(async move {
+                            h(Event::ServerEdited(e));
+                        });
                     }
                 }
                 Event::OwnPermissionsChanged => {
@@ -937,11 +967,47 @@ impl ClientInner {
     fn reset_directory_availability(&mut self) {
         self.directory_ready = false;
         self.directory_wakers.clear();
+        self.server_properties = None;
         if !self.own_permissions.is_empty() {
             self.own_permissions.clear();
             self.dispatch_event(Event::OwnPermissionsChanged);
         }
         self.directory_publication = DirectoryPublication::default();
+    }
+
+    pub(crate) fn server_info(&self) -> Option<ServerInfo> {
+        self.server_properties
+            .as_ref()
+            .map(crate::server_info::build_server_info)
+    }
+
+    pub(crate) fn seed_server_info(&mut self, params: &HashMap<String, String>) {
+        let props = crate::server_info::extract_server_properties(params, true);
+        let info = crate::server_info::build_server_info(&props);
+        self.server_properties = Some(props);
+        self.dispatch_event(Event::ServerInfoUpdated(info));
+    }
+
+    fn update_server_info(
+        &mut self,
+        params: &HashMap<String, String>,
+        include_counters: bool,
+    ) -> Option<ServerInfo> {
+        if self.server_properties.is_none() && self.status == ClientStatus::Disconnected {
+            return None;
+        }
+        let target = self.server_properties.get_or_insert_with(HashMap::new);
+        if crate::server_info::merge_server_properties(target, params, include_counters) {
+            Some(crate::server_info::build_server_info(target))
+        } else {
+            None
+        }
+    }
+
+    fn merge_server_info(&mut self, params: &HashMap<String, String>, include_counters: bool) {
+        if let Some(info) = self.update_server_info(params, include_counters) {
+            self.dispatch_event(Event::ServerInfoUpdated(info));
+        }
     }
 
     /// Register a oneshot waker for `wait_connected` (`directory = false`) or
@@ -1484,6 +1550,28 @@ impl Client {
         self
     }
 
+    /// 串行订阅虚拟服务器信息快照更新（涵盖 `initserver`、`notifyserveredited`、`notifyserverupdated` 及 `serverinfo` 回写）。
+    pub fn on_server_info_updated(&self, handler: EventHandler) -> &Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .server_info_updated
+            .push(SerialEventHandler::new(handler));
+        self
+    }
+
+    /// 订阅 `notifyserveredited` 编辑事件（含操作者信息与变更键值）。
+    pub fn on_server_edited(&self, handler: EventHandler) -> &Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .event_handlers
+            .server_edited
+            .push(handler);
+        self
+    }
+
     pub fn on_poked(&self, handler: EventHandler) -> &Self {
         self.inner
             .lock()
@@ -1566,6 +1654,11 @@ impl Client {
         inner.directory_ready.then(|| inner.directory.snapshot())
     }
 
+    /// 读取当前本地缓存的虚拟服务器信息快照；未连接或尚未收到 `initserver` 时返回 `None`。
+    pub fn server_info(&self) -> Option<ServerInfo> {
+        self.inner.lock().unwrap().server_info()
+    }
+
     pub fn use_command_middleware(&self, mw: Vec<Box<dyn CommandMiddleware>>) -> &Self {
         let sender = self.handler.lock().unwrap().create_packet_sender();
         let new_handler = {
@@ -1596,6 +1689,31 @@ impl Client {
     /// Fetch a channel's description via `channelgetdescription`.
     pub async fn get_channel_description(&self, channel_id: u64) -> Result<String, Error> {
         crate::api::get_channel_description(self, channel_id).await
+    }
+
+    /// 主动查询 `serverinfo`，同步刷新本地非计数器缓存并返回完整 [`ServerInfo`]。
+    pub async fn get_server_info(&self) -> Result<ServerInfo, Error> {
+        crate::api::get_server_info(self).await
+    }
+
+    /// 主动查询 `servergetvariables`，刷新本地非计数器缓存并返回合并后的 [`ServerInfo`]。
+    pub async fn get_server_variables(&self) -> Result<ServerInfo, Error> {
+        crate::api::get_server_variables(self).await
+    }
+
+    pub(crate) fn apply_server_info_response(&self, row: &HashMap<String, String>) {
+        self.inner.lock().unwrap().merge_server_info(row, false);
+    }
+
+    pub(crate) fn apply_server_variables_response(
+        &self,
+        row: &HashMap<String, String>,
+    ) -> ServerInfo {
+        let mut inner = self.inner.lock().unwrap();
+        inner.merge_server_info(row, false);
+        inner
+            .server_info()
+            .unwrap_or_else(|| crate::server_info::build_server_info(row))
     }
 
     // ---- File Transfer --------------------------------------------------------
@@ -2295,7 +2413,7 @@ mod tests {
 
         let mut serial = SerialEventHandler::new(handler);
         for id in 1..=3 {
-            serial.enqueue(client_info(id));
+            serial.enqueue(Event::ClientUpdated(client_info(id)));
         }
 
         tokio::time::timeout(Duration::from_secs(1), done_rx)
@@ -2330,7 +2448,7 @@ mod tests {
 
         let mut serial = SerialEventHandler::new(handler);
         for id in 0..(MAX_QUEUED_CLIENT_UPDATES as i32 + 44) {
-            serial.enqueue(client_info(id));
+            serial.enqueue(Event::ClientUpdated(client_info(id)));
         }
 
         tokio::time::timeout(Duration::from_secs(10), done_rx)
@@ -3238,6 +3356,230 @@ mod tests {
             .expect("timeout waiting for raw notification")
             .expect("raw notification received");
         assert_eq!(raw_name, "notifyconnectioninforequest");
+    }
+
+    #[tokio::test]
+    async fn server_info_tracks_initserver_edits_queries_and_disconnect() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        assert!(client.server_info().is_none());
+
+        let (info_tx, mut info_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (edited_tx, mut edited_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (connected_seen_info_tx, mut connected_seen_info_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        let client_for_conn = Arc::clone(&client);
+        client.on_connected(Arc::new(move || {
+            let _ = connected_seen_info_tx.send(client_for_conn.server_info());
+        }));
+        client.on_server_info_updated(Arc::new(move |event| {
+            if let Event::ServerInfoUpdated(info) = event {
+                let _ = info_tx.send(info);
+            }
+        }));
+        client.on_server_edited(Arc::new(move |event| {
+            if let Event::ServerEdited(evt) = event {
+                let _ = edited_tx.send(evt);
+            }
+        }));
+        client.on_raw_notification(Arc::new(move |event| {
+            if let Event::RawNotification { name, .. } = event {
+                let _ = raw_tx.send(name);
+            }
+        }));
+
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+
+        // 1. initserver 写入初始快照（不含 unique_identifier），且在 on_connected 之前可读
+        client.inner.lock().unwrap().handle_command_str(
+            "initserver aclid=7 client_nickname=bot virtualserver_name=Alpha\\sServer \
+             virtualserver_welcomemessage=Hello\\nWorld virtualserver_icon_id=-1528016466 \
+             virtualserver_maxclients=32 virtualserver_hostbanner_gfx_url=\\shttps:\\/\\/example.com\\/b.png\\s \
+             virtualserver_platform=Linux virtualserver_version=3.13.8\\s[Build:\\s1]",
+            &sender,
+        );
+
+        let connected_info =
+            tokio::time::timeout(Duration::from_secs(1), connected_seen_info_rx.recv())
+                .await
+                .expect("connected handler timeout")
+                .expect("connected handler payload")
+                .expect("server_info available in on_connected");
+        assert_eq!(connected_info.name, "Alpha Server");
+        assert_eq!(connected_info.unique_identifier, "");
+        assert_eq!(connected_info.welcome_message, "Hello\nWorld");
+        assert_eq!(connected_info.icon_id, Some(2766950830));
+        assert_eq!(connected_info.max_clients, Some(32));
+        assert_eq!(
+            connected_info.hostbanner_gfx_url.as_deref(),
+            Some("https://example.com/b.png")
+        );
+        assert_eq!(connected_info.platform, "Linux");
+        assert_eq!(connected_info.version, "3.13.8 [Build: 1]");
+        assert_eq!(connected_info.get_raw("aclid"), None);
+        assert_eq!(connected_info.get_raw("client_nickname"), None);
+        assert_eq!(
+            crate::icon_file_name(connected_info.icon_id.unwrap()),
+            "/icon_2766950830"
+        );
+
+        let first_evt = tokio::time::timeout(Duration::from_secs(1), info_rx.recv())
+            .await
+            .expect("initserver ServerInfoUpdated timeout")
+            .unwrap();
+        assert_eq!(first_evt, connected_info);
+
+        // 2. notifyserveredited 局部更新 + 空变更（TS6 修改欢迎语场景）
+        client.inner.lock().unwrap().handle_command_str(
+            "notifyserveredited invokerid=5 invokername=Admin\\sOne invokeruid=uid5= \
+             virtualserver_name=Beta\\sServer virtualserver_icon_id=18446744072424443899",
+            &sender,
+        );
+        let edited = tokio::time::timeout(Duration::from_secs(1), edited_rx.recv())
+            .await
+            .expect("ServerEdited timeout")
+            .unwrap();
+        assert_eq!(edited.invoker_id, 5);
+        assert_eq!(edited.invoker_name, "Admin One");
+        assert_eq!(edited.invoker_uid, "uid5=");
+        assert_eq!(
+            edited.changes.get("virtualserver_name").map(String::as_str),
+            Some("Beta Server")
+        );
+
+        let updated = tokio::time::timeout(Duration::from_secs(1), info_rx.recv())
+            .await
+            .expect("edited ServerInfoUpdated timeout")
+            .unwrap();
+        assert_eq!(updated.name, "Beta Server");
+        assert_eq!(updated.icon_id, Some(3009859579));
+        assert_eq!(updated.welcome_message, "Hello\nWorld");
+
+        // 重复内容不会再触发 ServerInfoUpdated，空 changes 仍触发 ServerEdited
+        client.inner.lock().unwrap().handle_command_str(
+            "notifyserveredited invokerid=5 invokername=Admin\\sOne invokeruid=uid5=",
+            &sender,
+        );
+        let empty_edited = tokio::time::timeout(Duration::from_secs(1), edited_rx.recv())
+            .await
+            .expect("empty ServerEdited timeout")
+            .unwrap();
+        assert!(empty_edited.changes.is_empty());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(info_rx.try_recv().is_err());
+
+        // 3. notifyserverupdated 合并非计数器字段并过滤计数器
+        client.inner.lock().unwrap().handle_command_str(
+            "notifyserverupdated virtualserver_welcomemessage=New\\sWelcome \
+             virtualserver_maxclients=64 virtualserver_clientsonline=9 virtualserver_uptime=420",
+            &sender,
+        );
+        let after_vars = tokio::time::timeout(Duration::from_secs(1), info_rx.recv())
+            .await
+            .expect("notifyserverupdated ServerInfoUpdated timeout")
+            .unwrap();
+        assert_eq!(after_vars.name, "Beta Server");
+        assert_eq!(after_vars.welcome_message, "New Welcome");
+        assert_eq!(after_vars.max_clients, Some(64));
+        assert_eq!(after_vars.get_raw("virtualserver_clientsonline"), None);
+        assert_eq!(after_vars.get_raw("virtualserver_uptime"), None);
+
+        // 仅计数器变化时不派发 ServerInfoUpdated
+        client.inner.lock().unwrap().handle_command_str(
+            "notifyserverupdated virtualserver_clientsonline=10 virtualserver_uptime=425",
+            &sender,
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(info_rx.try_recv().is_err());
+
+        // 4. get_server_info (serverinfo) 补齐 unique_identifier，返回值保留计数器，缓存过滤计数器
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .cmd_track
+            .signal_welcome_complete();
+        let seen_cmd = Arc::new(Mutex::new(String::new()));
+        let recorded = Arc::clone(&seen_cmd);
+        let inner = Arc::clone(&client.inner);
+        let sender_for_cmd = client.handler.lock().unwrap().create_packet_sender();
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            *recorded.lock().unwrap() = line.clone();
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            let mut inner = inner.lock().unwrap();
+            if line.starts_with("serverinfo ") {
+                inner.handle_command_str(
+                    "virtualserver_unique_identifier=srvUID123= virtualserver_name=Beta\\sServer \
+                     virtualserver_welcomemessage=New\\sWelcome virtualserver_icon_id=0 \
+                     virtualserver_maxclients=64 virtualserver_clientsonline=11 \
+                     virtualserver_uptime=500",
+                    &sender_for_cmd,
+                );
+            } else if line.starts_with("servergetvariables ") {
+                inner.handle_command_str(
+                    "notifyserverupdated virtualserver_welcomemessage=From\\sVars \
+                     virtualserver_clientsonline=12",
+                    &sender_for_cmd,
+                );
+            }
+            inner.cmd_track.resolve(rc, None);
+            Box::pin(async { Ok(()) })
+        });
+
+        let queried = client.get_server_info().await.unwrap();
+        assert!(
+            seen_cmd
+                .lock()
+                .unwrap()
+                .starts_with("serverinfo return_code=")
+        );
+        assert_eq!(queried.unique_identifier, "srvUID123=");
+        assert_eq!(queried.icon_id, Some(0));
+        assert_eq!(queried.get_raw("virtualserver_uptime"), Some("500"));
+
+        let after_query = tokio::time::timeout(Duration::from_secs(1), info_rx.recv())
+            .await
+            .expect("serverinfo writeback ServerInfoUpdated timeout")
+            .unwrap();
+        assert_eq!(after_query.unique_identifier, "srvUID123=");
+        assert_eq!(after_query.icon_id, Some(0));
+        assert_eq!(after_query.get_raw("virtualserver_uptime"), None);
+
+        // 5. get_server_variables (servergetvariables) 保留已缓存的 name/unique_identifier
+        let vars_info = client.get_server_variables().await.unwrap();
+        assert!(
+            seen_cmd
+                .lock()
+                .unwrap()
+                .starts_with("servergetvariables return_code=")
+        );
+        assert_eq!(vars_info.name, "Beta Server");
+        assert_eq!(vars_info.unique_identifier, "srvUID123=");
+        assert_eq!(vars_info.welcome_message, "From Vars");
+        let after_get_vars = tokio::time::timeout(Duration::from_secs(1), info_rx.recv())
+            .await
+            .expect("get_server_variables ServerInfoUpdated timeout")
+            .unwrap();
+        assert_eq!(after_get_vars, vars_info);
+
+        // notifyserveredited 与 notifyserverupdated 均不落入 RawNotification
+        assert!(raw_rx.try_recv().is_err());
+
+        // 6. 断开后清空缓存，且迟到的 notifyserveredited 不会复活 server_info()
+        client.inner.lock().unwrap().handle_connection_closed(None);
+        assert!(client.server_info().is_none());
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyserveredited virtualserver_name=Late", &sender);
+        assert!(client.server_info().is_none());
     }
 
     #[tokio::test]

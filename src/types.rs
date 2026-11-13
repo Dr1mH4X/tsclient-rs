@@ -116,6 +116,35 @@ pub struct ChannelInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInfo {
+    pub name: String,
+    pub unique_identifier: String,
+    pub welcome_message: String,
+    /// 服务器自定义图标的无符号 32 位 id；缺失或非法为 `None`，明确为 `0` 时保留 `Some(0)`。
+    pub icon_id: Option<u32>,
+    pub max_clients: Option<u32>,
+    pub hostbanner_gfx_url: Option<String>,
+    pub platform: String,
+    pub version: String,
+    pub raw: HashMap<String, String>,
+}
+
+impl ServerInfo {
+    /// 读取原始 `virtualserver_*` 属性值。
+    pub fn get_raw(&self, key: &str) -> Option<&str> {
+        self.raw.get(key).map(String::as_str)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerEditedEvent {
+    pub invoker_id: i32,
+    pub invoker_name: String,
+    pub invoker_uid: String,
+    pub changes: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectorySnapshot {
     pub channels: Vec<ChannelInfo>,
     pub clients: Vec<ClientInfo>,
@@ -182,6 +211,8 @@ pub enum Event {
     ClientLeave(ClientLeftViewEvent),
     ClientMoved(ClientMovedEvent),
     DirectorySnapshot(DirectorySnapshot),
+    ServerInfoUpdated(ServerInfo),
+    ServerEdited(ServerEditedEvent),
     Poked(PokeEvent),
     OwnPermissionsChanged,
     VoiceData(VoiceData),

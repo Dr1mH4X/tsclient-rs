@@ -156,6 +156,31 @@ pub async fn get_channel_info(client: &Client, channel_id: u64) -> Result<Channe
     Ok(parse_channel_info(channel_id, row))
 }
 
+/// 主动发送 `serverinfo` 查询虚拟服务器配置与运行态信息，并将非计数器字段合并进本地缓存。
+pub async fn get_server_info(client: &Client) -> Result<ServerInfo, Error> {
+    let data = client
+        .exec_command_with_response("serverinfo", QUERY_TIMEOUT_MS)
+        .await?;
+    let row = data
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Teamspeak("no data returned for serverinfo".into()))?;
+    client.apply_server_info_response(&row);
+    Ok(crate::server_info::build_server_info(&row))
+}
+
+/// 主动发送 `servergetvariables` 刷新可变服务器属性，并返回合并后的 [`ServerInfo`]。
+pub async fn get_server_variables(client: &Client) -> Result<ServerInfo, Error> {
+    let data = client
+        .exec_command_with_response("servergetvariables", QUERY_TIMEOUT_MS)
+        .await?;
+    let row = data
+        .into_iter()
+        .find(|row| row.keys().any(|key| key.starts_with("virtualserver_")))
+        .ok_or_else(|| Error::Teamspeak("no data returned for servergetvariables".into()))?;
+    Ok(client.apply_server_variables_response(&row))
+}
+
 /// Fetch a channel's description via `channelgetdescription`.
 pub async fn get_channel_description(client: &Client, channel_id: u64) -> Result<String, Error> {
     let cid = channel_id.to_string();

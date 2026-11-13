@@ -84,6 +84,7 @@ pub fn handle_init_server(
         sender.set_client_id(clid);
     }
 
+    inner.seed_server_info(params);
     inner
         .logger
         .info(&format!("connected to server, clid={}", inner.clid), &[]);

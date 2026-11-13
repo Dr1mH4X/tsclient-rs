@@ -37,6 +37,7 @@ mod events;
 mod handshake;
 mod helpers;
 mod notifications;
+mod server_info;
 mod throttle;
 mod transfer;
 mod transport;
@@ -63,7 +64,8 @@ pub use types::{
     ClientOptions, CommandMiddleware, ConsoleLogger as consoleLogger, DirectorySnapshot,
     EscapedString, Event, EventMiddleware, FileDownloadInfo, FileTransferStatusInfo,
     FileUploadInfo, KickReason, Logger, NoopLogger as noopLogger, PluginCommandEvent,
-    PluginCommandTarget, PokeEvent, ResolvedAddr, TextMessage, VoiceData,
+    PluginCommandTarget, PokeEvent, ResolvedAddr, ServerEditedEvent, ServerInfo, TextMessage,
+    VoiceData,
 };
 
 // ---- Errors ---------------------------------------------------------------------
@@ -83,10 +85,12 @@ pub use api::{
     client_update as clientUpdate, download_icon, download_icon as downloadIcon,
     file_transfer_delete_file as fileTransferDeleteFile, get_channel_description,
     get_channel_description as getChannelDescription, get_channel_info,
-    get_channel_info as getChannelInfo, get_client_info as getClientInfo, icon_file_name,
-    icon_file_name as iconFileName, list_channels as listChannels, list_clients as listClients,
-    poke, send_plugin_command, send_plugin_command as sendPluginCommand, send_raw_command,
-    send_raw_command as sendRawCommand, send_text_message as sendTextMessage,
+    get_channel_info as getChannelInfo, get_client_info as getClientInfo, get_server_info,
+    get_server_info as getServerInfo, get_server_variables,
+    get_server_variables as getServerVariables, icon_file_name, icon_file_name as iconFileName,
+    list_channels as listChannels, list_clients as listClients, poke, send_plugin_command,
+    send_plugin_command as sendPluginCommand, send_raw_command, send_raw_command as sendRawCommand,
+    send_text_message as sendTextMessage,
 };
 
 pub use command::escape;
