@@ -13,6 +13,9 @@
 | `client.status()`                          | Get current `ClientStatus`               |
 | `client.client_id()`                       | Get assigned client ID on the server     |
 | `client.channel_id()`                      | Get current channel ID                   |
+| `client.traffic_snapshot()`                | Get per-class packet/byte/bandwidth counters (`TrafficSnapshot`) |
+| `client.round_trip()`                      | Get keepalive RTT mean & deviation in ms (`Option<RoundTrip>`) |
+| `client.packet_loss()`                     | Get estimated S2C packet loss fractions (`Option<PacketLoss>`) |
 
 ## Events
 
@@ -114,3 +117,9 @@ so consumers can safely teardown and reconnect.
 文件传输协商中的 `notifystatusfiletransfer` 拒绝结果以 `Error::ServerError` 返回，保留数字错误码与服务器文案，调用方可以区分频道密码错误和权限不足。
 
 命令错误保留服务端 `extra_msg`。只有错误 524 携带明确等待时间时才在原调用时限内重试，最多三次；节流等待计入调用超时。
+
+## 传输层流量统计与连接信息上报
+
+`client.traffic_snapshot()` 返回自连接建立以来按方向（`sent` / `received`）与类别（`speech` / `keepalive` / `control`）统计的包数、字节数、上一整秒字节数与近一分钟平均每秒字节数（`TrafficSnapshot` / `TrafficCounters` / `TrafficFigures`）。`client.round_trip()` 返回基于最近最多 10 次 Ping/Pong 交换测得的均值与标准差（`Option<RoundTrip>`，首次 Pong 返回前为 `None`）。`client.packet_loss()` 基于按 `PacketType` 隔离的近 60 秒 1 秒分桶窗口估算服务端到客户端（S2C）丢包比例（`Option<PacketLoss>`，无有效样本时为 `None`）：`Voice` / `VoiceWhisper` / 服务端 `Ping` 使用不可靠流乱序宽恕窗口，心跳响应结合 `Ping -> Pong` 超时统计，`Command` / `CommandLow` 使用可靠流状态机以防止服务端重传被误判为乱序或双算。
+
+当服务端下发 `notifyconnectioninforequest` 时，客户端会自动响应 `setconnectioninfo`（附带各方向和类别的包计数、字节数、1s/1m 带宽以及可用的 `connection_ping` / `connection_ping_deviation` 与 `connection_server2client_packetloss_{speech,keepalive,control,total}`），同时仍按现有规则派发 `Event::RawNotification`。

@@ -16,6 +16,23 @@ pub enum PacketType {
     Init1 = 8,
 }
 
+impl PacketType {
+    pub(crate) fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Voice),
+            1 => Some(Self::VoiceWhisper),
+            2 => Some(Self::Command),
+            3 => Some(Self::CommandLow),
+            4 => Some(Self::Ping),
+            5 => Some(Self::Pong),
+            6 => Some(Self::Ack),
+            7 => Some(Self::AckLow),
+            8 => Some(Self::Init1),
+            _ => None,
+        }
+    }
+}
+
 pub struct PacketFlags;
 
 impl PacketFlags {

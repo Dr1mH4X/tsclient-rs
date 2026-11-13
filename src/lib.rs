@@ -29,6 +29,7 @@ mod api;
 mod client;
 mod command;
 mod commands;
+mod connection_info;
 mod crypto;
 mod directory;
 mod discovery;
@@ -47,6 +48,9 @@ mod types;
 // ---- Main client ----------------------------------------------------------------
 
 pub use client::{Client, ClientStatus};
+pub use transport::{
+    PacketLoss, RoundTrip, TrafficClass, TrafficCounters, TrafficFigures, TrafficSnapshot,
+};
 pub use types::ClientState;
 
 // ---- Public types ---------------------------------------------------------------

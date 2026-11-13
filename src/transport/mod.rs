@@ -4,6 +4,7 @@ mod generation_window;
 mod handler;
 mod packet;
 mod quicklz;
+mod traffic;
 
 #[allow(unused_imports)]
 pub use generation_window::GenerationWindow;
@@ -17,3 +18,8 @@ pub use packet::{
 };
 #[allow(unused_imports)]
 pub use quicklz::Qlz;
+#[cfg(test)]
+pub(crate) use traffic::TrafficMeter;
+pub use traffic::{
+    PacketLoss, RoundTrip, TrafficClass, TrafficCounters, TrafficFigures, TrafficSnapshot,
+};

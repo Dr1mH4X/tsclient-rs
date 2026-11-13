@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,9 @@ use super::packet::{
     Packet, PacketFlags, PacketType, build_c2s_header, is_unencrypted, packet_flags, packet_type,
 };
 use super::quicklz::Qlz;
+use super::traffic::{
+    PacketLoss, PacketLossEstimator, RoundTrip, RoundTripEstimator, TrafficMeter, TrafficSnapshot,
+};
 
 const MAX_OUT_PACKET_SIZE: usize = 500;
 const RECEIVE_PACKET_WINDOW_SIZE: u32 = 1024;
@@ -27,6 +30,7 @@ const TAG_SIZE: usize = 8;
 const VOICE_HEADER_SIZE: usize = 3;
 const RESEND_BASE_INTERVAL_MS: u64 = 500;
 const RESEND_LOOP_INTERVAL_MS: u64 = 100;
+const MAX_PENDING_PINGS: usize = 16;
 
 pub type OnPacket = Box<dyn FnMut(Packet) + Send>;
 pub type OnClose = Box<dyn FnMut(Option<Error>) + Send>;
@@ -57,6 +61,12 @@ struct HandlerCore {
     next_command_id: u16,
     next_command_low_id: u16,
     pending_sends: Vec<Vec<u8>>,
+    started_at: Instant,
+    traffic: TrafficMeter,
+    round_trip: RoundTripEstimator,
+    packet_loss: PacketLossEstimator,
+    /// When each keepalive ping still waiting for its pong was sent, by packet id.
+    pings_sent: VecDeque<(u16, Instant)>,
     logger: Arc<dyn Logger>,
 }
 
@@ -137,6 +147,33 @@ impl HandlerCore {
 
     fn queue_send(&mut self, bytes: Vec<u8>) {
         self.pending_sends.push(bytes);
+    }
+
+    fn elapsed_ms(&self, at: Instant) -> u64 {
+        at.saturating_duration_since(self.started_at).as_millis() as u64
+    }
+
+    fn record_sent_datagram(&mut self, data: &[u8]) {
+        if data.len() > TAG_SIZE + HEADER_SIZE - 1 {
+            if let Some(p_type) = PacketType::from_u8(data[TAG_SIZE + HEADER_SIZE - 1] & 0x0f) {
+                let now_ms = self.elapsed_ms(Instant::now());
+                self.traffic.record_sent(p_type, data.len(), now_ms);
+            }
+        }
+    }
+
+    fn traffic_snapshot(&mut self) -> TrafficSnapshot {
+        let now_ms = self.elapsed_ms(Instant::now());
+        self.traffic.snapshot(now_ms)
+    }
+
+    fn round_trip(&self) -> Option<RoundTrip> {
+        self.round_trip.get()
+    }
+
+    fn packet_loss(&mut self) -> Option<PacketLoss> {
+        let now_ms = self.elapsed_ms(Instant::now());
+        self.packet_loss.snapshot(now_ms)
     }
 }
 
@@ -271,6 +308,21 @@ impl PacketSender {
         })
     }
 
+    /// What this connection has carried so far, per direction and class.
+    pub fn traffic_snapshot(&self) -> TrafficSnapshot {
+        self.core.lock().unwrap().traffic_snapshot()
+    }
+
+    /// The keepalive round-trip time, or `None` before the first pong.
+    pub fn round_trip(&self) -> Option<RoundTrip> {
+        self.core.lock().unwrap().round_trip()
+    }
+
+    /// Server-to-client packet loss over the trailing 60-second window.
+    pub fn packet_loss(&self) -> Option<PacketLoss> {
+        self.core.lock().unwrap().packet_loss()
+    }
+
     /// Close the handler — mirrors `PacketHandler::close()`.
     /// Sets closed flag, signals shutdown, and drops the send channel.
     pub fn close(&self) {
@@ -332,6 +384,11 @@ impl PacketHandler {
                 next_command_id: 0,
                 next_command_low_id: 0,
                 pending_sends: Vec::new(),
+                started_at: Instant::now(),
+                traffic: TrafficMeter::new(),
+                round_trip: RoundTripEstimator::new(),
+                packet_loss: PacketLossEstimator::new(MAX_PENDING_PINGS),
+                pings_sent: VecDeque::with_capacity(MAX_PENDING_PINGS),
                 logger: logger.clone(),
             })),
             send_tx: Arc::new(Mutex::new(None)),
@@ -441,6 +498,21 @@ impl PacketHandler {
         })
     }
 
+    /// What this connection has carried so far, per direction and class.
+    pub fn traffic_snapshot(&self) -> TrafficSnapshot {
+        self.core.lock().unwrap().traffic_snapshot()
+    }
+
+    /// The keepalive round-trip time, or `None` before the first pong.
+    pub fn round_trip(&self) -> Option<RoundTrip> {
+        self.core.lock().unwrap().round_trip()
+    }
+
+    /// Server-to-client packet loss over the trailing 60-second window.
+    pub fn packet_loss(&self) -> Option<PacketLoss> {
+        self.core.lock().unwrap().packet_loss()
+    }
+
     /// Create a lightweight [`PacketSender`] handle for use in background tasks.
     pub fn create_packet_sender(&self) -> PacketSender {
         PacketSender {
@@ -458,6 +530,15 @@ impl Drop for PacketHandler {
 }
 
 // ---- Background task ---------------------------------------------------------
+
+async fn send_datagram(
+    core: &Arc<Mutex<HandlerCore>>,
+    socket: &UdpSocket,
+    bytes: &[u8],
+) -> std::io::Result<usize> {
+    core.lock().unwrap().record_sent_datagram(bytes);
+    socket.send(bytes).await
+}
 
 async fn bg_task(
     core: Arc<Mutex<HandlerCore>>,
@@ -482,7 +563,7 @@ async fn bg_task(
 
     match init1_result {
         Ok(Some(bytes)) => {
-            if socket.send(&bytes).await.is_err() {
+            if send_datagram(&core, &socket, &bytes).await.is_err() {
                 let mut c = core.lock().unwrap();
                 trigger_close(
                     &mut *c,
@@ -533,28 +614,37 @@ async fn bg_task(
                     (p, wc)
                 };
                 for bytes in pending {
-                    let _ = socket.send(&bytes).await;
+                    let _ = send_datagram(&core, &socket, &bytes).await;
                 }
                 if was_closed {
                     break;
                 }
             }
             Some(bytes) = send_rx.recv() => {
-                let _ = socket.send(&bytes).await;
+                let _ = send_datagram(&core, &socket, &bytes).await;
             }
             _ = ping_interval.tick() => {
-                let should_ping = {
-                    let c = core.lock().unwrap();
-                    c.crypt.crypto_init_complete && !c.closed
-                };
-                if should_ping {
-                    let bytes = {
-                        let mut c = core.lock().unwrap();
-                        c.build_and_track_packet(
+                let maybe_ping = {
+                    let mut c = core.lock().unwrap();
+                    if c.crypt.crypto_init_complete && !c.closed {
+                        let id = c.packet_counter[PacketType::Ping as usize];
+                        let sent_at = Instant::now();
+                        c.pings_sent.retain(|&(existing_id, _)| existing_id != id);
+                        c.pings_sent.push_back((id, sent_at));
+                        if c.pings_sent.len() > MAX_PENDING_PINGS {
+                            c.pings_sent.pop_front();
+                        }
+                        let sent_ms = c.elapsed_ms(sent_at);
+                        c.packet_loss.record_ping_sent(id, sent_ms);
+                        Some(c.build_and_track_packet(
                             PacketType::Ping, vec![], PacketFlags::Unencrypted, false,
-                        )
-                    };
-                    let _ = socket.send(&bytes).await;
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(bytes) = maybe_ping {
+                    let _ = send_datagram(&core, &socket, &bytes).await;
                 }
             }
             _ = resend_interval.tick() => {
@@ -563,10 +653,12 @@ async fn bg_task(
                     if c.closed { break; }
                     let now = Instant::now();
                     check_resends_sync(&mut c, now, &on_close);
+                    let now_ms = c.elapsed_ms(now);
+                    c.packet_loss.flush(now_ms);
                     std::mem::take(&mut c.pending_sends)
                 };
                 for bytes in pending {
-                    let _ = socket.send(&bytes).await;
+                    let _ = send_datagram(&core, &socket, &bytes).await;
                 }
             }
         }
@@ -611,6 +703,27 @@ fn handle_raw_packet(c: &mut HandlerCore, raw: &[u8], on_packet: &Arc<Mutex<Opti
     p.data = plaintext;
 
     let p_type = packet_type(&p);
+    let now_ms = c.elapsed_ms(p.received_at);
+    c.traffic.record_received(p_type, raw.len(), now_ms);
+    c.packet_loss.record_received(p_type, p.id, now_ms);
+
+    if p_type == PacketType::Pong && p.data.len() >= 2 {
+        let acked = u16::from_be_bytes([p.data[0], p.data[1]]);
+        let matched = if let Some(pos) = c.pings_sent.iter().position(|&(id, _)| id == acked) {
+            if let Some((_, sent_at)) = c.pings_sent.remove(pos) {
+                let rtt_ms = p
+                    .received_at
+                    .saturating_duration_since(sent_at)
+                    .as_secs_f64()
+                    * 1000.0;
+                c.round_trip.add(rtt_ms);
+            }
+            true
+        } else {
+            false
+        };
+        c.packet_loss.record_pong_received(acked, matched, now_ms);
+    }
 
     if p_type == PacketType::Ping {
         send_pong(c, p.id, dummy_used);
@@ -1067,5 +1180,106 @@ mod tests {
             plan_fragments(PacketType::Voice, MAX_CHUNK * 4, MAX_CHUNK),
             vec![(0, MAX_CHUNK * 4, false)]
         );
+    }
+
+    #[test]
+    fn handler_records_received_traffic_and_pong_rtt() {
+        let crypt = Crypt::new(crate::crypto::generate_identity(0));
+        let handler = PacketHandler::new(crypt, Arc::new(crate::types::NoopLogger));
+        let on_packet: Arc<Mutex<Option<OnPacket>>> = Arc::new(Mutex::new(None));
+
+        let sent_at = Instant::now() - Duration::from_millis(25);
+        {
+            let mut core = handler.core.lock().unwrap();
+            core.pings_sent.push_back((7, sent_at));
+
+            // Unencrypted S2C Pong packet acknowledging ping id 7.
+            let mut raw = vec![0u8; TAG_SIZE + 3 + 2];
+            raw[..TAG_SIZE].copy_from_slice(&core.crypt.fake_signature);
+            raw[TAG_SIZE..TAG_SIZE + 2].copy_from_slice(&0u16.to_be_bytes());
+            raw[TAG_SIZE + 2] = (PacketType::Pong as u8) | PacketFlags::Unencrypted;
+            raw[TAG_SIZE + 3..TAG_SIZE + 5].copy_from_slice(&7u16.to_be_bytes());
+
+            handle_raw_packet(&mut core, &raw, &on_packet);
+        }
+
+        let snap = handler.traffic_snapshot();
+        assert_eq!(snap.received.keepalive.packets, 1);
+        assert_eq!(snap.received.keepalive.bytes, (TAG_SIZE + 3 + 2) as u64);
+
+        let rt = handler.round_trip().expect("rtt recorded");
+        assert!(rt.mean_ms >= 25.0);
+        assert_eq!(rt.deviation_ms, 0.0);
+    }
+
+    #[test]
+    fn handler_records_sent_datagrams_by_class() {
+        let crypt = Crypt::new(crate::crypto::generate_identity(0));
+        let handler = PacketHandler::new(crypt, Arc::new(crate::types::NoopLogger));
+
+        {
+            let mut core = handler.core.lock().unwrap();
+            let cmd = core.build_and_track_packet(PacketType::Command, b"ping".to_vec(), 0, true);
+            core.record_sent_datagram(&cmd);
+
+            let ping = core.build_and_track_packet(
+                PacketType::Ping,
+                vec![],
+                PacketFlags::Unencrypted,
+                false,
+            );
+            core.record_sent_datagram(&ping);
+        }
+
+        let snap = handler.traffic_snapshot();
+        assert_eq!(snap.sent.control.packets, 1);
+        assert!(snap.sent.control.bytes > 0);
+        assert_eq!(snap.sent.keepalive.packets, 1);
+        assert_eq!(snap.sent.keepalive.bytes, (TAG_SIZE + HEADER_SIZE) as u64);
+    }
+
+    #[test]
+    fn handler_isolates_sequences_and_tracks_control_retransmits() {
+        let crypt = Crypt::new(crate::crypto::generate_identity(0));
+        let handler = PacketHandler::new(crypt, Arc::new(crate::types::NoopLogger));
+        let on_packet: Arc<Mutex<Option<OnPacket>>> = Arc::new(Mutex::new(None));
+
+        let send_unencrypted =
+            |core: &mut HandlerCore, p_type: PacketType, id: u16, data: &[u8]| {
+                let mut raw = vec![0u8; TAG_SIZE + 3 + data.len()];
+                raw[..TAG_SIZE].copy_from_slice(&core.crypt.fake_signature);
+                raw[TAG_SIZE..TAG_SIZE + 2].copy_from_slice(&id.to_be_bytes());
+                raw[TAG_SIZE + 2] = (p_type as u8) | PacketFlags::Unencrypted;
+                raw[TAG_SIZE + 3..].copy_from_slice(data);
+                handle_raw_packet(core, &raw, &on_packet);
+            };
+
+        {
+            let mut core = handler.core.lock().unwrap();
+            core.started_at = Instant::now() - Duration::from_secs(5);
+            // Interleave Voice & VoiceWhisper with completely unrelated ids (no loss).
+            send_unencrypted(&mut core, PacketType::Voice, 10, b"v0");
+            send_unencrypted(&mut core, PacketType::VoiceWhisper, 200, b"w0");
+            send_unencrypted(&mut core, PacketType::Voice, 11, b"v1");
+            send_unencrypted(&mut core, PacketType::VoiceWhisper, 201, b"w1");
+
+            // Command gap (id=1 missed) + CommandLow unrelated id=90.
+            send_unencrypted(&mut core, PacketType::Command, 0, b"c0");
+            send_unencrypted(&mut core, PacketType::CommandLow, 90, b"l0");
+            send_unencrypted(&mut core, PacketType::Command, 2, b"c2");
+
+            // Advance elapsed clock by forcing started_at back 100ms, then deliver RTO retransmit of Command id=1.
+            core.started_at -= Duration::from_millis(100);
+            send_unencrypted(&mut core, PacketType::Command, 1, b"c1");
+            // Duplicate of Command id=1 must not double-count.
+            core.started_at -= Duration::from_millis(100);
+            send_unencrypted(&mut core, PacketType::Command, 1, b"c1");
+        }
+
+        let loss = handler.packet_loss().expect("packet loss tracked");
+        assert_eq!(loss.speech, 0.0);
+        // Control: Command(0,1,2) + CommandLow(90) = 4 expected, 1 lost.
+        assert!((loss.control - 0.25).abs() < 1e-9);
+        assert!((loss.total - 0.125).abs() < 1e-9);
     }
 }

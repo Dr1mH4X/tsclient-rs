@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -14,6 +14,7 @@ use tokio::sync::oneshot;
 use crate::Error;
 use crate::command::parse_command;
 use crate::commands::{self, CommandTracker};
+use crate::connection_info::build_set_connection_info;
 use crate::crypto::{Crypt, Identity};
 use crate::directory as server_directory;
 use crate::discovery::Resolver;
@@ -22,7 +23,9 @@ use crate::helpers::{is_auto_nickname_match, split_command_rows};
 use crate::notifications::{NotificationResult, handle_notification};
 use crate::throttle::CommandThrottle;
 use crate::transfer::{self, FileTransferTracker, FtNotification};
-use crate::transport::{Packet, PacketHandler, PacketSender, PacketType};
+use crate::transport::{
+    Packet, PacketHandler, PacketLoss, PacketSender, PacketType, RoundTrip, TrafficSnapshot,
+};
 pub use crate::types::AbortSignal;
 pub use crate::types::ClientStatus;
 use crate::types::*;
@@ -321,6 +324,9 @@ pub(crate) struct ClientInner {
     /// Set when error 3329 is received — signals the bg task to perform
     /// a deferred disconnect, matching JS `setImmediate(() => this.disconnect())`.
     pub(crate) pending_disconnect: bool,
+    self_weak: Weak<Mutex<ClientInner>>,
+    throttle: Arc<tokio::sync::Mutex<CommandThrottle>>,
+    final_cmd_handler: Arc<Mutex<CommandHandler>>,
 }
 
 impl ClientInner {
@@ -334,6 +340,9 @@ impl ClientInner {
         cmd_middlewares: Vec<Box<dyn CommandMiddleware>>,
         event_middlewares: Vec<Box<dyn EventMiddleware>>,
         close_tx: mpsc::UnboundedSender<Option<Error>>,
+        self_weak: Weak<Mutex<ClientInner>>,
+        throttle: Arc<tokio::sync::Mutex<CommandThrottle>>,
+        final_cmd_handler: Arc<Mutex<CommandHandler>>,
     ) -> Self {
         let (_, packet_rx) = mpsc::unbounded_channel();
         let (_, close_rx) = mpsc::unbounded_channel();
@@ -362,6 +371,9 @@ impl ClientInner {
             close_rx,
             close_tx,
             pending_disconnect: false,
+            self_weak,
+            throttle,
+            final_cmd_handler,
         }
     }
 
@@ -450,6 +462,9 @@ impl ClientInner {
             if cmd.name.starts_with("notify") {
                 self.cmd_track
                     .buffer_notification(&cmd.name, cmd.params.clone());
+                if cmd.name == "notifyconnectioninforequest" {
+                    self.answer_connection_info_request(sender);
+                }
                 if cmd.name == "notifyclientneededpermissions"
                     && self.status != ClientStatus::Disconnected
                 {
@@ -633,6 +648,44 @@ impl ClientInner {
             // inner lock is released. The bg task checks this flag.
             self.pending_disconnect = true;
         }
+    }
+
+    /// Someone asked the server for this client's connection info, and it asks
+    /// us for the figures: answer with what this connection has measured. A
+    /// failure is only logged, as the request is not one a caller made.
+    fn answer_connection_info_request(&self, sender: &PacketSender) {
+        if self.status != ClientStatus::Connected {
+            return;
+        }
+        let line = build_set_connection_info(
+            &sender.traffic_snapshot(),
+            sender.round_trip(),
+            sender.packet_loss(),
+        );
+        let throttle = Arc::clone(&self.throttle);
+        let final_cmd_handler = Arc::clone(&self.final_cmd_handler);
+        let weak_inner = self.self_weak.clone();
+        let logger = Arc::clone(&self.logger);
+        tokio::spawn(async move {
+            let send_result: Result<(), Error> = async {
+                throttle.lock().await.wait(None).await?;
+                let still_connected = weak_inner
+                    .upgrade()
+                    .is_some_and(|inner| inner.lock().unwrap().status == ClientStatus::Connected);
+                if !still_connected {
+                    return Err(Error::Teamspeak("not connected".into()));
+                }
+                let handler = final_cmd_handler.lock().unwrap().clone();
+                handler(line).await
+            }
+            .await;
+            if let Err(err) = send_result {
+                logger.debug(
+                    &format!("could not answer a connection info request: {err}"),
+                    &[],
+                );
+            }
+        });
     }
 
     fn process_notification_result(&mut self, result: NotificationResult, sender: &PacketSender) {
@@ -937,8 +990,8 @@ pub struct Client {
     pub logger: Arc<dyn Logger>,
     pub nickname: String,
     resolver: Box<dyn AddrResolver>,
-    throttle: tokio::sync::Mutex<CommandThrottle>,
-    final_cmd_handler: Mutex<CommandHandler>,
+    throttle: Arc<tokio::sync::Mutex<CommandThrottle>>,
+    final_cmd_handler: Arc<Mutex<CommandHandler>>,
     inner: Arc<Mutex<ClientInner>>,
     _bg_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -957,28 +1010,37 @@ impl Client {
         let handler = PacketHandler::new(crypt.clone(), Arc::clone(&logger));
         let packet_sender = handler.create_packet_sender();
 
-        let final_cmd_handler = Self::build_cmd_handler_simple(&cmd_middlewares, &packet_sender);
+        let final_cmd_handler = Arc::new(Mutex::new(Self::build_cmd_handler_simple(
+            &cmd_middlewares,
+            &packet_sender,
+        )));
+        let throttle = Arc::new(tokio::sync::Mutex::new(CommandThrottle::new()));
 
         let (close_tx, _close_rx_dummy) = mpsc::unbounded_channel();
-        let inner = Arc::new(Mutex::new(ClientInner::new(
-            crypt,
-            Arc::clone(&logger),
-            nickname.clone(),
-            identity,
-            addr,
-            client_init_options,
-            cmd_middlewares,
-            event_middlewares,
-            close_tx,
-        )));
+        let inner = Arc::new_cyclic(|weak| {
+            Mutex::new(ClientInner::new(
+                crypt,
+                Arc::clone(&logger),
+                nickname.clone(),
+                identity,
+                addr,
+                client_init_options,
+                cmd_middlewares,
+                event_middlewares,
+                close_tx,
+                weak.clone(),
+                Arc::clone(&throttle),
+                Arc::clone(&final_cmd_handler),
+            ))
+        });
 
         Self {
             handler: Mutex::new(handler),
             logger,
             nickname,
             resolver,
-            throttle: tokio::sync::Mutex::new(CommandThrottle::new()),
-            final_cmd_handler: Mutex::new(final_cmd_handler),
+            throttle,
+            final_cmd_handler,
             inner,
             _bg_task: Mutex::new(None),
         }
@@ -1016,6 +1078,22 @@ impl Client {
             .client(inner.clid)
             .map(|info| info.channel_id)
             .unwrap_or(0)
+    }
+
+    /// What this connection has carried so far, per direction and class.
+    pub fn traffic_snapshot(&self) -> TrafficSnapshot {
+        self.handler.lock().unwrap().traffic_snapshot()
+    }
+
+    /// The keepalive round-trip time, or `None` before the first pong.
+    pub fn round_trip(&self) -> Option<RoundTrip> {
+        self.handler.lock().unwrap().round_trip()
+    }
+
+    /// Estimated server-to-client packet loss fractions (`0.0..=1.0`) over the
+    /// trailing 60-second window, or `None` until S2C sequence samples arrive.
+    pub fn packet_loss(&self) -> Option<PacketLoss> {
+        self.handler.lock().unwrap().packet_loss()
     }
 
     // ---- Connection -----------------------------------------------------------
@@ -3114,5 +3192,76 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn connection_info_request_sends_setconnectioninfo_and_emits_raw_notification() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            let _ = cmd_tx.send(line);
+            Box::pin(async { Ok(()) })
+        });
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        client.on_raw_notification(Arc::new(move |event| {
+            if let Event::RawNotification { name, .. } = event {
+                let _ = raw_tx.send(name);
+            }
+        }));
+
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client.inner.lock().unwrap().status = ClientStatus::Connected;
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyconnectioninforequest", &sender);
+
+        let sent = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("timeout waiting for setconnectioninfo")
+            .expect("setconnectioninfo sent");
+        let parsed = parse_command(&sent).expect("valid setconnectioninfo command");
+        assert_eq!(parsed.name, "setconnectioninfo");
+        assert_eq!(parsed.params["connection_packets_sent_control"], "0");
+        assert_eq!(parsed.params["connection_bytes_received_speech"], "0");
+        assert!(!parsed.params.contains_key("connection_ping"));
+        assert!(!sent.contains("packetloss"));
+
+        let raw_name = tokio::time::timeout(Duration::from_secs(1), raw_rx.recv())
+            .await
+            .expect("timeout waiting for raw notification")
+            .expect("raw notification received");
+        assert_eq!(raw_name, "notifyconnectioninforequest");
+    }
+
+    #[tokio::test]
+    async fn connection_info_request_is_ignored_when_not_connected() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            let _ = cmd_tx.send(line);
+            Box::pin(async { Ok(()) })
+        });
+
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyconnectioninforequest", &sender);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(cmd_rx.try_recv().is_err());
     }
 }
