@@ -38,6 +38,7 @@ Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.co
 
 - [API Reference](docs/api.md)
 - [Examples](docs/examples.md)
+- [OpenProtocol Specification](docs/open-protocol.md)
 
 ## Known Dead Code
 
