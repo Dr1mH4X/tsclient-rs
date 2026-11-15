@@ -86,6 +86,7 @@ Sent via `PluginCommandTarget::Client` back to `event.invoker_id`:
 {
   "v": 1,
   "action": "list_ack",
+  "command_prefix": "!",
   "commands": [
     {
       "name": "replay",
@@ -104,8 +105,9 @@ Sent via `PluginCommandTarget::Client` back to `event.invoker_id`:
 | --- | --- | --- |
 | `v` | `u32` | Protocol version (`1`) |
 | `action` | `string` | `"list_req"` or `"list_ack"` |
+| `command_prefix` | `string?` | Optional command trigger prefix declared by the bot (e.g. `"!"`, `"/"`); omitted or empty defaults to `"/"` |
 | `commands` | `object[]` | List of command descriptors |
-| `commands[].name` | `string` | Command name without leading `/` or `!` |
+| `commands[].name` | `string` | Command name without leading prefix (e.g. without `/` or `!`) |
 | `commands[].args` | `string?` | Optional argument hint (omitted when absent) |
 | `commands[].desc` | `string` | Short command description |
 
@@ -122,7 +124,7 @@ To avoid flooding the TeamSpeak server or UI with redundant plugin commands:
   - `tsclient:commands` `list_req` → `list_ack`: **5 seconds**
 - **Field truncation & packet budget**:
   - Keep serialized payloads well under the TeamSpeak packet limit (`< 1024` bytes).
-  - Receivers should sanitize and truncate untrusted peer fields (e.g., max 32 chars per identity string field, max 16 capabilities, max 12–16 commands, `name` ≤ 24 chars, `args` ≤ 32 chars, `desc` ≤ 64 chars).
+  - Receivers should sanitize and truncate untrusted peer fields (e.g., max 32 chars per identity string field, max 16 capabilities, max 12–16 commands, `command_prefix` ≤ 8 chars, `name` ≤ 24 chars, `args` ≤ 32 chars, `desc` ≤ 64 chars).
 
 ---
 
