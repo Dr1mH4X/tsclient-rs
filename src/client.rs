@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use crate::Error;
 use crate::command::parse_command;
@@ -133,6 +134,10 @@ impl OrderedDirectoryHandler {
 /// coalesced `DirectorySnapshot` event carries the whole state regardless.
 const MAX_QUEUED_CLIENT_UPDATES: usize = 256;
 
+/// Cap on plugin commands queued per serial handler so bursts stay ordered
+/// without unbounded memory growth.
+const MAX_QUEUED_PLUGIN_COMMANDS: usize = 1024;
+
 /// Delivers state updates to one handler in dispatch order: a drain task
 /// pops a bounded FIFO, so an older record can never overtake a newer one
 /// and a slow handler cannot accumulate unbounded work.
@@ -140,27 +145,32 @@ struct SerialEventHandler {
     handler: EventHandler,
     pending: Arc<Mutex<VecDeque<Event>>>,
     wake: Arc<Notify>,
-    started: bool,
+    max_queued: usize,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl SerialEventHandler {
     fn new(handler: EventHandler) -> Self {
+        Self::with_capacity(handler, MAX_QUEUED_CLIENT_UPDATES)
+    }
+
+    fn with_capacity(handler: EventHandler, max_queued: usize) -> Self {
         Self {
             handler,
             pending: Arc::new(Mutex::new(VecDeque::new())),
             wake: Arc::new(Notify::new()),
-            started: false,
+            max_queued,
+            shutdown: None,
         }
     }
 
     fn enqueue(&mut self, event: Event) {
-        if !self.started {
-            self.started = true;
+        if self.shutdown.is_none() {
             self.start();
         }
         {
             let mut pending = self.pending.lock().unwrap();
-            if pending.len() >= MAX_QUEUED_CLIENT_UPDATES {
+            if pending.len() >= self.max_queued {
                 pending.pop_front();
             }
             pending.push_back(event);
@@ -172,10 +182,21 @@ impl SerialEventHandler {
         let handler = Arc::clone(&self.handler);
         let pending = Arc::clone(&self.pending);
         let wake = Arc::clone(&self.wake);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
             loop {
-                wake.notified().await;
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    _ = wake.notified() => {}
+                }
                 loop {
+                    if matches!(
+                        shutdown_rx.try_recv(),
+                        Ok(_) | Err(oneshot::error::TryRecvError::Closed)
+                    ) {
+                        return;
+                    }
                     let next = pending.lock().unwrap().pop_front();
                     let Some(event) = next else { break };
                     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -184,6 +205,7 @@ impl SerialEventHandler {
                 }
             }
         });
+        self.shutdown = Some(shutdown_tx);
     }
 }
 
@@ -198,7 +220,7 @@ struct SerialRawNotificationHandler {
     handler: EventHandler,
     pending: Arc<Mutex<VecDeque<Event>>>,
     wake: Arc<Notify>,
-    started: bool,
+    shutdown: Option<oneshot::Sender<()>>,
     logger: Arc<dyn Logger>,
 }
 
@@ -208,14 +230,13 @@ impl SerialRawNotificationHandler {
             handler,
             pending: Arc::new(Mutex::new(VecDeque::new())),
             wake: Arc::new(Notify::new()),
-            started: false,
+            shutdown: None,
             logger,
         }
     }
 
     fn enqueue(&mut self, event: Event) {
-        if !self.started {
-            self.started = true;
+        if self.shutdown.is_none() {
             self.start();
         }
         {
@@ -240,10 +261,21 @@ impl SerialRawNotificationHandler {
         let handler = Arc::clone(&self.handler);
         let pending = Arc::clone(&self.pending);
         let wake = Arc::clone(&self.wake);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
             loop {
-                wake.notified().await;
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    _ = wake.notified() => {}
+                }
                 loop {
+                    if matches!(
+                        shutdown_rx.try_recv(),
+                        Ok(_) | Err(oneshot::error::TryRecvError::Closed)
+                    ) {
+                        return;
+                    }
                     let next = pending.lock().unwrap().pop_front();
                     let Some(event) = next else { break };
                     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -252,6 +284,72 @@ impl SerialRawNotificationHandler {
                 }
             }
         });
+        self.shutdown = Some(shutdown_tx);
+    }
+}
+
+enum LifecycleJob {
+    Connected(Vec<Arc<dyn Fn() + Send + Sync>>),
+    Disconnected {
+        handlers: Vec<EventHandler>,
+        err: Option<Error>,
+        done: watch::Sender<bool>,
+    },
+}
+
+/// Serializes `connected` and `disconnected` listener callbacks so a slow
+/// disconnect callback from an earlier session can never overtake a reconnect.
+struct LifecycleDispatcher {
+    tx: mpsc::UnboundedSender<LifecycleJob>,
+    _shutdown: oneshot::Sender<()>,
+}
+
+impl LifecycleDispatcher {
+    fn spawn() -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<LifecycleJob>();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                let job = tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    maybe = rx.recv() => match maybe {
+                        Some(job) => job,
+                        None => break,
+                    },
+                };
+                match job {
+                    LifecycleJob::Connected(handlers) => {
+                        for h in handlers {
+                            let _ = catch_unwind(AssertUnwindSafe(|| {
+                                h();
+                            }));
+                        }
+                    }
+                    LifecycleJob::Disconnected {
+                        handlers,
+                        err,
+                        done,
+                    } => {
+                        for h in handlers {
+                            let e = err.clone();
+                            let _ = catch_unwind(AssertUnwindSafe(|| {
+                                h(Event::Disconnected(e));
+                            }));
+                        }
+                        let _ = done.send(true);
+                    }
+                }
+            }
+        });
+        Self {
+            tx,
+            _shutdown: shutdown_tx,
+        }
+    }
+
+    fn dispatch(&mut self, job: LifecycleJob) {
+        let _ = self.tx.send(job);
     }
 }
 
@@ -272,7 +370,7 @@ struct EventHandlers {
     connected: Vec<Arc<dyn Fn() + Send + Sync>>,
     disconnected: Vec<EventHandler>,
     kicked: Vec<EventHandler>,
-    plugin_command: Vec<EventHandler>,
+    plugin_command: Vec<SerialEventHandler>,
     raw_notification: Vec<SerialRawNotificationHandler>,
 }
 
@@ -310,6 +408,7 @@ pub(crate) struct ClientInner {
     pub(crate) addr: String,
     pub(crate) client_init_options: ClientInitOptions,
     pub(crate) status: ClientStatus,
+    pub(crate) connection_epoch: u64,
     pub(crate) cmd_track: CommandTracker,
     own_permissions: HashMap<u32, i32>,
     pub(crate) ft_track: FileTransferTracker,
@@ -321,6 +420,10 @@ pub(crate) struct ClientInner {
     directory_wakers: Vec<(u64, oneshot::Sender<()>)>,
     next_waker_id: u64,
     event_handlers: EventHandlers,
+    lifecycle: Option<LifecycleDispatcher>,
+    pending_disconnect_done: Option<watch::Receiver<bool>>,
+    defer_events: bool,
+    deferred_events: Vec<Event>,
     pub(crate) cmd_middlewares: Vec<Box<dyn CommandMiddleware>>,
     pub(crate) event_middlewares: Vec<Box<dyn EventMiddleware>>,
     pub(crate) packet_rx: mpsc::UnboundedReceiver<Packet>,
@@ -360,6 +463,7 @@ impl ClientInner {
             addr,
             client_init_options,
             status: ClientStatus::Disconnected,
+            connection_epoch: 0,
             cmd_track: CommandTracker::new(),
             own_permissions: HashMap::new(),
             ft_track: FileTransferTracker::new(),
@@ -371,6 +475,10 @@ impl ClientInner {
             directory_wakers: Vec::new(),
             next_waker_id: 0,
             event_handlers: EventHandlers::new(),
+            lifecycle: None,
+            pending_disconnect_done: None,
+            defer_events: false,
+            deferred_events: Vec::new(),
             cmd_middlewares,
             event_middlewares,
             packet_rx,
@@ -790,7 +898,59 @@ impl ClientInner {
         }
     }
 
+    fn ensure_lifecycle(&mut self) -> Option<&mut LifecycleDispatcher> {
+        if self.lifecycle.is_none() && tokio::runtime::Handle::try_current().is_ok() {
+            self.lifecycle = Some(LifecycleDispatcher::spawn());
+        }
+        self.lifecycle.as_mut()
+    }
+
+    fn emit_connected(&mut self) {
+        let handlers = self.event_handlers.connected.clone();
+        if handlers.is_empty() {
+            return;
+        }
+        if let Some(lifecycle) = self.ensure_lifecycle() {
+            lifecycle.dispatch(LifecycleJob::Connected(handlers));
+        } else {
+            for h in handlers {
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    h();
+                }));
+            }
+        }
+    }
+
+    fn emit_disconnected(&mut self, err: Option<Error>) -> Option<watch::Receiver<bool>> {
+        let handlers = self.event_handlers.disconnected.clone();
+        if handlers.is_empty() {
+            return None;
+        }
+        let (done_tx, done_rx) = watch::channel(false);
+        if let Some(lifecycle) = self.ensure_lifecycle() {
+            lifecycle.dispatch(LifecycleJob::Disconnected {
+                handlers,
+                err,
+                done: done_tx,
+            });
+            self.pending_disconnect_done = Some(done_rx.clone());
+            Some(done_rx)
+        } else {
+            for h in handlers {
+                let e = err.clone();
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    h(Event::Disconnected(e));
+                }));
+            }
+            None
+        }
+    }
+
     fn dispatch_event(&mut self, event: Event) {
+        if self.defer_events {
+            self.deferred_events.push(event);
+            return;
+        }
         let dispatched = Arc::new(Mutex::new(None::<Event>));
         let base: EventHandler = {
             let d = Arc::clone(&dispatched);
@@ -801,135 +961,124 @@ impl ClientInner {
         let chain = build_event_chain(&self.event_middlewares, base);
         chain(event);
         if let Some(evt) = dispatched.lock().unwrap().take() {
-            match evt {
-                Event::TextMessage(msg) => {
-                    for h in &self.event_handlers.text_message {
-                        let h = Arc::clone(h);
-                        let m = msg.clone();
-                        tokio::spawn(async move {
-                            h(Event::TextMessage(m));
-                        });
-                    }
+            self.deliver_event(evt);
+        }
+    }
+
+    fn deliver_event(&mut self, evt: Event) {
+        match evt {
+            Event::TextMessage(msg) => {
+                for h in &self.event_handlers.text_message {
+                    let h = Arc::clone(h);
+                    let m = msg.clone();
+                    tokio::spawn(async move {
+                        h(Event::TextMessage(m));
+                    });
                 }
-                Event::ClientEnter(info) => {
-                    for h in &self.event_handlers.client_enter {
-                        let h = Arc::clone(h);
-                        let i = info.clone();
-                        tokio::spawn(async move {
-                            h(Event::ClientEnter(i));
-                        });
-                    }
+            }
+            Event::ClientEnter(info) => {
+                for h in &self.event_handlers.client_enter {
+                    let h = Arc::clone(h);
+                    let i = info.clone();
+                    tokio::spawn(async move {
+                        h(Event::ClientEnter(i));
+                    });
                 }
-                Event::ClientUpdated(info) => {
-                    for handler in &mut self.event_handlers.client_updated {
-                        handler.enqueue(Event::ClientUpdated(info.clone()));
-                    }
+            }
+            Event::ClientUpdated(info) => {
+                for handler in &mut self.event_handlers.client_updated {
+                    handler.enqueue(Event::ClientUpdated(info.clone()));
                 }
-                Event::ClientLeave(evt) => {
-                    for h in &self.event_handlers.client_leave {
-                        let h = Arc::clone(h);
-                        let e = evt.clone();
-                        tokio::spawn(async move {
-                            h(Event::ClientLeave(e));
-                        });
-                    }
+            }
+            Event::ClientLeave(evt) => {
+                for h in &self.event_handlers.client_leave {
+                    let h = Arc::clone(h);
+                    let e = evt.clone();
+                    tokio::spawn(async move {
+                        h(Event::ClientLeave(e));
+                    });
                 }
-                Event::ClientMoved(evt) => {
-                    for h in &self.event_handlers.client_moved {
-                        let h = Arc::clone(h);
-                        let e = evt.clone();
-                        tokio::spawn(async move {
-                            h(Event::ClientMoved(e));
-                        });
-                    }
+            }
+            Event::ClientMoved(evt) => {
+                for h in &self.event_handlers.client_moved {
+                    let h = Arc::clone(h);
+                    let e = evt.clone();
+                    tokio::spawn(async move {
+                        h(Event::ClientMoved(e));
+                    });
                 }
-                Event::DirectorySnapshot(snapshot) => {
-                    for handler in &mut self.event_handlers.directory_snapshot {
-                        handler.enqueue(snapshot.clone());
-                    }
+            }
+            Event::DirectorySnapshot(snapshot) => {
+                for handler in &mut self.event_handlers.directory_snapshot {
+                    handler.enqueue(snapshot.clone());
                 }
-                Event::ServerInfoUpdated(info) => {
-                    for handler in &mut self.event_handlers.server_info_updated {
-                        handler.enqueue(Event::ServerInfoUpdated(info.clone()));
-                    }
+            }
+            Event::ServerInfoUpdated(info) => {
+                for handler in &mut self.event_handlers.server_info_updated {
+                    handler.enqueue(Event::ServerInfoUpdated(info.clone()));
                 }
-                Event::ServerEdited(evt) => {
-                    for h in &self.event_handlers.server_edited {
-                        let h = Arc::clone(h);
-                        let e = evt.clone();
-                        tokio::spawn(async move {
-                            h(Event::ServerEdited(e));
-                        });
-                    }
+            }
+            Event::ServerEdited(evt) => {
+                for h in &self.event_handlers.server_edited {
+                    let h = Arc::clone(h);
+                    let e = evt.clone();
+                    tokio::spawn(async move {
+                        h(Event::ServerEdited(e));
+                    });
                 }
-                Event::OwnPermissionsChanged => {
-                    for handler in &self.event_handlers.own_permissions_changed {
-                        let handler = Arc::clone(handler);
-                        tokio::spawn(async move {
-                            handler(Event::OwnPermissionsChanged);
-                        });
-                    }
+            }
+            Event::OwnPermissionsChanged => {
+                for handler in &self.event_handlers.own_permissions_changed {
+                    let handler = Arc::clone(handler);
+                    tokio::spawn(async move {
+                        handler(Event::OwnPermissionsChanged);
+                    });
                 }
-                Event::Poked(evt) => {
-                    for h in &self.event_handlers.poked {
-                        let h = Arc::clone(h);
-                        let e = evt.clone();
-                        tokio::spawn(async move {
-                            h(Event::Poked(e));
-                        });
-                    }
+            }
+            Event::Poked(evt) => {
+                for h in &self.event_handlers.poked {
+                    let h = Arc::clone(h);
+                    let e = evt.clone();
+                    tokio::spawn(async move {
+                        h(Event::Poked(e));
+                    });
                 }
-                Event::VoiceData(data) => {
-                    for handler in &mut self.event_handlers.voice_data {
-                        handler.enqueue(Event::VoiceData(data.clone()));
-                    }
+            }
+            Event::VoiceData(data) => {
+                for handler in &mut self.event_handlers.voice_data {
+                    handler.enqueue(Event::VoiceData(data.clone()));
                 }
-                Event::Connected => {
-                    for h in &self.event_handlers.connected {
-                        let h = Arc::clone(h);
-                        tokio::spawn(async move {
-                            h();
-                        });
-                    }
+            }
+            Event::Connected => {
+                self.emit_connected();
+            }
+            Event::Disconnected(err) => {
+                self.emit_disconnected(err);
+            }
+            Event::Kicked(msg) => {
+                for h in &self.event_handlers.kicked {
+                    let h = Arc::clone(h);
+                    let m = msg.clone();
+                    tokio::spawn(async move {
+                        h(Event::Kicked(m));
+                    });
                 }
-                Event::Disconnected(err) => {
-                    for h in &self.event_handlers.disconnected {
-                        let h = Arc::clone(h);
-                        let e = err.clone();
-                        tokio::spawn(async move {
-                            h(Event::Disconnected(e));
-                        });
-                    }
+            }
+            Event::PluginCommand(evt) => {
+                for handler in &mut self.event_handlers.plugin_command {
+                    handler.enqueue(Event::PluginCommand(evt.clone()));
                 }
-                Event::Kicked(msg) => {
-                    for h in &self.event_handlers.kicked {
-                        let h = Arc::clone(h);
-                        let m = msg.clone();
-                        tokio::spawn(async move {
-                            h(Event::Kicked(m));
-                        });
-                    }
+            }
+            Event::RawNotification { name, items } => {
+                let event = Event::RawNotification { name, items };
+                for handler in &mut self.event_handlers.raw_notification {
+                    handler.enqueue(event.clone());
                 }
-                Event::PluginCommand(evt) => {
-                    for h in &self.event_handlers.plugin_command {
-                        let h = Arc::clone(h);
-                        let e = evt.clone();
-                        tokio::spawn(async move {
-                            h(Event::PluginCommand(e));
-                        });
-                    }
-                }
-                Event::RawNotification { name, items } => {
-                    let event = Event::RawNotification { name, items };
-                    for handler in &mut self.event_handlers.raw_notification {
-                        handler.enqueue(event.clone());
-                    }
-                }
-                Event::NotificationOverflow { queue } => {
-                    let event = Event::NotificationOverflow { queue };
-                    for handler in &mut self.event_handlers.raw_notification {
-                        handler.enqueue(event.clone());
-                    }
+            }
+            Event::NotificationOverflow { queue } => {
+                let event = Event::NotificationOverflow { queue };
+                for handler in &mut self.event_handlers.raw_notification {
+                    handler.enqueue(event.clone());
                 }
             }
         }
@@ -940,14 +1089,9 @@ impl ClientInner {
             return;
         }
         self.status = ClientStatus::Disconnected;
+        self.connection_epoch = self.connection_epoch.wrapping_add(1);
         self.reset_directory_availability();
-        let handlers = std::mem::take(&mut self.event_handlers.disconnected);
-        for h in handlers {
-            let e = err.clone();
-            tokio::spawn(async move {
-                h(Event::Disconnected(e));
-            });
-        }
+        self.emit_disconnected(err);
     }
 
     pub(crate) fn mark_connected(&mut self) {
@@ -955,12 +1099,7 @@ impl ClientInner {
         for (_, waker) in self.connected_wakers.drain(..) {
             let _ = waker.send(());
         }
-        let handlers = std::mem::take(&mut self.event_handlers.connected);
-        for h in handlers {
-            tokio::spawn(async move {
-                h();
-            });
-        }
+        self.emit_connected();
     }
 
     fn reset_directory_availability(&mut self) {
@@ -1057,6 +1196,7 @@ pub struct Client {
     resolver: Box<dyn AddrResolver>,
     throttle: Arc<tokio::sync::Mutex<CommandThrottle>>,
     final_cmd_handler: Arc<Mutex<CommandHandler>>,
+    final_event_handler: Arc<Mutex<EventHandler>>,
     inner: Arc<Mutex<ClientInner>>,
     _bg_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -1099,6 +1239,11 @@ impl Client {
             ))
         });
 
+        let final_event_handler = Arc::new(Mutex::new(Self::build_event_handler_simple(
+            &inner.lock().unwrap().event_middlewares,
+            Arc::downgrade(&inner),
+        )));
+
         Self {
             handler: Mutex::new(handler),
             logger,
@@ -1106,8 +1251,41 @@ impl Client {
             resolver,
             throttle,
             final_cmd_handler,
+            final_event_handler,
             inner,
             _bg_task: Mutex::new(None),
+        }
+    }
+
+    fn build_event_handler_simple(
+        middlewares: &[Box<dyn EventMiddleware>],
+        inner_weak: Weak<Mutex<ClientInner>>,
+    ) -> EventHandler {
+        let base: EventHandler = Arc::new(move |ev: Event| {
+            if let Some(inner) = inner_weak.upgrade() {
+                inner.lock().unwrap().deliver_event(ev);
+            }
+        });
+        build_event_chain(middlewares, base)
+    }
+
+    fn flush_deferred_events(
+        inner: &Arc<Mutex<ClientInner>>,
+        final_event_handler: &Arc<Mutex<EventHandler>>,
+    ) {
+        loop {
+            let events = {
+                let mut i = inner.lock().unwrap();
+                i.defer_events = false;
+                if i.deferred_events.is_empty() {
+                    break;
+                }
+                std::mem::take(&mut i.deferred_events)
+            };
+            let handler = final_event_handler.lock().unwrap().clone();
+            for ev in events {
+                handler(ev);
+            }
         }
     }
 
@@ -1164,6 +1342,17 @@ impl Client {
     // ---- Connection -----------------------------------------------------------
 
     pub async fn connect(&mut self) -> Result<(), Error> {
+        loop {
+            let rx = self.inner.lock().unwrap().pending_disconnect_done.clone();
+            let Some(mut rx) = rx else { break };
+            if *rx.borrow() {
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+
         {
             let inner = self.inner.lock().unwrap();
             if inner.status != ClientStatus::Disconnected {
@@ -1191,6 +1380,7 @@ impl Client {
 
         // Spawn background packet processing task
         let inner = Arc::clone(&self.inner);
+        let final_event_handler = Arc::clone(&self.final_event_handler);
         let sender = {
             let handler = self.handler.lock().unwrap();
             handler.create_packet_sender()
@@ -1208,13 +1398,16 @@ impl Client {
             loop {
                 let directory_deadline = {
                     let mut i = inner.lock().unwrap();
+                    i.defer_events = true;
                     i.flush_directory_if_due();
                     i.directory_deadline()
                 };
+                Self::flush_deferred_events(&inner, &final_event_handler);
                 tokio::select! {
                     Some(packet) = packet_rx.recv() => {
                         let pending = {
                             let mut i = inner.lock().unwrap();
+                            i.defer_events = true;
                             i.process_packet(&sender, packet);
                             if i.pending_disconnect {
                                 i.pending_disconnect = false;
@@ -1223,6 +1416,7 @@ impl Client {
                                 false
                             }
                         };
+                        Self::flush_deferred_events(&inner, &final_event_handler);
                         if pending {
                             // Deferred disconnect — mirrors JS `disconnect()`:
                             // 1. Check if already disconnected → skip
@@ -1230,36 +1424,47 @@ impl Client {
                             // 3. If was Connected, send `clientdisconnect` (best-effort)
                             // 4. Close handler
                             // 5. Call disconnected handlers with None
-                            let (was_connected, handlers) = {
+                            let was_connected = {
                                 let mut i = inner.lock().unwrap();
                                 if i.status == ClientStatus::Disconnected {
-                                    break;
+                                    None
+                                } else {
+                                    let was_connected = i.status == ClientStatus::Connected;
+                                    i.status = ClientStatus::Disconnected;
+                                    i.connection_epoch = i.connection_epoch.wrapping_add(1);
+                                    i.defer_events = true;
+                                    i.reset_directory_availability();
+                                    Some(was_connected)
                                 }
-                                let was_connected = i.status == ClientStatus::Connected;
-                                i.status = ClientStatus::Disconnected;
-                                i.reset_directory_availability();
-                                let handlers = std::mem::take(&mut i.event_handlers.disconnected);
-                                (was_connected, handlers)
+                            };
+                            Self::flush_deferred_events(&inner, &final_event_handler);
+                            let Some(was_connected) = was_connected else {
+                                break;
                             };
                             if was_connected {
                                 let cmd_sender = sender.create_command_sender();
                                 cmd_sender(b"clientdisconnect reasonmsg=Shutdown".to_vec());
                             }
                             sender.close();
-                            for h in handlers {
-                                tokio::spawn(async move {
-                                    h(Event::Disconnected(None));
-                                });
-                            }
+                            inner.lock().unwrap().emit_disconnected(None);
                             break;
                         }
                     }
                     _ = wait_for_directory_deadline(directory_deadline) => {
-                        inner.lock().unwrap().flush_directory_if_due();
+                        {
+                            let mut i = inner.lock().unwrap();
+                            i.defer_events = true;
+                            i.flush_directory_if_due();
+                        }
+                        Self::flush_deferred_events(&inner, &final_event_handler);
                     }
                     Some(err) = close_rx.recv() => {
-                        let mut i = inner.lock().unwrap();
-                        i.handle_connection_closed(err);
+                        {
+                            let mut i = inner.lock().unwrap();
+                            i.defer_events = true;
+                            i.handle_connection_closed(err);
+                        }
+                        Self::flush_deferred_events(&inner, &final_event_handler);
                         break;
                     }
                     else => break,
@@ -1279,9 +1484,12 @@ impl Client {
             }
             let was_connected = inner.status == ClientStatus::Connected;
             inner.status = ClientStatus::Disconnected;
+            inner.connection_epoch = inner.connection_epoch.wrapping_add(1);
+            inner.defer_events = true;
             inner.reset_directory_availability();
             was_connected
         };
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
 
         self.logger.info("disconnecting from server", &[]);
 
@@ -1301,12 +1509,16 @@ impl Client {
             let _ = handle.await;
         }
 
-        let handlers = {
+        let done_rx = {
             let mut inner = self.inner.lock().unwrap();
-            std::mem::take(&mut inner.event_handlers.disconnected)
+            inner.emit_disconnected(None)
         };
-        for h in handlers {
-            h(Event::Disconnected(None));
+        if let Some(mut rx) = done_rx {
+            while !*rx.borrow() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
         }
 
         Ok(())
@@ -1407,6 +1619,7 @@ impl Client {
             &*self.logger,
             cmd,
             timeout_ms,
+            None,
         )
         .await
     }
@@ -1573,7 +1786,10 @@ impl Client {
             .unwrap()
             .event_handlers
             .plugin_command
-            .push(handler);
+            .push(SerialEventHandler::with_capacity(
+                handler,
+                MAX_QUEUED_PLUGIN_COMMANDS,
+            ));
         self
     }
 
@@ -1616,7 +1832,12 @@ impl Client {
     }
 
     pub fn use_event_middleware(&self, mw: Vec<Box<dyn EventMiddleware>>) -> &Self {
-        self.inner.lock().unwrap().event_middlewares.extend(mw);
+        let new_handler = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.event_middlewares.extend(mw);
+            Self::build_event_handler_simple(&inner.event_middlewares, Arc::downgrade(&self.inner))
+        };
+        *self.final_event_handler.lock().unwrap() = new_handler;
         self
     }
 
@@ -1782,17 +2003,7 @@ impl Client {
     /// Called by handshake when the server acknowledges our connection.
     pub fn mark_connected(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.status = ClientStatus::Connected;
-        for (_, waker) in inner.connected_wakers.drain(..) {
-            let _ = waker.send(());
-        }
-        let handlers = std::mem::take(&mut inner.event_handlers.connected);
-        drop(inner);
-        for h in handlers {
-            tokio::spawn(async move {
-                h();
-            });
-        }
+        inner.mark_connected();
     }
 
     // ---- Private --------------------------------------------------------------
@@ -1829,6 +2040,8 @@ impl Client {
         let sender = self.handler.lock().unwrap().create_packet_sender();
         {
             let mut inner = self.inner.lock().unwrap();
+            inner.connection_epoch = inner.connection_epoch.wrapping_add(1);
+            inner.pending_disconnect_done = None;
             inner.crypt = new_crypt;
             inner.cmd_track.reset();
             inner.ft_track.reset();
@@ -1853,6 +2066,16 @@ impl Client {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn process_packet_for_test(&self, sender: &PacketSender, p: Packet) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.defer_events = true;
+            inner.process_packet(sender, p);
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
     #[cfg(all(test, feature = "open-protocol"))]
     pub(crate) fn install_open_protocol_test_transport(&self, seen_cmds: Arc<Mutex<Vec<String>>>) {
         let inner = Arc::downgrade(&self.inner);
@@ -1869,9 +2092,13 @@ impl Client {
     #[cfg(all(test, feature = "open-protocol"))]
     pub(crate) fn inject_open_protocol_test_line(&self, clid: i32, line: &str) {
         let sender = self.handler.lock().unwrap().create_packet_sender();
-        let mut inner = self.inner.lock().unwrap();
-        inner.clid = clid;
-        inner.handle_command_str(line, &sender);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.clid = clid;
+            inner.defer_events = true;
+            inner.handle_command_str(line, &sender);
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
     }
 }
 
@@ -1906,6 +2133,14 @@ pub(crate) struct ClientHandle {
 
 #[cfg(feature = "open-protocol")]
 impl ClientHandle {
+    pub(crate) fn status(&self) -> ClientStatus {
+        self.inner.lock().unwrap().status
+    }
+
+    pub(crate) fn connection_epoch(&self) -> u64 {
+        self.inner.lock().unwrap().connection_epoch
+    }
+
     pub(crate) fn client_id(&self) -> i32 {
         self.inner.lock().unwrap().clid
     }
@@ -1924,12 +2159,13 @@ impl ClientHandle {
         inner.directory_ready.then(|| inner.directory.snapshot())
     }
 
-    pub(crate) async fn send_plugin_command(
+    pub(crate) async fn send_plugin_command_for_epoch(
         &self,
         name: &str,
         data: &str,
         target: PluginCommandTarget,
         target_id: Option<i32>,
+        expected_epoch: u64,
     ) -> Result<(), Error> {
         let cmd = crate::api::build_plugin_command_line(name, data, target, target_id)?;
         exec_command_parts(
@@ -1939,6 +2175,7 @@ impl ClientHandle {
             &*self.logger,
             &cmd,
             crate::api::CMD_TIMEOUT_MS,
+            Some(expected_epoch),
         )
         .await?;
         Ok(())
@@ -1952,6 +2189,7 @@ async fn exec_command_parts(
     logger: &dyn Logger,
     cmd: &str,
     timeout_ms: u64,
+    expected_epoch: Option<u64>,
 ) -> Result<Vec<HashMap<String, String>>, Error> {
     if cmd
         .split_whitespace()
@@ -1968,7 +2206,15 @@ async fn exec_command_parts(
         let attempt = async {
             let mut throttle = throttle_arc.lock().await;
             throttle.wait(None).await?;
-            let (rc, rx) = inner_arc.lock().unwrap().cmd_track.register_command(cmd);
+            let (rc, rx) = {
+                let mut inner = inner_arc.lock().unwrap();
+                if expected_epoch.is_some_and(|exp| inner.connection_epoch != exp) {
+                    return Err(Error::Teamspeak(
+                        "connection epoch changed before command send".into(),
+                    ));
+                }
+                inner.cmd_track.register_command(cmd)
+            };
             registered = Some(rc);
             logger.debug(
                 &format!(
@@ -3844,12 +4090,23 @@ mod tests {
     async fn voice_data_passes_through_event_middleware() {
         struct VoiceFilterMiddleware {
             seen: Arc<Mutex<Vec<u16>>>,
+            client_probe: Arc<Mutex<Option<ClientStatus>>>,
+            client_ref: Arc<Mutex<Option<Arc<Client>>>>,
         }
         impl EventMiddleware for VoiceFilterMiddleware {
             fn wrap(&self, next: EventHandler) -> EventHandler {
                 let seen = Arc::clone(&self.seen);
+                let client_probe = Arc::clone(&self.client_probe);
+                let client_ref = Arc::clone(&self.client_ref);
                 Arc::new(move |ev| match ev {
                     Event::VoiceData(mut vd) => {
+                        if let Some(client) = client_ref.lock().unwrap().as_ref() {
+                            // Synchronous client APIs lock ClientInner; this must not deadlock.
+                            let _ = client.client_id();
+                            let _ = client.channel_id();
+                            let _ = client.directory_snapshot();
+                            *client_probe.lock().unwrap() = Some(client.status());
+                        }
                         seen.lock().unwrap().push(vd.seq);
                         if vd.seq == 1 {
                             return;
@@ -3863,9 +4120,13 @@ mod tests {
         }
 
         let mw_seen = Arc::new(Mutex::new(Vec::new()));
+        let client_probe = Arc::new(Mutex::new(None));
+        let client_ref = Arc::new(Mutex::new(None));
         let mut opts = ClientOptions::default();
         opts.event_middleware.push(Box::new(VoiceFilterMiddleware {
             seen: Arc::clone(&mw_seen),
+            client_probe: Arc::clone(&client_probe),
+            client_ref: Arc::clone(&client_ref),
         }));
         let client = Arc::new(Client::new(
             crate::crypto::generate_identity(0),
@@ -3873,15 +4134,17 @@ mod tests {
             "bot".to_string(),
             opts,
         ));
+        *client_ref.lock().unwrap() = Some(Arc::clone(&client));
         let sender = client.handler.lock().unwrap().create_packet_sender();
         let now = std::time::Instant::now();
 
         // Even before any on_voice_data listener is registered, middleware observes voiceData.
-        client.inner.lock().unwrap().process_packet(
+        client.process_packet_for_test(
             &sender,
             make_voice_packet(PacketType::Voice, 10, 7, 4, &[1], now),
         );
         assert_eq!(*mw_seen.lock().unwrap(), vec![10]);
+        assert_eq!(*client_probe.lock().unwrap(), Some(ClientStatus::Disconnected));
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.on_voice_data(Arc::new(move |ev| {
@@ -3890,17 +4153,14 @@ mod tests {
             }
         }));
 
-        {
-            let mut inner = client.inner.lock().unwrap();
-            inner.process_packet(
-                &sender,
-                make_voice_packet(PacketType::Voice, 1, 7, 4, &[1], now),
-            );
-            inner.process_packet(
-                &sender,
-                make_voice_packet(PacketType::Voice, 2, 7, 4, &[2], now),
-            );
-        }
+        client.process_packet_for_test(
+            &sender,
+            make_voice_packet(PacketType::Voice, 1, 7, 4, &[1], now),
+        );
+        client.process_packet_for_test(
+            &sender,
+            make_voice_packet(PacketType::Voice, 2, 7, 4, &[2], now),
+        );
 
         let delivered = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -3911,9 +4171,10 @@ mod tests {
         assert_eq!(delivered.seq, 2);
         assert_eq!(delivered.codec, 99);
         assert_eq!(*mw_seen.lock().unwrap(), vec![10, 1, 2]);
+        *client_ref.lock().unwrap() = None;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn voice_data_handlers_run_serially_in_arrival_order_and_drop_oldest_above_256() {
         let client = Arc::new(Client::new(
             crate::crypto::generate_identity(0),
@@ -3927,12 +4188,17 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::<u16>::new()));
         let active = Arc::new(AtomicBool::new(false));
         let overlapped = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let (done_tx, done_rx) = oneshot::channel();
         let done_tx = Arc::new(Mutex::new(Some(done_tx)));
 
         let seen_cb = Arc::clone(&seen);
         let active_cb = Arc::clone(&active);
         let overlapped_cb = Arc::clone(&overlapped);
+        let entered_tx_cb = Arc::clone(&entered_tx);
+        let gate_cb = Arc::clone(&gate);
         let done_tx_cb = Arc::clone(&done_tx);
         let total = MAX_QUEUED_CLIENT_UPDATES as u16 + 44;
 
@@ -3941,9 +4207,19 @@ mod tests {
                 overlapped_cb.store(true, Ordering::SeqCst);
             }
             if let Event::VoiceData(vd) = ev {
+                if vd.seq == 0 {
+                    if let Some(tx) = entered_tx_cb.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    let (lock, cvar) = &*gate_cb;
+                    let mut open = lock.lock().unwrap();
+                    while !*open {
+                        open = cvar.wait(open).unwrap();
+                    }
+                }
                 let mut guard = seen_cb.lock().unwrap();
                 guard.push(vd.seq);
-                if guard.len() == MAX_QUEUED_CLIENT_UPDATES {
+                if guard.len() == 1 + MAX_QUEUED_CLIENT_UPDATES {
                     if let Some(tx) = done_tx_cb.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
@@ -3952,14 +4228,30 @@ mod tests {
             active_cb.store(false, Ordering::SeqCst);
         }));
 
+        client.process_packet_for_test(
+            &sender,
+            make_voice_packet(PacketType::Voice, 0, 7, 4, &[1], now),
+        );
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .expect("first voice callback did not start")
+            .unwrap();
+
         {
             let mut inner = client.inner.lock().unwrap();
-            for seq in 0..total {
+            for seq in 1..=total {
                 inner.process_packet(
                     &sender,
                     make_voice_packet(PacketType::Voice, seq, 7, 4, &[1], now),
                 );
             }
+        }
+        // Give another worker thread an opportunity to run concurrently if dispatch were not serial.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        {
+            let (lock, cvar) = &*gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
         }
 
         tokio::time::timeout(Duration::from_secs(2), done_rx)
@@ -3969,9 +4261,92 @@ mod tests {
 
         assert!(!overlapped.load(Ordering::SeqCst));
         let got = seen.lock().unwrap();
-        assert_eq!(got.len(), MAX_QUEUED_CLIENT_UPDATES);
-        assert_eq!(got[0], 44);
-        assert_eq!(*got.last().unwrap(), total - 1);
-        assert!(got.windows(2).all(|w| w[0] + 1 == w[1]));
+        assert_eq!(got.len(), 1 + MAX_QUEUED_CLIENT_UPDATES);
+        assert_eq!(got[0], 0);
+        assert_eq!(got[1], 45);
+        assert_eq!(*got.last().unwrap(), total);
+        assert!(got[1..].windows(2).all(|w| w[0] + 1 == w[1]));
+    }
+
+    #[tokio::test]
+    async fn serial_event_handler_drops_captured_resources_when_client_drops() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        );
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        let resource = Arc::new(());
+        let weak_resource = Arc::downgrade(&resource);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client.on_voice_data(Arc::new(move |ev| {
+            let _keep = &resource;
+            if let Event::VoiceData(vd) = ev {
+                let _ = tx.send(vd.seq);
+            }
+        }));
+
+        client.process_packet_for_test(
+            &sender,
+            make_voice_packet(PacketType::Voice, 1, 7, 4, &[1], std::time::Instant::now()),
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(weak_resource.upgrade().is_some());
+
+        drop(client);
+        for _ in 0..20 {
+            if weak_resource.upgrade().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(weak_resource.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_handlers_persist_across_reconnects_in_causal_order() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        );
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let log_conn = Arc::clone(&log);
+        let tx_conn = done_tx.clone();
+        client.on_connected(Arc::new(move || {
+            log_conn.lock().unwrap().push("connected");
+            let _ = tx_conn.send(());
+        }));
+        let log_disc = Arc::clone(&log);
+        client.on_disconnected(Arc::new(move |_| {
+            log_disc.lock().unwrap().push("disconnected");
+            let _ = done_tx.send(());
+        }));
+
+        client.mark_connected();
+        client.inner.lock().unwrap().handle_connection_closed(None);
+        client.mark_connected();
+        client.inner.lock().unwrap().handle_connection_closed(None);
+
+        for _ in 0..4 {
+            tokio::time::timeout(Duration::from_secs(1), done_rx.recv())
+                .await
+                .expect("lifecycle timeout")
+                .expect("channel open");
+        }
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["connected", "disconnected", "connected", "disconnected"]
+        );
     }
 }

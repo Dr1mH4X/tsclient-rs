@@ -57,6 +57,7 @@ impl AckRateLimiter {
     }
 
     pub fn rollback(&mut self, peer: &str, action: CooldownAction, acquired_at: Instant) {
+        // 仅撤回单对端冷却；全局令牌桶刻意不退还，避免服务端 524/失败响应绕过防洪限流。
         let key = CooldownKey {
             peer: peer.to_string(),
             action,
@@ -282,6 +283,16 @@ impl ProbeQueue {
             return;
         }
         self.probed_uids.insert(uid.to_string());
+        if self.queued_uids.remove(uid) {
+            self.queue.retain(|(_, q_uid)| q_uid != uid);
+        }
+    }
+
+    pub fn forget_uid(&mut self, uid: &str) {
+        if uid.is_empty() {
+            return;
+        }
+        self.probed_uids.remove(uid);
         if self.queued_uids.remove(uid) {
             self.queue.retain(|(_, q_uid)| q_uid != uid);
         }

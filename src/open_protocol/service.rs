@@ -60,8 +60,16 @@ impl OpenProtocolHandle {
         self.state.lock().unwrap().engine.local_commands().cloned()
     }
 
-    pub fn set_commands(&self, commands: Option<BotCommandList>) {
-        self.state.lock().unwrap().engine.set_commands(commands);
+    pub fn set_commands(self: &Arc<Self>, commands: Option<BotCommandList>) {
+        let (epoch, effects) = {
+            let mut guard = self.state.lock().unwrap();
+            let epoch = guard.epoch;
+            let effects = guard
+                .engine
+                .set_commands_and_announce(commands, Instant::now());
+            (epoch, effects)
+        };
+        self.dispatch_effects(epoch, effects);
     }
 
     pub fn announce(self: &Arc<Self>) {
@@ -143,6 +151,9 @@ impl OpenProtocolHandle {
             let Some(client) = client_ref.upgrade() else {
                 return;
             };
+            if client.status() != ClientStatus::Connected {
+                return;
+            }
             let clid = client.client_id();
             if clid > 0 {
                 handle.handle_connected(clid, client.channel_id());
@@ -198,7 +209,12 @@ impl OpenProtocolHandle {
             let Some(handle) = weak_handle.upgrade() else {
                 return;
             };
-            handle.state.lock().unwrap().engine.on_peer_left(ev.id);
+            handle
+                .state
+                .lock()
+                .unwrap()
+                .engine
+                .on_peer_left_with_reason(ev.id, Some(ev.reason_id));
         }));
 
         let weak_handle = Arc::downgrade(handle);
@@ -256,10 +272,17 @@ impl OpenProtocolHandle {
         }));
 
         let weak_handle = Arc::downgrade(handle);
+        let client_ref = weak_client.clone();
         client.on_disconnected(Arc::new(move |_| {
             let Some(handle) = weak_handle.upgrade() else {
                 return;
             };
+            if client_ref
+                .upgrade()
+                .is_some_and(|c| c.status() != ClientStatus::Disconnected)
+            {
+                return;
+            }
             let mut guard = handle.state.lock().unwrap();
             guard.epoch = guard.epoch.wrapping_add(1);
             guard.engine.reset(Instant::now());
@@ -355,6 +378,7 @@ impl OpenProtocolHandle {
             let _ = self.events.send(event);
         }
 
+        let expected_client_epoch = self.client.upgrade().map(|c| c.connection_epoch());
         for cmd in effects.outbound {
             let weak_client = self.client.clone();
             let weak_handle = Arc::downgrade(self);
@@ -362,12 +386,32 @@ impl OpenProtocolHandle {
                 let Some(client) = weak_client.upgrade() else {
                     return;
                 };
+                let Some(handle) = weak_handle.upgrade() else {
+                    return;
+                };
+                let Some(client_epoch) = expected_client_epoch else {
+                    return;
+                };
+                if handle.state.lock().unwrap().epoch != epoch
+                    || client.connection_epoch() != client_epoch
+                {
+                    return;
+                }
                 let result = client
-                    .send_plugin_command(cmd.plugin, &cmd.data, cmd.target, cmd.target_id)
+                    .send_plugin_command_for_epoch(
+                        cmd.plugin,
+                        &cmd.data,
+                        cmd.target,
+                        cmd.target_id,
+                        client_epoch,
+                    )
                     .await;
                 let Some(handle) = weak_handle.upgrade() else {
                     return;
                 };
+                if handle.state.lock().unwrap().epoch != epoch {
+                    return;
+                }
                 let outcome = SendOutcome::from_result(&result);
                 if let Err(err) = result {
                     let _ = handle.events.send(OpenProtocolEvent::SendFailed {
@@ -501,5 +545,98 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_resets_across_multiple_disconnects_and_drops_stale_outbound_commands() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "FlSpeak".to_string(),
+            ClientOptions::default(),
+        );
+        let sent_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
+        client.install_open_protocol_test_transport(Arc::clone(&sent_cmds));
+
+        let config =
+            OpenProtocolConfig::new(PeerIdentity::new(ClientKind::FlSpeak, "FlSpeak", "0.1.14"));
+        let handle = OpenProtocolHandle::attach(&client, config);
+        let mut rx = handle.subscribe();
+
+        // Two full connect -> cache peer -> disconnect cycles: second disconnect must still reset!
+        for _ in 0..2 {
+            client.inject_open_protocol_test_line(
+                7,
+                r#"notifyplugincmd name=tsclient:identity data={"v":1,"action":"announce_ack","client_type":"bot","app_name":"Claw","app_version":"0.5.0"} invokerid=12 invokername=Claw invokeruid=bot-uid"#,
+            );
+            let evt = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("identity event timeout")
+                .expect("event channel open");
+            assert!(matches!(
+                evt,
+                OpenProtocolEvent::PeerIdentityUpdated { .. }
+            ));
+            assert!(handle.peer_identity("bot-uid").is_some());
+
+            client.mark_connected();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            client.disconnect().await.unwrap();
+            assert!(handle.peer_identity("bot-uid").is_none());
+        }
+
+        // Stale outbound command queued before a disconnect/epoch change must not be sent.
+        sent_cmds.lock().unwrap().clear();
+        let stale_epoch = handle.state.lock().unwrap().epoch;
+        handle.query_peer(42, Some("stale-peer"));
+        // Immediately invalidate epoch before the spawned outbound task sends.
+        handle.state.lock().unwrap().epoch += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(sent_cmds.lock().unwrap().is_empty());
+
+        // Silence unused variable warning while ensuring stale_epoch actually advanced.
+        assert_ne!(handle.state.lock().unwrap().epoch, stale_epoch);
+    }
+
+    #[tokio::test]
+    async fn set_commands_reannounces_when_connected() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "ExampleBot".to_string(),
+            ClientOptions::default(),
+        );
+        let sent_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
+        client.install_open_protocol_test_transport(Arc::clone(&sent_cmds));
+
+        let config =
+            OpenProtocolConfig::new(PeerIdentity::new(ClientKind::Bot, "ExampleBot", "0.1.0"));
+        let handle = OpenProtocolHandle::attach(&client, config);
+        handle.handle_connected(7, 5);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sent_cmds.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial announce");
+        sent_cmds.lock().unwrap().clear();
+
+        handle.set_commands(Some(BotCommandList::new(vec![BotCommand::new(
+            "ping",
+            "Ping bot",
+        )])));
+        // Wait past debounce or flush if immediate; set_commands schedules trailing or sends immediately.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while sent_cmds.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("capability update announce");
+        assert!(
+            sent_cmds.lock().unwrap()[0].contains("chat:slash_commands")
+        );
     }
 }

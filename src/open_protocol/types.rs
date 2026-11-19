@@ -148,6 +148,14 @@ impl BotCommandList {
         self.command_prefix = Some(prefix.into());
         self
     }
+
+    /// Returns the effective trigger prefix, defaulting omitted or empty values to `"/"`.
+    pub fn effective_prefix(&self) -> &str {
+        self.command_prefix
+            .as_deref()
+            .filter(|prefix| !prefix.is_empty())
+            .unwrap_or("/")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

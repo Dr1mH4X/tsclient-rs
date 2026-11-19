@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use crate::types::{PluginCommandEvent, PluginCommandTarget};
@@ -13,10 +13,12 @@ use super::limiter::{
     ProbeQueue, QueryRateLimiter,
 };
 use super::types::{
-    BotCommandList, COMMANDS_PLUGIN, ClientKind, CooldownAction, EngineEffects, IDENTITY_PLUGIN,
-    OpenProtocolConfig, OpenProtocolEvent, OutboundPluginCommand, PeerIdentity,
-    SELF_ANNOUNCE_RETRY_DELAY, SendOutcome, SendReceipt, TimerRequest, TimerToken,
+    BotCommandList, CAP_CHAT_SLASH_COMMANDS, COMMANDS_PLUGIN, ClientKind, CooldownAction,
+    EngineEffects, IDENTITY_PLUGIN, OpenProtocolConfig, OpenProtocolEvent, OutboundPluginCommand,
+    PeerIdentity, SELF_ANNOUNCE_RETRY_DELAY, SendOutcome, SendReceipt, TimerRequest, TimerToken,
 };
+
+const MAX_CACHED_PEERS: usize = 1024;
 
 /// 纯同步、无 IO 的 OpenProtocol 协议引擎，可嵌入单线程 Actor 或被异步托管层驱动。
 pub struct OpenProtocolEngine {
@@ -29,6 +31,8 @@ pub struct OpenProtocolEngine {
     query_limiter: QueryRateLimiter,
     inflight_commands: InflightCommands,
     probe_queue: ProbeQueue,
+    clid_to_uid: HashMap<i32, String>,
+    cached_peer_order: VecDeque<String>,
     peer_identities: HashMap<String, PeerIdentity>,
     peer_commands: HashMap<String, BotCommandList>,
 }
@@ -55,6 +59,8 @@ impl OpenProtocolEngine {
                 probe_initial_delay,
                 max_auto_discover_peers,
             ),
+            clid_to_uid: HashMap::new(),
+            cached_peer_order: VecDeque::new(),
             peer_identities: HashMap::new(),
             peer_commands: HashMap::new(),
         }
@@ -70,6 +76,21 @@ impl OpenProtocolEngine {
 
     pub fn set_commands(&mut self, commands: Option<BotCommandList>) {
         self.config.commands = commands.map(sanitize_bot_command_list);
+    }
+
+    pub fn set_commands_and_announce(
+        &mut self,
+        commands: Option<BotCommandList>,
+        now: Instant,
+    ) -> EngineEffects {
+        let prev_identity = self.effective_identity();
+        self.set_commands(commands);
+        let next_identity = self.effective_identity();
+        if prev_identity != next_identity && self.self_channel_id != 0 {
+            self.begin_announce(AnnounceAttemptMode::Normal, true, now)
+        } else {
+            EngineEffects::default()
+        }
     }
 
     pub fn self_client_id(&self) -> Option<i32> {
@@ -136,6 +157,11 @@ impl OpenProtocolEngine {
         peers: &[(i32, &str, u64)],
         now: Instant,
     ) -> EngineEffects {
+        for &(clid, uid, _) in peers {
+            if clid > 0 && !uid.is_empty() && self.self_clid != Some(clid) {
+                self.clid_to_uid.insert(clid, uid.to_string());
+            }
+        }
         let mut effects = EngineEffects::default();
         if !self.config.auto_discover_peers || self.self_clid.is_none() {
             return effects;
@@ -153,6 +179,9 @@ impl OpenProtocolEngine {
     }
 
     pub fn on_peer_joined(&mut self, clid: i32, uid: &str, now: Instant) -> EngineEffects {
+        if clid > 0 && !uid.is_empty() && self.self_clid != Some(clid) {
+            self.clid_to_uid.insert(clid, uid.to_string());
+        }
         let mut effects = EngineEffects::default();
         if !self.config.auto_discover_peers || self.self_clid.is_none() {
             return effects;
@@ -167,7 +196,19 @@ impl OpenProtocolEngine {
     }
 
     pub fn on_peer_left(&mut self, clid: i32) {
+        self.on_peer_left_with_reason(clid, None);
+    }
+
+    /// 处理成员离开视图通知：总是移出探测队列；当 `reason_id` 为整服离开
+    /// （3=掉线/超时、5=踢出服务器、6=封禁、8=主动断开）且无其他在线分身时，清理缓存。
+    pub fn on_peer_left_with_reason(&mut self, clid: i32, reason_id: Option<i32>) {
         self.probe_queue.remove_clid(clid);
+        if matches!(reason_id, Some(3 | 5 | 6 | 8))
+            && let Some(uid) = self.clid_to_uid.remove(&clid)
+            && !self.clid_to_uid.values().any(|other| other == &uid)
+        {
+            self.evict_peer_cache(&uid);
+        }
     }
 
     pub fn announce_now(&mut self, now: Instant) -> EngineEffects {
@@ -217,6 +258,10 @@ impl OpenProtocolEngine {
         } else {
             resolved_uid.filter(|u| !u.is_empty()).unwrap_or("")
         };
+        if !peer_uid.is_empty() && event.invoker_id > 0 {
+            self.clid_to_uid
+                .insert(event.invoker_id, peer_uid.to_string());
+        }
         let cooldown_key = if !peer_uid.is_empty() {
             peer_uid.to_string()
         } else {
@@ -283,6 +328,7 @@ impl OpenProtocolEngine {
                     if self.config.cache_peers {
                         self.peer_commands
                             .insert(peer_uid.to_string(), list.clone());
+                        self.track_cached_peer(peer_uid);
                     }
                 }
                 effects.events.push(OpenProtocolEvent::PeerCommandsUpdated {
@@ -425,6 +471,8 @@ impl OpenProtocolEngine {
         self.self_clid = None;
         self.self_channel_id = 0;
         self.server_beacon_sent = false;
+        self.clid_to_uid.clear();
+        self.cached_peer_order.clear();
         self.peer_identities.clear();
         self.peer_commands.clear();
         self.announce_state.reset();
@@ -562,8 +610,13 @@ impl OpenProtocolEngine {
         if !peer_uid.is_empty() {
             self.probe_queue.mark_discovered(peer_uid);
             if self.config.cache_peers {
+                let changed = self.peer_identities.get(peer_uid) != Some(&identity);
+                if changed || !identity.has_capability(CAP_CHAT_SLASH_COMMANDS) {
+                    self.peer_commands.remove(peer_uid);
+                }
                 self.peer_identities
                     .insert(peer_uid.to_string(), identity.clone());
+                self.track_cached_peer(peer_uid);
             }
         }
         effects.events.push(OpenProtocolEvent::PeerIdentityUpdated {
@@ -571,6 +624,27 @@ impl OpenProtocolEngine {
             clid,
             identity,
         });
+    }
+
+    fn track_cached_peer(&mut self, peer_uid: &str) {
+        if !self.cached_peer_order.iter().any(|uid| uid == peer_uid) {
+            self.cached_peer_order.push_back(peer_uid.to_string());
+        }
+        while self.cached_peer_order.len() > MAX_CACHED_PEERS {
+            let Some(oldest) = self.cached_peer_order.pop_front() else {
+                break;
+            };
+            self.peer_identities.remove(&oldest);
+            self.peer_commands.remove(&oldest);
+        }
+    }
+
+    fn evict_peer_cache(&mut self, peer_uid: &str) {
+        self.peer_identities.remove(peer_uid);
+        self.peer_commands.remove(peer_uid);
+        self.cached_peer_order.retain(|uid| uid != peer_uid);
+        self.inflight_commands.complete(peer_uid);
+        self.probe_queue.forget_uid(peer_uid);
     }
 }
 
@@ -830,5 +904,54 @@ mod tests {
                 .outbound
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn peer_leave_evicts_server_departures_but_keeps_view_exits_and_reannounces_on_cmd_change() {
+        let t0 = Instant::now();
+        let mut engine = OpenProtocolEngine::new(bot_config(), t0);
+        engine.on_connected(3, 1, t0);
+
+        let peer_announce = PluginCommandEvent {
+            name: IDENTITY_PLUGIN.to_string(),
+            data: serde_json::json!({
+                "v": 1,
+                "action": "announce",
+                "client_type": "bot",
+                "app_name": "PeerBot",
+                "app_version": "1.0.0",
+                "capabilities": [CAP_CHAT_SLASH_COMMANDS]
+            })
+            .to_string(),
+            invoker_id: 20,
+            invoker_name: "PeerBot".to_string(),
+            invoker_uid: "peer-uid".to_string(),
+        };
+        engine.on_plugin_command(&peer_announce, None, t0);
+        let list_ack = PluginCommandEvent {
+            name: COMMANDS_PLUGIN.to_string(),
+            data: r#"{"v":1,"action":"list_ack","commands":[{"name":"help"}]}"#.to_string(),
+            invoker_id: 20,
+            invoker_name: "PeerBot".to_string(),
+            invoker_uid: "peer-uid".to_string(),
+        };
+        engine.on_plugin_command(&list_ack, None, t0);
+        assert!(engine.peer_identity("peer-uid").is_some());
+        assert!(engine.peer_commands("peer-uid").is_some());
+
+        // Moving to an unsubscribed channel (reason 1) keeps cached identity & commands.
+        engine.on_peer_left_with_reason(20, Some(1));
+        assert!(engine.peer_identity("peer-uid").is_some());
+        assert!(engine.peer_commands("peer-uid").is_some());
+
+        // Leaving the server (reason 8) evicts both identity & command caches.
+        engine.on_peer_left_with_reason(20, Some(8));
+        assert!(engine.peer_identity("peer-uid").is_none());
+        assert!(engine.peer_commands("peer-uid").is_none());
+
+        // Removing slash commands while connected re-announces updated capability state.
+        let eff = engine.set_commands_and_announce(None, t0 + Duration::from_secs(3));
+        assert_eq!(eff.outbound.len(), 1);
+        assert!(!eff.outbound[0].data.contains(CAP_CHAT_SLASH_COMMANDS));
     }
 }

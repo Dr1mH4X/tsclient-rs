@@ -10,6 +10,10 @@ use super::types::{
     MAX_IDENTITY_FIELD_CHARS, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION, PeerIdentity,
 };
 
+/// Maximum length of the `" return_code=<i32>"` suffix appended by `exec_command_parts`
+/// (`" return_code=-2147483648".len() == 24`).
+const MAX_RETURN_CODE_SUFFIX_BYTES: usize = 24;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IdentityWirePayload {
     v: u32,
@@ -201,7 +205,7 @@ pub fn wire_command_len(
         .map(|line| line.len())
 }
 
-/// 判断 JSON 原文与 TS3 转义后线缆命令是否均严格小于 `MAX_PAYLOAD_BYTES` (1024)。
+/// 判断 JSON 原文与附加 `return_code` 后的 TS3 转义线缆命令是否均严格小于 `MAX_PAYLOAD_BYTES` (1024)。
 pub fn fits_wire_budget(
     plugin: &str,
     data: &str,
@@ -211,7 +215,8 @@ pub fn fits_wire_budget(
     if data.len() >= MAX_PAYLOAD_BYTES {
         return false;
     }
-    wire_command_len(plugin, data, target, target_id).is_some_and(|len| len < MAX_PAYLOAD_BYTES)
+    wire_command_len(plugin, data, target, target_id)
+        .is_some_and(|len| len + MAX_RETURN_CODE_SUFFIX_BYTES < MAX_PAYLOAD_BYTES)
 }
 
 pub(crate) fn encode_identity_announce(
@@ -234,6 +239,25 @@ pub(crate) fn encode_identity_ack(identity: &PeerIdentity, target_id: i32) -> Op
     )
 }
 
+fn pop_last_char(s: &mut String) -> bool {
+    s.pop().is_some()
+}
+
+fn drop_excess_capability(caps: &mut Vec<String>) -> bool {
+    if let Some(pos) = caps
+        .iter()
+        .rposition(|cap| cap != CAP_CHAT_SLASH_COMMANDS)
+    {
+        caps.remove(pos);
+        true
+    } else if !caps.is_empty() {
+        caps.pop();
+        true
+    } else {
+        false
+    }
+}
+
 fn encode_identity_payload(
     action: &str,
     identity: &PeerIdentity,
@@ -242,7 +266,7 @@ fn encode_identity_payload(
     target_id: Option<i32>,
 ) -> Option<String> {
     let sanitized = sanitize_identity(identity);
-    let payload = IdentityWirePayload {
+    let mut payload = IdentityWirePayload {
         v: PROTOCOL_VERSION,
         action: action.to_string(),
         client_type: sanitized.client_type.as_str().to_string(),
@@ -251,8 +275,24 @@ fn encode_identity_payload(
         capabilities: sanitized.capabilities,
         noreply: action == "announce" && noreply,
     };
-    let json = serde_json::to_string(&payload).ok()?;
-    fits_wire_budget(IDENTITY_PLUGIN, &json, target, target_id).then_some(json)
+
+    loop {
+        let json = serde_json::to_string(&payload).ok()?;
+        if fits_wire_budget(IDENTITY_PLUGIN, &json, target, target_id) {
+            return Some(json);
+        }
+        if drop_excess_capability(&mut payload.capabilities)
+            || pop_last_char(&mut payload.app_version)
+            || pop_last_char(&mut payload.app_name)
+        {
+            continue;
+        }
+        if payload.client_type != "custom" {
+            payload.client_type = "custom".to_string();
+            continue;
+        }
+        return None;
+    }
 }
 
 pub(crate) fn encode_query_message() -> String {
@@ -345,12 +385,14 @@ pub fn parse_inbound_message(plugin: &str, data: &str) -> Option<InboundMessage>
                             desc: cmd.desc,
                         })
                         .collect();
-                    Some(InboundMessage::CommandsListAck(sanitize_bot_command_list(
-                        BotCommandList {
-                            command_prefix: payload.command_prefix,
-                            commands,
-                        },
-                    )))
+                    let mut list = sanitize_bot_command_list(BotCommandList {
+                        command_prefix: payload.command_prefix,
+                        commands,
+                    });
+                    if list.command_prefix.is_none() {
+                        list.command_prefix = Some("/".to_string());
+                    }
+                    Some(InboundMessage::CommandsListAck(list))
                 }
                 _ => None,
             }
@@ -448,6 +490,20 @@ mod tests {
         assert_eq!(list.commands[1].name, "play");
         assert_eq!(list.commands[1].args.as_deref(), Some("<song>"));
         assert_eq!(list.commands[1].desc, "Playsong");
+
+        // Omitted or empty command_prefix defaults to "/" on decode.
+        for raw in [
+            r#"{"v":1,"action":"list_ack","commands":[{"name":"ping"}]}"#,
+            r#"{"v":1,"action":"list_ack","command_prefix":"  ","commands":[{"name":"ping"}]}"#,
+        ] {
+            let Some(InboundMessage::CommandsListAck(decoded)) =
+                parse_inbound_message(COMMANDS_PLUGIN, raw)
+            else {
+                panic!("expected CommandsListAck");
+            };
+            assert_eq!(decoded.command_prefix.as_deref(), Some("/"));
+            assert_eq!(decoded.effective_prefix(), "/");
+        }
     }
 
     #[test]
@@ -460,12 +516,19 @@ mod tests {
             .collect();
         let list = BotCommandList::new(many_spaced).with_prefix("!");
         let json = encode_commands_ack(&list, 65535).expect("fits after trimming");
-        assert!(fits_wire_budget(
+        let wire = build_plugin_command_line(
             COMMANDS_PLUGIN,
             &json,
             PluginCommandTarget::Client,
             Some(65535),
-        ));
+        )
+        .expect("valid wire line");
+        let sent_line = crate::commands::append_return_code(&wire, i32::MAX);
+        assert!(
+            sent_line.len() < MAX_PAYLOAD_BYTES,
+            "escaped wire line with return_code must stay < 1024, got {}",
+            sent_line.len()
+        );
         let Some(InboundMessage::CommandsListAck(decoded)) =
             parse_inbound_message(COMMANDS_PLUGIN, &json)
         else {
@@ -473,6 +536,83 @@ mod tests {
         };
         assert!(!decoded.commands.is_empty());
         assert!(decoded.commands.len() < 16);
+
+        // Raw JSON under 1024 bytes that expands past 1024 after TS3 escaping must also trim.
+        let escape_heavy: Vec<BotCommand> = (0..9)
+            .map(|i| BotCommand::new(format!("c{i}"), " /|".repeat(20)))
+            .collect();
+        let escape_list = BotCommandList::new(escape_heavy);
+        let raw_full = serde_json::to_string(&CommandsWirePayload {
+            v: PROTOCOL_VERSION,
+            action: "list_ack".to_string(),
+            command_prefix: None,
+            commands: escape_list
+                .commands
+                .iter()
+                .map(|c| BotCommandWire {
+                    name: c.name.clone(),
+                    args: c.args.clone(),
+                    desc: c.desc.clone(),
+                })
+                .collect(),
+        })
+        .unwrap();
+        assert!(raw_full.len() < MAX_PAYLOAD_BYTES);
+        let escaped_full = build_plugin_command_line(
+            COMMANDS_PLUGIN,
+            &raw_full,
+            PluginCommandTarget::Client,
+            Some(65535),
+        )
+        .unwrap();
+        assert!(escaped_full.len() >= MAX_PAYLOAD_BYTES);
+
+        let trimmed_json = encode_commands_ack(&escape_list, 65535).expect("trimmed escape-heavy");
+        let trimmed_wire = build_plugin_command_line(
+            COMMANDS_PLUGIN,
+            &trimmed_json,
+            PluginCommandTarget::Client,
+            Some(65535),
+        )
+        .unwrap();
+        assert!(crate::commands::append_return_code(&trimmed_wire, i32::MAX).len() < MAX_PAYLOAD_BYTES);
+        let Some(InboundMessage::CommandsListAck(trimmed_decoded)) =
+            parse_inbound_message(COMMANDS_PLUGIN, &trimmed_json)
+        else {
+            panic!("expected decoded trimmed escape-heavy ack");
+        };
+        assert!(!trimmed_decoded.commands.is_empty());
+        assert!(trimmed_decoded.commands.len() < 9);
+    }
+
+    #[test]
+    fn oversized_identity_trims_to_wire_budget_preserving_slash_command_cap() {
+        let mut caps: Vec<String> = (0..15)
+            .map(|i| format!("{i:02}_") + &"/".repeat(29))
+            .collect();
+        caps.push(CAP_CHAT_SLASH_COMMANDS.to_string());
+        let oversized = PeerIdentity::new(
+            ClientKind::Bot,
+            "🚀".repeat(32),
+            "\\".repeat(32),
+        )
+        .with_capabilities(caps);
+
+        let ack = encode_identity_ack(&oversized, 65535).expect("trims to fit wire budget");
+        let wire = build_plugin_command_line(
+            IDENTITY_PLUGIN,
+            &ack,
+            PluginCommandTarget::Client,
+            Some(65535),
+        )
+        .unwrap();
+        assert!(crate::commands::append_return_code(&wire, i32::MAX).len() < MAX_PAYLOAD_BYTES);
+        let Some(InboundMessage::IdentityAnnounceAck(decoded)) =
+            parse_inbound_message(IDENTITY_PLUGIN, &ack)
+        else {
+            panic!("expected decoded IdentityAnnounceAck");
+        };
+        assert!(decoded.has_capability(CAP_CHAT_SLASH_COMMANDS));
     }
 
     #[test]
