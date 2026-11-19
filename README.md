@@ -30,6 +30,7 @@ Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.co
 - **Address resolution** — SRV records, TSDNS, and direct address support
 - **Middleware** — Pluggable command and event middleware chains
 - **Built-in rate limiter** — Token-bucket throttling to prevent server-side flood kicks
+- **OpenProtocol (`open-protocol` feature)** — Optional typed identity & bot slash command discovery with rate limiting and wire-budget checks
 - **Identity management** — Generate, import/export identities
 - **Zero unsafe code** — Pure safe Rust, no `unsafe` blocks
 - **Async-native** — Built on `tokio` with proper async cancellation and graceful shutdown

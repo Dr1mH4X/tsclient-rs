@@ -1400,69 +1400,15 @@ impl Client {
         cmd: &str,
         timeout_ms: u64,
     ) -> Result<Vec<HashMap<String, String>>, Error> {
-        if cmd
-            .split_whitespace()
-            .any(|part| part.starts_with("return_code="))
-        {
-            return Err(Error::Teamspeak(
-                "return_code is managed by the client".into(),
-            ));
-        }
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        for refused in 0..=3 {
-            let mut registered = None;
-            let mut sent = false;
-            let attempt = async {
-                let mut throttle = self.throttle.lock().await;
-                throttle.wait(None).await?;
-                let (rc, rx) = self.inner.lock().unwrap().cmd_track.register_command(cmd);
-                registered = Some(rc);
-                self.logger.debug(
-                    &format!(
-                        "command {} awaiting response rc={rc}",
-                        cmd.split_whitespace().next().unwrap_or("")
-                    ),
-                    &[],
-                );
-                let handler = self.final_cmd_handler.lock().unwrap().clone();
-                handler(commands::append_return_code(cmd, rc)).await?;
-                sent = true;
-                drop(throttle);
-                rx.await
-                    .map_err(|_| Error::Teamspeak("command channel closed".into()))
-            };
-            let result = tokio::time::timeout_at(deadline, attempt).await;
-            if let Some(rc) = registered {
-                let mut inner = self.inner.lock().unwrap();
-                if sent {
-                    inner.cmd_track.unregister(rc);
-                } else {
-                    inner.cmd_track.discard_unsent(rc);
-                }
-            }
-            let result = result.map_err(|_| Error::CommandTimeout {
-                command: cmd.split_whitespace().next().unwrap_or("").to_string(),
-            })??;
-            if let Some(error) = result.err {
-                if let Some(delay) = error.flood_retry_delay() {
-                    // Match the reference client's recovery margin; only an explicit refusal is retried.
-                    let hold = delay.saturating_mul(2);
-                    self.logger.debug(
-                        &format!("server requested command pause: {}ms", delay.as_millis()),
-                        &[],
-                    );
-                    if refused < 3
-                        && hold < deadline.saturating_duration_since(tokio::time::Instant::now())
-                    {
-                        self.throttle.lock().await.hold(hold);
-                        continue;
-                    }
-                }
-                return Err(error);
-            }
-            return Ok(result.data);
-        }
-        unreachable!("bounded retries return on the final attempt")
+        exec_command_parts(
+            &self.inner,
+            &self.throttle,
+            &self.final_cmd_handler,
+            &*self.logger,
+            cmd,
+            timeout_ms,
+        )
+        .await
     }
 
     // ---- Events ---------------------------------------------------------------
@@ -1896,6 +1842,180 @@ impl Client {
         *self.final_cmd_handler.lock().unwrap() =
             Self::build_cmd_handler_simple(&self.inner.lock().unwrap().cmd_middlewares, &sender);
     }
+
+    #[cfg(feature = "open-protocol")]
+    pub(crate) fn weak_handle(&self) -> ClientWeak {
+        ClientWeak {
+            inner: Arc::downgrade(&self.inner),
+            throttle: Arc::downgrade(&self.throttle),
+            final_cmd_handler: Arc::downgrade(&self.final_cmd_handler),
+            logger: Arc::downgrade(&self.logger),
+        }
+    }
+
+    #[cfg(all(test, feature = "open-protocol"))]
+    pub(crate) fn install_open_protocol_test_transport(&self, seen_cmds: Arc<Mutex<Vec<String>>>) {
+        let inner = Arc::downgrade(&self.inner);
+        *self.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            seen_cmds.lock().unwrap().push(line.clone());
+            let rc = line.split("return_code=").last().unwrap().parse().unwrap();
+            if let Some(inner) = inner.upgrade() {
+                inner.lock().unwrap().cmd_track.resolve(rc, None);
+            }
+            Box::pin(async { Ok(()) })
+        });
+    }
+
+    #[cfg(all(test, feature = "open-protocol"))]
+    pub(crate) fn inject_open_protocol_test_line(&self, clid: i32, line: &str) {
+        let sender = self.handler.lock().unwrap().create_packet_sender();
+        let mut inner = self.inner.lock().unwrap();
+        inner.clid = clid;
+        inner.handle_command_str(line, &sender);
+    }
+}
+
+#[cfg(feature = "open-protocol")]
+#[derive(Clone)]
+pub(crate) struct ClientWeak {
+    inner: std::sync::Weak<Mutex<ClientInner>>,
+    throttle: std::sync::Weak<tokio::sync::Mutex<CommandThrottle>>,
+    final_cmd_handler: std::sync::Weak<Mutex<CommandHandler>>,
+    logger: std::sync::Weak<dyn Logger>,
+}
+
+#[cfg(feature = "open-protocol")]
+impl ClientWeak {
+    pub(crate) fn upgrade(&self) -> Option<ClientHandle> {
+        Some(ClientHandle {
+            inner: self.inner.upgrade()?,
+            throttle: self.throttle.upgrade()?,
+            final_cmd_handler: self.final_cmd_handler.upgrade()?,
+            logger: self.logger.upgrade()?,
+        })
+    }
+}
+
+#[cfg(feature = "open-protocol")]
+pub(crate) struct ClientHandle {
+    inner: Arc<Mutex<ClientInner>>,
+    throttle: Arc<tokio::sync::Mutex<CommandThrottle>>,
+    final_cmd_handler: Arc<Mutex<CommandHandler>>,
+    logger: Arc<dyn Logger>,
+}
+
+#[cfg(feature = "open-protocol")]
+impl ClientHandle {
+    pub(crate) fn client_id(&self) -> i32 {
+        self.inner.lock().unwrap().clid
+    }
+
+    pub(crate) fn channel_id(&self) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .directory
+            .client(inner.clid)
+            .map(|info| info.channel_id)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn directory_snapshot(&self) -> Option<DirectorySnapshot> {
+        let inner = self.inner.lock().unwrap();
+        inner.directory_ready.then(|| inner.directory.snapshot())
+    }
+
+    pub(crate) async fn send_plugin_command(
+        &self,
+        name: &str,
+        data: &str,
+        target: PluginCommandTarget,
+        target_id: Option<i32>,
+    ) -> Result<(), Error> {
+        let cmd = crate::api::build_plugin_command_line(name, data, target, target_id)?;
+        exec_command_parts(
+            &self.inner,
+            &self.throttle,
+            &self.final_cmd_handler,
+            &*self.logger,
+            &cmd,
+            crate::api::CMD_TIMEOUT_MS,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+async fn exec_command_parts(
+    inner_arc: &Arc<Mutex<ClientInner>>,
+    throttle_arc: &Arc<tokio::sync::Mutex<CommandThrottle>>,
+    final_cmd_handler_arc: &Arc<Mutex<CommandHandler>>,
+    logger: &dyn Logger,
+    cmd: &str,
+    timeout_ms: u64,
+) -> Result<Vec<HashMap<String, String>>, Error> {
+    if cmd
+        .split_whitespace()
+        .any(|part| part.starts_with("return_code="))
+    {
+        return Err(Error::Teamspeak(
+            "return_code is managed by the client".into(),
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    for refused in 0..=3 {
+        let mut registered = None;
+        let mut sent = false;
+        let attempt = async {
+            let mut throttle = throttle_arc.lock().await;
+            throttle.wait(None).await?;
+            let (rc, rx) = inner_arc.lock().unwrap().cmd_track.register_command(cmd);
+            registered = Some(rc);
+            logger.debug(
+                &format!(
+                    "command {} awaiting response rc={rc}",
+                    cmd.split_whitespace().next().unwrap_or("")
+                ),
+                &[],
+            );
+            let handler = final_cmd_handler_arc.lock().unwrap().clone();
+            handler(commands::append_return_code(cmd, rc)).await?;
+            sent = true;
+            drop(throttle);
+            rx.await
+                .map_err(|_| Error::Teamspeak("command channel closed".into()))
+        };
+        let result = tokio::time::timeout_at(deadline, attempt).await;
+        if let Some(rc) = registered {
+            let mut inner = inner_arc.lock().unwrap();
+            if sent {
+                inner.cmd_track.unregister(rc);
+            } else {
+                inner.cmd_track.discard_unsent(rc);
+            }
+        }
+        let result = result.map_err(|_| Error::CommandTimeout {
+            command: cmd.split_whitespace().next().unwrap_or("").to_string(),
+        })??;
+        if let Some(error) = result.err {
+            if let Some(delay) = error.flood_retry_delay() {
+                // Match the reference client's recovery margin; only an explicit refusal is retried.
+                let hold = delay.saturating_mul(2);
+                logger.debug(
+                    &format!("server requested command pause: {}ms", delay.as_millis()),
+                    &[],
+                );
+                if refused < 3
+                    && hold < deadline.saturating_duration_since(tokio::time::Instant::now())
+                {
+                    throttle_arc.lock().await.hold(hold);
+                    continue;
+                }
+            }
+            return Err(error);
+        }
+        return Ok(result.data);
+    }
+    unreachable!("bounded retries return on the final attempt")
 }
 
 // ---- Free functions -----------------------------------------------------------

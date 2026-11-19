@@ -19,9 +19,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
-      - run: cargo test
-      - run: cargo clippy -- -D warnings
+      - run: cargo check --all-targets --all-features
+      - run: cargo test --all-features
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')

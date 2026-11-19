@@ -196,6 +196,37 @@ client.on_plugin_command(Arc::new(|event| {
 }));
 ```
 
+## OpenProtocol（`open-protocol` feature）
+
+运行完整示例：`cargo run --example open_protocol_bot --features open-protocol`
+
+```rust
+use tsclient_rs::open_protocol::{
+    BotCommand, BotCommandList, ClientKind, OpenProtocolConfig, OpenProtocolHandle, PeerIdentity,
+};
+use tsclient_rs::{Client, ClientOptions, generateIdentity};
+
+let mut client = Client::new(
+    generateIdentity(8),
+    "127.0.0.1:9987".to_string(),
+    "OpenProtocolBot".to_string(),
+    ClientOptions::default(),
+);
+
+let config = OpenProtocolConfig::new(PeerIdentity::new(
+    ClientKind::Bot,
+    "ExampleBot",
+    env!("CARGO_PKG_VERSION"),
+))
+.with_commands(
+    BotCommandList::new(vec![BotCommand::new("ping", "Ping bot")]).with_prefix("!"),
+);
+
+let open_protocol = OpenProtocolHandle::attach(&client, config);
+client.connect().await?;
+client.wait_connected(None).await?;
+```
+
 ## File Transfer Example
 
 ```rust

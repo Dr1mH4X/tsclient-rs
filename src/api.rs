@@ -10,19 +10,18 @@ use crate::helpers;
 use crate::types::*;
 
 /// Default timeout (ms) for commands that modify server state.
-const CMD_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const CMD_TIMEOUT_MS: u64 = 10_000;
 
 /// Shorter timeout (ms) for read-only queries.
 const QUERY_TIMEOUT_MS: u64 = 5_000;
 
-/// Send a plugin command to clients in the channel (0), server (1), or a specific client (2).
-pub async fn send_plugin_command(
-    client: &Client,
+/// Build the raw escaped `plugincmd` wire line without sending it.
+pub(crate) fn build_plugin_command_line(
     name: &str,
     data: &str,
     target: PluginCommandTarget,
     target_id: Option<i32>,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let mode_str = (target as i32).to_string();
     let target_id_str;
     let mut params = vec![
@@ -48,7 +47,18 @@ pub async fn send_plugin_command(
             }
         }
     }
-    let cmd = build_command_ordered("plugincmd", &params);
+    Ok(build_command_ordered("plugincmd", &params))
+}
+
+/// Send a plugin command to clients in the channel (0), server (1), or a specific client (2).
+pub async fn send_plugin_command(
+    client: &Client,
+    name: &str,
+    data: &str,
+    target: PluginCommandTarget,
+    target_id: Option<i32>,
+) -> Result<(), Error> {
+    let cmd = build_plugin_command_line(name, data, target, target_id)?;
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 

@@ -6,11 +6,17 @@ license = "MIT"
 repository = "https://github.com/dreamhax/tsclient-rs"
 edition = "2024"
 
+[features]
+default = []
+open-protocol = ["dep:serde", "dep:serde_json"]
+
 [dependencies]
 thiserror = "2"
 bytes = "1"
 tokio = { version = "1", features = ["net", "time", "rt", "macros", "sync"] }
 async-trait = "0.1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # crypto
 aes = "0.8"
@@ -39,3 +45,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # logging
 tracing = "0.1"
+
+[[example]]
+name = "open_protocol_bot"
+required-features = ["open-protocol"]
