@@ -82,8 +82,16 @@ async fn main() -> Result<(), tsclient_rs::Error> {
     // Receive voice data
     client.on_voice_data(Arc::new(|event| {
         if let Event::VoiceData(ref vd) = event {
-            println!("Voice from client {}, codec: {}", vd.client_id, vd.codec);
-            // vd.data contains Opus-encoded audio frames
+            println!(
+                "Voice from client {}, seq: {}, codec: {}, whisper: {}, bytes: {}, at: {:?}",
+                vd.client_id,
+                vd.seq,
+                vd.codec,
+                vd.whisper,
+                vd.data.len(),
+                vd.received_at,
+            );
+            // vd.data contains Opus-encoded audio frames (empty on end-of-speech tail frame)
         }
     }));
 
