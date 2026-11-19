@@ -22,6 +22,7 @@ use super::traffic::{
 
 const MAX_OUT_PACKET_SIZE: usize = 500;
 const RECEIVE_PACKET_WINDOW_SIZE: u32 = 1024;
+const UNACKED_RECEIVE_WINDOW_SIZE: u32 = 1 << 15;
 const PING_INTERVAL_MS: u64 = 5000;
 const PACKET_TIMEOUT_MS: u64 = 60000;
 const MAX_RETRY_INTERVAL_MS: u64 = 1000;
@@ -52,6 +53,8 @@ struct HandlerCore {
     generation_counter: [u32; 9],
     recv_window_command: GenerationWindow,
     recv_window_command_low: GenerationWindow,
+    recv_window_voice: GenerationWindow,
+    recv_window_voice_whisper: GenerationWindow,
     send_window_command: GenerationWindow,
     send_window_command_low: GenerationWindow,
     command_queue: HashMap<u16, Packet>,
@@ -84,7 +87,7 @@ impl HandlerCore {
         let p_gen = self.generation_counter[p_type as usize];
 
         if p_type != PacketType::Init1 {
-            self.packet_counter[p_type as usize] = (p_id + 1) & 0xffff;
+            self.packet_counter[p_type as usize] = p_id.wrapping_add(1);
             if self.packet_counter[p_type as usize] == 0 {
                 self.generation_counter[p_type as usize] =
                     self.generation_counter[p_type as usize].wrapping_add(1);
@@ -237,6 +240,48 @@ fn send_fragmented(
     }
 }
 
+fn send_voice(
+    core: &Arc<Mutex<HandlerCore>>,
+    send_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    data: Vec<u8>,
+    codec: i32,
+) {
+    let Some(tx) = send_tx.lock().unwrap().clone() else {
+        return;
+    };
+
+    let final_bytes = {
+        let mut core = core.lock().unwrap();
+        if core.closed {
+            return;
+        }
+
+        let p_id = core.packet_counter[PacketType::Voice as usize];
+        core.packet_counter[PacketType::Voice as usize] = p_id.wrapping_add(1);
+        if core.packet_counter[PacketType::Voice as usize] == 0 {
+            core.generation_counter[PacketType::Voice as usize] =
+                core.generation_counter[PacketType::Voice as usize].wrapping_add(1);
+        }
+
+        let payload_len = VOICE_HEADER_SIZE + data.len();
+        let mut voice_payload = vec![0u8; payload_len];
+        voice_payload[..2].copy_from_slice(&p_id.to_be_bytes());
+        voice_payload[2] = codec as u8;
+        voice_payload[VOICE_HEADER_SIZE..].copy_from_slice(&data);
+
+        let type_flagged = (PacketType::Voice as u8) | PacketFlags::Unencrypted;
+        let header = build_c2s_header_raw(p_id, core.client_id, type_flagged);
+
+        let mut final_bytes = Vec::with_capacity(TAG_SIZE + HEADER_SIZE + payload_len);
+        final_bytes.extend_from_slice(&core.crypt.fake_signature);
+        final_bytes.extend_from_slice(&header);
+        final_bytes.extend_from_slice(&voice_payload);
+        final_bytes
+    };
+
+    let _ = tx.send(final_bytes);
+}
+
 // ---- PacketSender (lightweight handle for bg tasks) --------------------------
 
 /// A lightweight handle that can send packets, cloned for background tasks.
@@ -257,32 +302,7 @@ impl PacketSender {
     }
 
     pub fn send_voice_packet(&self, data: Vec<u8>, codec: i32) {
-        let mut core = self.core.lock().unwrap();
-
-        let p_id = core.packet_counter[PacketType::Voice as usize];
-        core.packet_counter[PacketType::Voice as usize] = (p_id + 1) & 0xffff;
-        if core.packet_counter[PacketType::Voice as usize] == 0 {
-            core.generation_counter[PacketType::Voice as usize] =
-                core.generation_counter[PacketType::Voice as usize].wrapping_add(1);
-        }
-
-        let payload_len = VOICE_HEADER_SIZE + data.len();
-        let mut voice_payload = vec![0u8; payload_len];
-        voice_payload[..2].copy_from_slice(&p_id.to_be_bytes());
-        voice_payload[2] = codec as u8;
-        voice_payload[VOICE_HEADER_SIZE..].copy_from_slice(&data);
-
-        let type_flagged = (PacketType::Voice as u8) | PacketFlags::Unencrypted;
-        let header = build_c2s_header_raw(p_id, core.client_id, type_flagged);
-
-        let mut final_bytes = Vec::with_capacity(TAG_SIZE + HEADER_SIZE + payload_len);
-        final_bytes.extend_from_slice(&core.crypt.fake_signature);
-        final_bytes.extend_from_slice(&header);
-        final_bytes.extend_from_slice(&voice_payload);
-
-        if let Some(tx) = self.send_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(final_bytes);
-        }
+        send_voice(&self.core, &self.send_tx, data, codec);
     }
 
     pub fn set_client_id(&self, id: i32) {
@@ -375,6 +395,11 @@ impl PacketHandler {
                 generation_counter: [0u32; 9],
                 recv_window_command: GenerationWindow::new(1 << 16, RECEIVE_PACKET_WINDOW_SIZE),
                 recv_window_command_low: GenerationWindow::new(1 << 16, RECEIVE_PACKET_WINDOW_SIZE),
+                recv_window_voice: GenerationWindow::new(1 << 16, UNACKED_RECEIVE_WINDOW_SIZE),
+                recv_window_voice_whisper: GenerationWindow::new(
+                    1 << 16,
+                    UNACKED_RECEIVE_WINDOW_SIZE,
+                ),
                 send_window_command: GenerationWindow::new(1 << 16, RECEIVE_PACKET_WINDOW_SIZE),
                 send_window_command_low: GenerationWindow::new(1 << 16, RECEIVE_PACKET_WINDOW_SIZE),
                 command_queue: HashMap::new(),
@@ -462,32 +487,7 @@ impl PacketHandler {
     }
 
     pub fn send_voice_packet(&self, data: Vec<u8>, codec: i32) {
-        let mut core = self.core.lock().unwrap();
-
-        let p_id = core.packet_counter[PacketType::Voice as usize];
-        core.packet_counter[PacketType::Voice as usize] = (p_id + 1) & 0xffff;
-        if core.packet_counter[PacketType::Voice as usize] == 0 {
-            core.generation_counter[PacketType::Voice as usize] =
-                core.generation_counter[PacketType::Voice as usize].wrapping_add(1);
-        }
-
-        let payload_len = VOICE_HEADER_SIZE + data.len();
-        let mut voice_payload = vec![0u8; payload_len];
-        voice_payload[..2].copy_from_slice(&p_id.to_be_bytes());
-        voice_payload[2] = codec as u8;
-        voice_payload[VOICE_HEADER_SIZE..].copy_from_slice(&data);
-
-        let type_flagged = (PacketType::Voice as u8) | PacketFlags::Unencrypted;
-        let header = build_c2s_header_raw(p_id, core.client_id, type_flagged);
-
-        let mut final_bytes = Vec::with_capacity(TAG_SIZE + HEADER_SIZE + payload_len);
-        final_bytes.extend_from_slice(&core.crypt.fake_signature);
-        final_bytes.extend_from_slice(&header);
-        final_bytes.extend_from_slice(&voice_payload);
-
-        if let Some(tx) = self.send_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(final_bytes);
-        }
+        send_voice(&self.core, &self.send_tx, data, codec);
     }
 
     pub fn create_command_sender(&self) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
@@ -599,15 +599,16 @@ async fn bg_task(
                         break;
                     }
                 };
+                let received_at = Instant::now();
 
                 let (pending, was_closed) = {
                     let mut c = core.lock().unwrap();
                     if c.closed {
                         break;
                     }
-                    c.last_message_received = Instant::now();
+                    c.last_message_received = received_at;
 
-                    handle_raw_packet(&mut c, &recv_buf[..n], &on_packet);
+                    handle_raw_packet(&mut c, &recv_buf[..n], received_at, &on_packet);
 
                     let p = std::mem::take(&mut c.pending_sends);
                     let wc = c.closed;
@@ -672,7 +673,12 @@ async fn bg_task(
 
 // ---- Packet processing -------------------------------------------------------
 
-fn handle_raw_packet(c: &mut HandlerCore, raw: &[u8], on_packet: &Arc<Mutex<Option<OnPacket>>>) {
+fn handle_raw_packet(
+    c: &mut HandlerCore,
+    raw: &[u8],
+    received_at: Instant,
+    on_packet: &Arc<Mutex<Option<OnPacket>>>,
+) {
     if raw.len() < 11 {
         return;
     }
@@ -692,7 +698,7 @@ fn handle_raw_packet(c: &mut HandlerCore, raw: &[u8], on_packet: &Arc<Mutex<Opti
         client_id: 0,
         generation_id,
         data: Vec::new(),
-        received_at: Instant::now(),
+        received_at,
     };
 
     let decrypted = decrypt_packet_data(c, &p, header, ciphertext, tag);
@@ -703,6 +709,7 @@ fn handle_raw_packet(c: &mut HandlerCore, raw: &[u8], on_packet: &Arc<Mutex<Opti
     p.data = plaintext;
 
     let p_type = packet_type(&p);
+    advance_receive_generation(c, p_type, p.id);
     let now_ms = c.elapsed_ms(p.received_at);
     c.traffic.record_received(p_type, raw.len(), now_ms);
     c.packet_loss.record_received(p_type, p.id, now_ms);
@@ -740,11 +747,21 @@ fn handle_raw_packet(c: &mut HandlerCore, raw: &[u8], on_packet: &Arc<Mutex<Opti
 
 fn resolve_generation(c: &HandlerCore, id: u16, p_type: u8) -> u32 {
     match p_type {
+        0 => c.recv_window_voice.get_generation(id as u32),
+        1 => c.recv_window_voice_whisper.get_generation(id as u32),
         2 => c.recv_window_command.get_generation(id as u32),
         3 => c.recv_window_command_low.get_generation(id as u32),
         6 => c.send_window_command.get_generation(id as u32),
         7 => c.send_window_command_low.get_generation(id as u32),
         _ => 0,
+    }
+}
+
+fn advance_receive_generation(c: &mut HandlerCore, p_type: PacketType, id: u16) {
+    match p_type {
+        PacketType::Voice => c.recv_window_voice.advance_after(id as u32),
+        PacketType::VoiceWhisper => c.recv_window_voice_whisper.advance_after(id as u32),
+        _ => {}
     }
 }
 
@@ -758,7 +775,8 @@ fn decrypt_packet_data(
     let unencrypted = is_unencrypted(p);
     let dummy = !c.crypt.crypto_init_complete;
     let dummy_used = dummy;
-    let p_type_val = packet_type(p) as u8;
+    let p_type = packet_type(p);
+    let p_type_val = p_type as u8;
     let generation = p.generation_id;
 
     let r = c.crypt.decrypt(
@@ -775,22 +793,28 @@ fn decrypt_packet_data(
         return Some((plaintext, dummy_used));
     }
 
-    for &offset in &[-1i32, 1i32] {
-        let guess_gen = (generation as i32).wrapping_add(offset);
-        if guess_gen < 0 {
-            continue;
-        }
-        let guess_gen = guess_gen as u32;
-        let r = c.crypt.decrypt(
-            p_type_val, p.id, guess_gen, header, ciphertext, tag, false, false,
-        );
-        if let Ok(plaintext) = r {
-            return Some((plaintext, false));
+    if dummy || unencrypted {
+        return None;
+    }
+
+    if !matches!(p_type, PacketType::Voice | PacketType::VoiceWhisper) {
+        for &offset in &[-1i32, 1i32] {
+            let guess_gen = (generation as i32).wrapping_add(offset);
+            if guess_gen < 0 {
+                continue;
+            }
+            let guess_gen = guess_gen as u32;
+            let r = c.crypt.decrypt(
+                p_type_val, p.id, guess_gen, header, ciphertext, tag, false, false,
+            );
+            if let Ok(plaintext) = r {
+                return Some((plaintext, false));
+            }
         }
     }
 
     if matches!(
-        packet_type(p),
+        p_type,
         PacketType::Command | PacketType::CommandLow | PacketType::Ack
     ) {
         let r = c.crypt.decrypt(
@@ -1200,7 +1224,7 @@ mod tests {
             raw[TAG_SIZE + 2] = (PacketType::Pong as u8) | PacketFlags::Unencrypted;
             raw[TAG_SIZE + 3..TAG_SIZE + 5].copy_from_slice(&7u16.to_be_bytes());
 
-            handle_raw_packet(&mut core, &raw, &on_packet);
+            handle_raw_packet(&mut core, &raw, Instant::now(), &on_packet);
         }
 
         let snap = handler.traffic_snapshot();
@@ -1251,7 +1275,7 @@ mod tests {
                 raw[TAG_SIZE..TAG_SIZE + 2].copy_from_slice(&id.to_be_bytes());
                 raw[TAG_SIZE + 2] = (p_type as u8) | PacketFlags::Unencrypted;
                 raw[TAG_SIZE + 3..].copy_from_slice(data);
-                handle_raw_packet(core, &raw, &on_packet);
+                handle_raw_packet(core, &raw, Instant::now(), &on_packet);
             };
 
         {
@@ -1281,5 +1305,198 @@ mod tests {
         // Control: Command(0,1,2) + CommandLow(90) = 4 expected, 1 lost.
         assert!((loss.control - 0.25).abs() < 1e-9);
         assert!((loss.total - 0.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn send_voice_packet_wraps_u16_without_overflow_and_increments_generation() {
+        let crypt = Crypt::new(crate::crypto::generate_identity(0));
+        let handler = PacketHandler::new(crypt, Arc::new(crate::types::NoopLogger));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *handler.send_tx.lock().unwrap() = Some(tx);
+
+        {
+            let mut core = handler.core.lock().unwrap();
+            core.client_id = 0x1234;
+            core.packet_counter[PacketType::Voice as usize] = 65534;
+        }
+
+        for expected_id in [65534u16, 65535u16, 0u16] {
+            handler.send_voice_packet(vec![0xaa, 0xbb], 5);
+            let datagram = rx.try_recv().expect("voice datagram queued");
+            let header_id = u16::from_be_bytes([datagram[TAG_SIZE], datagram[TAG_SIZE + 1]]);
+            let payload_id = u16::from_be_bytes([
+                datagram[TAG_SIZE + HEADER_SIZE],
+                datagram[TAG_SIZE + HEADER_SIZE + 1],
+            ]);
+            assert_eq!(header_id, expected_id);
+            assert_eq!(payload_id, expected_id);
+            assert_eq!(datagram[TAG_SIZE + HEADER_SIZE + 2], 5);
+        }
+
+        let core = handler.core.lock().unwrap();
+        assert_eq!(core.packet_counter[PacketType::Voice as usize], 1);
+        assert_eq!(core.generation_counter[PacketType::Voice as usize], 1);
+    }
+
+    #[test]
+    fn send_voice_packet_without_send_tx_does_not_consume_counter() {
+        let crypt = Crypt::new(crate::crypto::generate_identity(0));
+        let handler = PacketHandler::new(crypt, Arc::new(crate::types::NoopLogger));
+
+        handler.send_voice_packet(vec![1, 2, 3], 4);
+
+        let core = handler.core.lock().unwrap();
+        assert_eq!(core.packet_counter[PacketType::Voice as usize], 0);
+        assert_eq!(core.generation_counter[PacketType::Voice as usize], 0);
+    }
+
+    fn build_encrypted_s2c_packet(
+        crypt: &mut Crypt,
+        p_type: PacketType,
+        id: u16,
+        generation: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut header = [0u8; 3];
+        header[..2].copy_from_slice(&id.to_be_bytes());
+        header[2] = p_type as u8;
+        let (key, nonce) = crypt.get_key_nonce(true, id, generation, p_type as u8, false);
+        let eax = crate::crypto::EAX::new(&key).expect("eax");
+        let (ciphertext, tag) = eax.encrypt(&nonce, &header, payload);
+
+        let mut raw = Vec::with_capacity(TAG_SIZE + 3 + ciphertext.len());
+        raw.extend_from_slice(&tag[..TAG_SIZE]);
+        raw.extend_from_slice(&header);
+        raw.extend_from_slice(&ciphertext);
+        raw
+    }
+
+    fn crypt_with_session_secret() -> Crypt {
+        let mut crypt = Crypt::new(crate::crypto::generate_identity(0));
+        crypt.set_shared_secret(&[1u8; 10], &[2u8; 10], &[3u8; 20]);
+        crypt
+    }
+
+    #[test]
+    fn encrypted_voice_and_whisper_decrypt_across_u16_wrap() {
+        let mut server_crypt = crypt_with_session_secret();
+        let handler = PacketHandler::new(server_crypt.clone(), Arc::new(crate::types::NoopLogger));
+        let delivered = Arc::new(Mutex::new(Vec::<(u8, u16, u32, Vec<u8>)>::new()));
+        let delivered_cb = Arc::clone(&delivered);
+        let on_packet: Arc<Mutex<Option<OnPacket>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |p| {
+                delivered_cb.lock().unwrap().push((
+                    p.type_flagged & 0x0f,
+                    p.id,
+                    p.generation_id,
+                    p.data,
+                ));
+            }))));
+
+        let payload = [0u8, 1, 0, 2, 4, 0xaa];
+        let frames = [
+            (PacketType::Voice, 65535, 0),
+            (PacketType::Voice, 0, 1),
+            (PacketType::Voice, 32768, 1),
+            (PacketType::Voice, 65535, 1),
+            (PacketType::Voice, 0, 2),
+            (PacketType::VoiceWhisper, 7, 0),
+            (PacketType::VoiceWhisper, 65535, 0),
+            (PacketType::VoiceWhisper, 0, 1),
+        ];
+
+        {
+            let mut core = handler.core.lock().unwrap();
+            for (p_type, id, generation) in frames {
+                let raw =
+                    build_encrypted_s2c_packet(&mut server_crypt, p_type, id, generation, &payload);
+                handle_raw_packet(&mut core, &raw, Instant::now(), &on_packet);
+            }
+        }
+
+        let got: Vec<(u8, u16, u32)> = delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, id, generation, _)| (*t, *id, *generation))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 65535, 0),
+                (0, 0, 1),
+                (0, 32768, 1),
+                (0, 65535, 1),
+                (0, 0, 2),
+                (1, 7, 0),
+                (1, 65535, 0),
+                (1, 0, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn encrypted_voice_handles_loss_late_packets_and_rejects_wrong_generation() {
+        let mut server_crypt = crypt_with_session_secret();
+        let handler = PacketHandler::new(server_crypt.clone(), Arc::new(crate::types::NoopLogger));
+        let delivered = Arc::new(Mutex::new(Vec::<(u16, u32)>::new()));
+        let delivered_cb = Arc::clone(&delivered);
+        let on_packet: Arc<Mutex<Option<OnPacket>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |p| {
+                delivered_cb.lock().unwrap().push((p.id, p.generation_id));
+            }))));
+
+        let payload = [0u8, 1, 0, 2, 4, 0xaa];
+        let mut deliver = |core: &mut HandlerCore, id: u16, generation: u32| {
+            let raw = build_encrypted_s2c_packet(
+                &mut server_crypt,
+                PacketType::Voice,
+                id,
+                generation,
+                &payload,
+            );
+            handle_raw_packet(core, &raw, Instant::now(), &on_packet);
+        };
+
+        {
+            let mut core = handler.core.lock().unwrap();
+            deliver(&mut core, 64000, 0);
+            deliver(&mut core, 464, 1);
+            // Wrong-generation packet at id=465 with gen=0 must be rejected.
+            deliver(&mut core, 465, 0);
+            // Late packet from gen 0 before the wrap still decrypts without corrupting gen 1.
+            deliver(&mut core, 65530, 0);
+            deliver(&mut core, 465, 1);
+        }
+
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec![(64000, 0), (464, 1), (65530, 0), (465, 1)]
+        );
+    }
+
+    #[test]
+    fn handle_raw_packet_preserves_received_at_on_packet() {
+        let crypt = Crypt::new(crate::crypto::generate_identity(0));
+        let handler = PacketHandler::new(crypt, Arc::new(crate::types::NoopLogger));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_cb = Arc::clone(&received);
+        let on_packet: Arc<Mutex<Option<OnPacket>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |p| {
+                received_cb.lock().unwrap().push(p.received_at);
+            }))));
+
+        let expected_at = Instant::now() - Duration::from_millis(42);
+        {
+            let mut core = handler.core.lock().unwrap();
+            let mut raw = vec![0u8; TAG_SIZE + 3 + 5];
+            raw[..TAG_SIZE].copy_from_slice(&core.crypt.fake_signature);
+            raw[TAG_SIZE..TAG_SIZE + 2].copy_from_slice(&1u16.to_be_bytes());
+            raw[TAG_SIZE + 2] = (PacketType::Voice as u8) | PacketFlags::Unencrypted;
+            raw[TAG_SIZE + 3..].copy_from_slice(&[0, 1, 0, 2, 4]);
+            handle_raw_packet(&mut core, &raw, expected_at, &on_packet);
+        }
+
+        assert_eq!(*received.lock().unwrap(), vec![expected_at]);
     }
 }

@@ -42,6 +42,15 @@ impl GenerationWindow {
         self.advance(move_dist + 1);
     }
 
+    /// Move the base to just past a received packet; stale packets leave the window unchanged.
+    pub fn advance_after(&mut self, mapped_value: u32) {
+        let index = self.mapped_to_index(mapped_value);
+        if index < 0 {
+            return;
+        }
+        self.advance((index + 1) as u32);
+    }
+
     #[allow(dead_code)]
     pub fn sync_to(&mut self, mapped_value: u32) {
         let move_dist = if mapped_value >= self.mapped_base_offset {
@@ -63,10 +72,20 @@ impl GenerationWindow {
 
     pub fn mapped_to_index(&self, mapped_value: u32) -> i64 {
         if self.is_next_gen(mapped_value) {
-            mapped_value as i64 + self.r#mod as i64 - self.mapped_base_offset as i64
-        } else {
-            mapped_value as i64 - self.mapped_base_offset as i64
+            return mapped_value as i64 + self.r#mod as i64 - self.mapped_base_offset as i64;
         }
+        let index = mapped_value as i64 - self.mapped_base_offset as i64;
+        if self.is_behind_across_wrap(index) {
+            index - self.r#mod as i64
+        } else {
+            index
+        }
+    }
+
+    fn is_behind_across_wrap(&self, index: i64) -> bool {
+        self.generation > 0
+            && index >= self.receive_window as i64
+            && index >= self.r#mod as i64 - self.receive_window as i64
     }
 
     pub fn is_old_packet(&self, mapped_value: u32) -> bool {
@@ -85,15 +104,52 @@ impl GenerationWindow {
 
     pub fn get_generation(&self, mapped_value: u32) -> u32 {
         if self.is_next_gen(mapped_value) {
-            self.generation + 1
-        } else {
-            self.generation
+            return self.generation + 1;
         }
+        if self.is_behind_across_wrap(mapped_value as i64 - self.mapped_base_offset as i64) {
+            return self.generation - 1;
+        }
+        self.generation
     }
 
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.mapped_base_offset = 0;
         self.generation = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advance_after_ignores_stale_packets_across_wrap() {
+        let mut w = GenerationWindow::new(1 << 16, 1 << 15);
+        w.advance((1 << 16) + 10);
+
+        w.advance_after(65535);
+        assert!(w.is_old_packet(65535));
+        assert_eq!(w.get_generation(65535), 0);
+        assert!(!w.is_old_packet(10));
+        assert_eq!(w.get_generation(10), 1);
+
+        w.advance_after(20);
+        assert!(w.is_old_packet(20));
+        assert!(!w.is_old_packet(21));
+        assert_eq!(w.get_generation(21), 1);
+    }
+
+    #[test]
+    fn ids_behind_base_across_wrap_map_to_previous_generation() {
+        let mod_val = 1 << 16;
+        let size = 1 << 15;
+        let mut w = GenerationWindow::new(mod_val, size);
+        w.advance(mod_val + 465);
+
+        assert_eq!(w.get_generation(65530), 0);
+        assert_eq!(w.mapped_to_index(65530), 65530 - 465 - mod_val as i64);
+        assert!(w.is_old_packet(65530));
+        assert_eq!(w.get_generation(465), 1);
     }
 }

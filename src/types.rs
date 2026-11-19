@@ -190,6 +190,9 @@ pub struct VoiceData {
     pub client_id: i32,
     pub codec: i32,
     pub data: Bytes,
+    pub seq: u16,
+    pub whisper: bool,
+    pub received_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

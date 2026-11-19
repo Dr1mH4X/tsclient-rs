@@ -34,7 +34,7 @@
 | `client.on_server_edited(handler)`        | Fires on `notifyserveredited` (`Event::ServerEdited`) |
 | `client.on_kicked(handler)`               | Fires when the bot is kicked       |
 | `client.on_poked(handler)`                | Fires when poked by a client       |
-| `client.on_voice_data(handler)`           | Fires on incoming voice data       |
+| `client.on_voice_data(handler)`           | Fires serially with `Event::VoiceData(VoiceData)` (incl. `seq`, `whisper`, `received_at`, and 0-byte end-of-speech tail frames) |
 | `client.on_plugin_command(handler)`       | Fires on a plugin command (`send_plugin_command`) |
 | `client.on_raw_notification(handler)`     | Fires on unmodeled `notify*` messages (`Event::RawNotification`) |
 

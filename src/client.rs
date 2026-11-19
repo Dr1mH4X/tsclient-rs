@@ -268,7 +268,7 @@ struct EventHandlers {
     server_edited: Vec<EventHandler>,
     poked: Vec<EventHandler>,
     own_permissions_changed: Vec<EventHandler>,
-    voice_data: Vec<EventHandler>,
+    voice_data: Vec<SerialEventHandler>,
     connected: Vec<Arc<dyn Fn() + Send + Sync>>,
     disconnected: Vec<EventHandler>,
     kicked: Vec<EventHandler>,
@@ -400,8 +400,8 @@ impl ClientInner {
             return;
         }
 
-        if (p_type == 0 /* Voice */ || p_type == 1/* VoiceWhisper */) && p.data.len() > 5 {
-            self.handle_voice_packet(&p.data);
+        if (p_type == 0 /* Voice */ || p_type == 1/* VoiceWhisper */) && p.data.len() >= 5 {
+            self.handle_voice_packet(&p.data, p_type == 1, p.received_at);
             return;
         }
 
@@ -412,8 +412,13 @@ impl ClientInner {
         }
     }
 
-    fn handle_voice_packet(&self, payload: &[u8]) {
-        if self.event_handlers.voice_data.is_empty() {
+    fn handle_voice_packet(
+        &mut self,
+        payload: &[u8],
+        whisper: bool,
+        received_at: std::time::Instant,
+    ) {
+        if self.event_handlers.voice_data.is_empty() && self.event_middlewares.is_empty() {
             return;
         }
 
@@ -421,27 +426,25 @@ impl ClientInner {
             return;
         }
 
+        let seq = u16::from_be_bytes([payload[0], payload[1]]);
         let client_id = u16::from_be_bytes([payload[2], payload[3]]) as i32;
         if client_id == self.clid {
             return;
         }
 
         let codec = payload[4] as i32;
-        let data = payload[5..].to_vec();
+        let data = bytes::Bytes::copy_from_slice(&payload[5..]);
 
         let voice_data = VoiceData {
             client_id,
             codec,
-            data: bytes::Bytes::from(data),
+            data,
+            seq,
+            whisper,
+            received_at,
         };
 
-        for h in &self.event_handlers.voice_data {
-            let h = Arc::clone(h);
-            let vd = voice_data.clone();
-            tokio::spawn(async move {
-                h(Event::VoiceData(vd));
-            });
-        }
+        self.dispatch_event(Event::VoiceData(voice_data));
     }
 
     fn handle_command_lines(&mut self, s: &str, sender: &PacketSender) {
@@ -877,12 +880,8 @@ impl ClientInner {
                     }
                 }
                 Event::VoiceData(data) => {
-                    for h in &self.event_handlers.voice_data {
-                        let h = Arc::clone(h);
-                        let d = data.clone();
-                        tokio::spawn(async move {
-                            h(Event::VoiceData(d));
-                        });
+                    for handler in &mut self.event_handlers.voice_data {
+                        handler.enqueue(Event::VoiceData(data.clone()));
                     }
                 }
                 Event::Connected => {
@@ -1588,7 +1587,7 @@ impl Client {
             .unwrap()
             .event_handlers
             .voice_data
-            .push(handler);
+            .push(SerialEventHandler::new(handler));
         self
     }
 
@@ -3605,5 +3604,254 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(cmd_rx.try_recv().is_err());
+    }
+
+    fn make_voice_packet(
+        p_type: PacketType,
+        seq: u16,
+        sender_clid: u16,
+        codec: u8,
+        audio: &[u8],
+        received_at: std::time::Instant,
+    ) -> Packet {
+        let mut data = Vec::with_capacity(5 + audio.len());
+        data.extend_from_slice(&seq.to_be_bytes());
+        data.extend_from_slice(&sender_clid.to_be_bytes());
+        data.push(codec);
+        data.extend_from_slice(audio);
+        Packet {
+            type_flagged: (p_type as u8) | crate::transport::PacketFlags::Unencrypted,
+            id: 0,
+            client_id: 0,
+            generation_id: 0,
+            data,
+            received_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_packet_parses_seq_whisper_received_at_and_empty_tail_frame() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client.inner.lock().unwrap().clid = 99;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.on_voice_data(Arc::new(move |ev| {
+            if let Event::VoiceData(vd) = ev {
+                let _ = tx.send(vd);
+            }
+        }));
+
+        let base = std::time::Instant::now();
+        let t1 = base + Duration::from_millis(10);
+        let t2 = base + Duration::from_millis(20);
+        let t3 = base + Duration::from_millis(30);
+        {
+            let mut inner = client.inner.lock().unwrap();
+            // 1. Voice packet with audio payload
+            inner.process_packet(
+                &sender,
+                make_voice_packet(PacketType::Voice, 0x1234, 7, 4, &[0xaa, 0xbb], t1),
+            );
+            // 2. VoiceWhisper packet
+            inner.process_packet(
+                &sender,
+                make_voice_packet(PacketType::VoiceWhisper, 0xfffe, 8, 5, &[0xcc], t2),
+            );
+            // 3. 5-byte end-of-speech tail packet (0-byte audio data)
+            inner.process_packet(
+                &sender,
+                make_voice_packet(PacketType::Voice, 0x1235, 7, 4, &[], t3),
+            );
+            // 4. Malformed (< 5 bytes) and self-echo (clid == 99) must be ignored
+            inner.process_packet(
+                &sender,
+                Packet {
+                    type_flagged: (PacketType::Voice as u8)
+                        | crate::transport::PacketFlags::Unencrypted,
+                    id: 0,
+                    client_id: 0,
+                    generation_id: 0,
+                    data: vec![0x12, 0x36, 0x00, 0x07],
+                    received_at: t3,
+                },
+            );
+            inner.process_packet(
+                &sender,
+                make_voice_packet(PacketType::Voice, 0x1237, 99, 4, &[0xdd], t3),
+            );
+        }
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let vd = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("voice event timeout")
+                .expect("voice channel open");
+            got.push(vd);
+        }
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(got[0].seq, 0x1234);
+        assert_eq!(got[0].client_id, 7);
+        assert_eq!(got[0].codec, 4);
+        assert!(!got[0].whisper);
+        assert_eq!(got[0].data.as_ref(), &[0xaa, 0xbb]);
+        assert_eq!(got[0].received_at, t1);
+
+        assert_eq!(got[1].seq, 0xfffe);
+        assert_eq!(got[1].client_id, 8);
+        assert_eq!(got[1].codec, 5);
+        assert!(got[1].whisper);
+        assert_eq!(got[1].data.as_ref(), &[0xcc]);
+        assert_eq!(got[1].received_at, t2);
+
+        assert_eq!(got[2].seq, 0x1235);
+        assert_eq!(got[2].client_id, 7);
+        assert_eq!(got[2].codec, 4);
+        assert!(!got[2].whisper);
+        assert!(got[2].data.is_empty());
+        assert_eq!(got[2].received_at, t3);
+    }
+
+    #[tokio::test]
+    async fn voice_data_passes_through_event_middleware() {
+        struct VoiceFilterMiddleware {
+            seen: Arc<Mutex<Vec<u16>>>,
+        }
+        impl EventMiddleware for VoiceFilterMiddleware {
+            fn wrap(&self, next: EventHandler) -> EventHandler {
+                let seen = Arc::clone(&self.seen);
+                Arc::new(move |ev| match ev {
+                    Event::VoiceData(mut vd) => {
+                        seen.lock().unwrap().push(vd.seq);
+                        if vd.seq == 1 {
+                            return;
+                        }
+                        vd.codec = 99;
+                        next(Event::VoiceData(vd));
+                    }
+                    other => next(other),
+                })
+            }
+        }
+
+        let mw_seen = Arc::new(Mutex::new(Vec::new()));
+        let mut opts = ClientOptions::default();
+        opts.event_middleware.push(Box::new(VoiceFilterMiddleware {
+            seen: Arc::clone(&mw_seen),
+        }));
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            opts,
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        let now = std::time::Instant::now();
+
+        // Even before any on_voice_data listener is registered, middleware observes voiceData.
+        client.inner.lock().unwrap().process_packet(
+            &sender,
+            make_voice_packet(PacketType::Voice, 10, 7, 4, &[1], now),
+        );
+        assert_eq!(*mw_seen.lock().unwrap(), vec![10]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.on_voice_data(Arc::new(move |ev| {
+            if let Event::VoiceData(vd) = ev {
+                let _ = tx.send(vd);
+            }
+        }));
+
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.process_packet(
+                &sender,
+                make_voice_packet(PacketType::Voice, 1, 7, 4, &[1], now),
+            );
+            inner.process_packet(
+                &sender,
+                make_voice_packet(PacketType::Voice, 2, 7, 4, &[2], now),
+            );
+        }
+
+        let delivered = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("middleware voice event timeout")
+            .expect("channel open");
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(delivered.seq, 2);
+        assert_eq!(delivered.codec, 99);
+        assert_eq!(*mw_seen.lock().unwrap(), vec![10, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn voice_data_handlers_run_serially_in_arrival_order_and_drop_oldest_above_256() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        let now = std::time::Instant::now();
+
+        let seen = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let active = Arc::new(AtomicBool::new(false));
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+
+        let seen_cb = Arc::clone(&seen);
+        let active_cb = Arc::clone(&active);
+        let overlapped_cb = Arc::clone(&overlapped);
+        let done_tx_cb = Arc::clone(&done_tx);
+        let total = MAX_QUEUED_CLIENT_UPDATES as u16 + 44;
+
+        client.on_voice_data(Arc::new(move |ev| {
+            if active_cb.swap(true, Ordering::SeqCst) {
+                overlapped_cb.store(true, Ordering::SeqCst);
+            }
+            if let Event::VoiceData(vd) = ev {
+                let mut guard = seen_cb.lock().unwrap();
+                guard.push(vd.seq);
+                if guard.len() == MAX_QUEUED_CLIENT_UPDATES {
+                    if let Some(tx) = done_tx_cb.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            active_cb.store(false, Ordering::SeqCst);
+        }));
+
+        {
+            let mut inner = client.inner.lock().unwrap();
+            for seq in 0..total {
+                inner.process_packet(
+                    &sender,
+                    make_voice_packet(PacketType::Voice, seq, 7, 4, &[1], now),
+                );
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("voice serial queue did not drain")
+            .ok();
+
+        assert!(!overlapped.load(Ordering::SeqCst));
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), MAX_QUEUED_CLIENT_UPDATES);
+        assert_eq!(got[0], 44);
+        assert_eq!(*got.last().unwrap(), total - 1);
+        assert!(got.windows(2).all(|w| w[0] + 1 == w[1]));
     }
 }
