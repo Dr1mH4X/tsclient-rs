@@ -265,18 +265,21 @@ impl From<std::io::Error> for Error {
 }
 
 impl Error {
+    pub fn is_flood_error(&self) -> bool {
+        matches!(self, Self::ServerError { id, .. } if id == "524")
+    }
+
     pub(crate) fn flood_retry_delay(&self) -> Option<std::time::Duration> {
+        if !self.is_flood_error() {
+            return None;
+        }
         let Error::ServerError {
-            id,
             extra_message: Some(extra),
             ..
         } = self
         else {
             return None;
         };
-        if id != "524" {
-            return None;
-        }
         let (digits, multiplier) = if let Some(digits) = extra
             .strip_prefix("retry in ")
             .and_then(|s| s.strip_suffix("ms"))

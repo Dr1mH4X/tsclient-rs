@@ -34,7 +34,7 @@
 | `client.on_server_edited(handler)`        | Fires on `notifyserveredited` (`Event::ServerEdited`) |
 | `client.on_kicked(handler)`               | Fires when the bot is kicked       |
 | `client.on_poked(handler)`                | Fires when poked by a client       |
-| `client.on_voice_data(handler)`           | Fires on incoming voice data       |
+| `client.on_voice_data(handler)`           | Fires serially with `Event::VoiceData(VoiceData)` (incl. `seq`, `whisper`, `received_at`, and 0-byte end-of-speech tail frames) |
 | `client.on_plugin_command(handler)`       | Fires on a plugin command (`send_plugin_command`) |
 | `client.on_raw_notification(handler)`     | Fires on unmodeled `notify*` messages (`Event::RawNotification`) |
 
@@ -136,3 +136,10 @@ so consumers can safely teardown and reconnect.
 `client.traffic_snapshot()` 返回自连接建立以来按方向（`sent` / `received`）与类别（`speech` / `keepalive` / `control`）统计的包数、字节数、上一整秒字节数与近一分钟平均每秒字节数（`TrafficSnapshot` / `TrafficCounters` / `TrafficFigures`）。`client.round_trip()` 返回基于最近最多 10 次 Ping/Pong 交换测得的均值与标准差（`Option<RoundTrip>`，首次 Pong 返回前为 `None`）。`client.packet_loss()` 基于按 `PacketType` 隔离的近 60 秒 1 秒分桶窗口估算服务端到客户端（S2C）丢包比例（`Option<PacketLoss>`，无有效样本时为 `None`）：`Voice` / `VoiceWhisper` / 服务端 `Ping` 使用不可靠流乱序宽恕窗口，心跳响应结合 `Ping -> Pong` 超时统计，`Command` / `CommandLow` 使用可靠流状态机以防止服务端重传被误判为乱序或双算。
 
 当服务端下发 `notifyconnectioninforequest` 时，客户端会自动响应 `setconnectioninfo`（附带各方向和类别的包计数、字节数、1s/1m 带宽以及可用的 `connection_ping` / `connection_ping_deviation` 与 `connection_server2client_packetloss_{speech,keepalive,control,total}`），同时仍按现有规则派发 `Event::RawNotification`。
+
+## OpenProtocol（可选 feature `open-protocol`）
+
+启用 `features = ["open-protocol"]` 后导出 `tsclient_rs::open_protocol` 模块，提供两层接口（详见 [OpenProtocol Specification](open-protocol.md)）：
+
+- **异步托管层 `OpenProtocolHandle::attach(&client, config)`**：在 `connect()` 前后均可挂载，自动注册 `on_connected` / `on_directory_snapshot` / `on_client_enter` / `on_client_leave` / `on_client_moved` / `on_plugin_command` / `on_disconnected`，非阻塞派发 `announce`、`announce_ack` 与 `list_ack`，支持建连单次全服单向公告（`server_announce_on_join`）与跨频道低速背景探测（`auto_discover_peers`，收到对端 `announce` 自动从探测队列剔除，遇服务端 `524` 防洪错误立即熔断清空队列），并内置自回显过滤、防抖、冷却、全局令牌桶、单次重试与 TS3 转义线缆包长（`< 1024` 字节）裁剪；提供 `announce()`、`set_commands(...)`、`query_peer(clid, uid)`、`fetch_commands(clid, uid)`、`peer_identity(uid)`、`peer_commands(uid)`、`subscribe()`。
+- **无 IO 核心引擎 `OpenProtocolEngine`**：纯同步状态机，接收连接/换房/目录/进出/入站事件与定时器回调，返回 `EngineEffects`（出站指令、定时请求与变更事件），便于嵌入单线程 Actor 或自定义事件循环。

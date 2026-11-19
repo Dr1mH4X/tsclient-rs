@@ -46,6 +46,9 @@ mod transport;
 mod errors;
 mod types;
 
+#[cfg(feature = "open-protocol")]
+pub mod open_protocol;
+
 // ---- Main client ----------------------------------------------------------------
 
 pub use client::{Client, ClientStatus};
