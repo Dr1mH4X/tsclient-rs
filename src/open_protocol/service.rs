@@ -10,7 +10,7 @@ use crate::types::Event;
 use super::engine::OpenProtocolEngine;
 use super::types::{
     BotCommandList, EngineEffects, OpenProtocolConfig, OpenProtocolEvent, PeerIdentity,
-    SendReceipt, TimerToken,
+    SendOutcome, SendReceipt, TimerToken,
 };
 
 struct ServiceState {
@@ -171,9 +171,34 @@ impl OpenProtocolHandle {
                 .find(|c| c.id == clid)
                 .map(|c| c.channel_id)
                 .unwrap_or_else(|| client.channel_id());
-            if channel_id != 0 {
-                handle.handle_directory_ready(clid, channel_id);
-            }
+            let peers: Vec<(i32, &str, u64)> = snapshot
+                .clients
+                .iter()
+                .map(|c| (c.id, c.uid.as_str(), c.channel_id))
+                .collect();
+            handle.handle_directory_snapshot(clid, channel_id, &peers);
+        }));
+
+        let weak_handle = Arc::downgrade(handle);
+        client.on_client_enter(Arc::new(move |event| {
+            let Event::ClientEnter(info) = event else {
+                return;
+            };
+            let Some(handle) = weak_handle.upgrade() else {
+                return;
+            };
+            handle.handle_peer_joined(info.id, &info.uid);
+        }));
+
+        let weak_handle = Arc::downgrade(handle);
+        client.on_client_leave(Arc::new(move |event| {
+            let Event::ClientLeave(ev) = event else {
+                return;
+            };
+            let Some(handle) = weak_handle.upgrade() else {
+                return;
+            };
+            handle.state.lock().unwrap().engine.on_peer_left(ev.id);
         }));
 
         let weak_handle = Arc::downgrade(handle);
@@ -251,17 +276,35 @@ impl OpenProtocolHandle {
         self.dispatch_effects(epoch, effects);
     }
 
-    fn handle_directory_ready(self: &Arc<Self>, clid: i32, channel_id: u64) {
-        let (epoch, effects) = {
+    fn handle_directory_snapshot(
+        self: &Arc<Self>,
+        clid: i32,
+        channel_id: u64,
+        peers: &[(i32, &str, u64)],
+    ) {
+        let (epoch, ready_effects, probe_effects) = {
             let mut guard = self.state.lock().unwrap();
+            let now = Instant::now();
             let epoch = guard.epoch;
-            let effects = if guard.engine.self_client_id().is_none() {
-                guard.engine.on_connected(clid, channel_id, Instant::now())
-            } else if guard.engine.self_channel_id() == 0 {
-                guard.engine.on_self_moved(channel_id, Instant::now())
+            let ready_effects = if guard.engine.self_client_id().is_none() {
+                guard.engine.on_connected(clid, channel_id, now)
+            } else if channel_id != 0 && guard.engine.self_channel_id() == 0 {
+                guard.engine.on_self_moved(channel_id, now)
             } else {
                 EngineEffects::default()
             };
+            let probe_effects = guard.engine.sync_directory_peers(peers, now);
+            (epoch, ready_effects, probe_effects)
+        };
+        self.dispatch_effects(epoch, ready_effects);
+        self.dispatch_effects(epoch, probe_effects);
+    }
+
+    fn handle_peer_joined(self: &Arc<Self>, clid: i32, uid: &str) {
+        let (epoch, effects) = {
+            let mut guard = self.state.lock().unwrap();
+            let epoch = guard.epoch;
+            let effects = guard.engine.on_peer_joined(clid, uid, Instant::now());
             (epoch, effects)
         };
         self.dispatch_effects(epoch, effects);
@@ -291,13 +334,18 @@ impl OpenProtocolHandle {
         self.dispatch_effects(epoch, effects);
     }
 
-    fn handle_send_outcome(self: &Arc<Self>, epoch: u64, receipt: SendReceipt, succeeded: bool) {
+    fn handle_send_outcome(
+        self: &Arc<Self>,
+        epoch: u64,
+        receipt: SendReceipt,
+        outcome: SendOutcome,
+    ) {
         let effects = {
             let mut guard = self.state.lock().unwrap();
             if guard.epoch != epoch {
                 return;
             }
-            guard.engine.on_send_outcome(receipt, succeeded)
+            guard.engine.on_send_outcome(receipt, outcome)
         };
         self.dispatch_effects(epoch, effects);
     }
@@ -320,18 +368,16 @@ impl OpenProtocolHandle {
                 let Some(handle) = weak_handle.upgrade() else {
                     return;
                 };
-                match result {
-                    Ok(()) => handle.handle_send_outcome(epoch, cmd.receipt, true),
-                    Err(err) => {
-                        let _ = handle.events.send(OpenProtocolEvent::SendFailed {
-                            plugin: cmd.plugin,
-                            target: cmd.target,
-                            target_id: cmd.target_id,
-                            error: err.to_string(),
-                        });
-                        handle.handle_send_outcome(epoch, cmd.receipt, false);
-                    }
+                let outcome = SendOutcome::from_result(&result);
+                if let Err(err) = result {
+                    let _ = handle.events.send(OpenProtocolEvent::SendFailed {
+                        plugin: cmd.plugin,
+                        target: cmd.target,
+                        target_id: cmd.target_id,
+                        error: err.to_string(),
+                    });
                 }
+                handle.handle_send_outcome(epoch, cmd.receipt, outcome);
             });
         }
 

@@ -1,6 +1,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::errors::Error;
 use crate::types::PluginCommandTarget;
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -24,6 +25,9 @@ pub const SELF_ANNOUNCE_DEBOUNCE: Duration = Duration::from_secs(2);
 pub const SELF_ANNOUNCE_RETRY_DELAY: Duration = Duration::from_millis(500);
 pub const DEFAULT_QUERY_COOLDOWN: Duration = Duration::from_secs(30);
 pub const DEFAULT_COMMANDS_FETCH_TTL: Duration = Duration::from_secs(15);
+pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_millis(900);
+pub const DEFAULT_PROBE_INITIAL_DELAY: Duration = Duration::from_millis(1500);
+pub const DEFAULT_MAX_AUTO_DISCOVER_PEERS: usize = 64;
 
 pub const ACK_GLOBAL_BURST: f64 = 4.0;
 pub const ACK_GLOBAL_RATE_PER_SEC: f64 = 2.0;
@@ -153,6 +157,11 @@ pub struct OpenProtocolConfig {
     pub cache_peers: bool,
     pub reply_to_bots: bool,
     pub announce_on_join: bool,
+    pub server_announce_on_join: bool,
+    pub auto_discover_peers: bool,
+    pub probe_interval: Duration,
+    pub probe_initial_delay: Duration,
+    pub max_auto_discover_peers: usize,
     pub query_cooldown: Duration,
     pub commands_fetch_ttl: Duration,
 }
@@ -165,6 +174,11 @@ impl OpenProtocolConfig {
             cache_peers: true,
             reply_to_bots: true,
             announce_on_join: true,
+            server_announce_on_join: false,
+            auto_discover_peers: false,
+            probe_interval: DEFAULT_PROBE_INTERVAL,
+            probe_initial_delay: DEFAULT_PROBE_INITIAL_DELAY,
+            max_auto_discover_peers: DEFAULT_MAX_AUTO_DISCOVER_PEERS,
             query_cooldown: DEFAULT_QUERY_COOLDOWN,
             commands_fetch_ttl: DEFAULT_COMMANDS_FETCH_TTL,
         }
@@ -192,6 +206,31 @@ impl OpenProtocolConfig {
 
     pub fn with_announce_on_join(mut self, enabled: bool) -> Self {
         self.announce_on_join = enabled;
+        self
+    }
+
+    pub fn with_server_announce_on_join(mut self, enabled: bool) -> Self {
+        self.server_announce_on_join = enabled;
+        self
+    }
+
+    pub fn with_auto_discover_peers(mut self, enabled: bool) -> Self {
+        self.auto_discover_peers = enabled;
+        self
+    }
+
+    pub fn with_probe_interval(mut self, interval: Duration) -> Self {
+        self.probe_interval = interval;
+        self
+    }
+
+    pub fn with_probe_initial_delay(mut self, delay: Duration) -> Self {
+        self.probe_initial_delay = delay;
+        self
+    }
+
+    pub fn with_max_auto_discover_peers(mut self, max_peers: usize) -> Self {
+        self.max_auto_discover_peers = max_peers;
         self
     }
 
@@ -230,6 +269,7 @@ pub enum SendReceipt {
         seq_at_start: u64,
         allow_failure_retry: bool,
     },
+    ServerBeacon,
     Ack {
         peer: String,
         action: CooldownAction,
@@ -239,10 +279,31 @@ pub enum SendReceipt {
         peer: String,
         acquired_at: Instant,
     },
+    ProbeQuery {
+        peer_uid: String,
+        acquired_at: Instant,
+    },
     CommandsFetch {
         peer_uid: String,
         started_at: Instant,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    Succeeded,
+    Failed { flood: bool },
+}
+
+impl SendOutcome {
+    pub fn from_result(result: &Result<(), Error>) -> Self {
+        match result {
+            Ok(()) => Self::Succeeded,
+            Err(err) => Self::Failed {
+                flood: err.is_flood_error(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +319,7 @@ pub struct OutboundPluginCommand {
 pub enum TimerToken {
     AnnounceTrailing,
     AnnounceRetry { expected_seq: u64 },
+    ProbeNext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +340,7 @@ pub enum OpenProtocolEvent {
         clid: i32,
         commands: BotCommandList,
     },
+    ProbeHaltedByFlood,
     SendFailed {
         plugin: &'static str,
         target: PluginCommandTarget,

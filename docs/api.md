@@ -141,5 +141,5 @@ so consumers can safely teardown and reconnect.
 
 启用 `features = ["open-protocol"]` 后导出 `tsclient_rs::open_protocol` 模块，提供两层接口（详见 [OpenProtocol Specification](open-protocol.md)）：
 
-- **异步托管层 `OpenProtocolHandle::attach(&client, config)`**：在 `connect()` 前后均可挂载，自动注册 `on_connected` / `on_directory_snapshot` / `on_client_moved` / `on_plugin_command` / `on_disconnected`，非阻塞派发 `announce`、`announce_ack` 与 `list_ack`，并内置自回显过滤、防抖、冷却、全局令牌桶、单次重试与 TS3 转义线缆包长（`< 1024` 字节）裁剪；提供 `announce()`、`set_commands(...)`、`query_peer(clid, uid)`、`fetch_commands(clid, uid)`、`peer_identity(uid)`、`peer_commands(uid)`、`subscribe()`。
-- **无 IO 核心引擎 `OpenProtocolEngine`**：纯同步状态机，接收连接/换房/入站事件与定时器回调，返回 `EngineEffects`（出站指令、定时请求与变更事件），便于嵌入单线程 Actor 或自定义事件循环。
+- **异步托管层 `OpenProtocolHandle::attach(&client, config)`**：在 `connect()` 前后均可挂载，自动注册 `on_connected` / `on_directory_snapshot` / `on_client_enter` / `on_client_leave` / `on_client_moved` / `on_plugin_command` / `on_disconnected`，非阻塞派发 `announce`、`announce_ack` 与 `list_ack`，支持建连单次全服单向公告（`server_announce_on_join`）与跨频道低速背景探测（`auto_discover_peers`，收到对端 `announce` 自动从探测队列剔除，遇服务端 `524` 防洪错误立即熔断清空队列），并内置自回显过滤、防抖、冷却、全局令牌桶、单次重试与 TS3 转义线缆包长（`< 1024` 字节）裁剪；提供 `announce()`、`set_commands(...)`、`query_peer(clid, uid)`、`fetch_commands(clid, uid)`、`peer_identity(uid)`、`peer_commands(uid)`、`subscribe()`。
+- **无 IO 核心引擎 `OpenProtocolEngine`**：纯同步状态机，接收连接/换房/目录/进出/入站事件与定时器回调，返回 `EngineEffects`（出站指令、定时请求与变更事件），便于嵌入单线程 Actor 或自定义事件循环。

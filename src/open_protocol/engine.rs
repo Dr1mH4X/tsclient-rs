@@ -5,17 +5,17 @@ use crate::types::{PluginCommandEvent, PluginCommandTarget};
 
 use super::codec::{
     InboundMessage, effective_identity, encode_commands_ack, encode_commands_req,
-    encode_identity_message, encode_query_message, parse_inbound_message,
+    encode_identity_ack, encode_identity_announce, encode_query_message, parse_inbound_message,
     sanitize_bot_command_list,
 };
 use super::limiter::{
     AckRateLimiter, AnnounceAttemptMode, AnnounceDecision, AnnounceState, InflightCommands,
-    QueryRateLimiter,
+    ProbeQueue, QueryRateLimiter,
 };
 use super::types::{
     BotCommandList, COMMANDS_PLUGIN, ClientKind, CooldownAction, EngineEffects, IDENTITY_PLUGIN,
     OpenProtocolConfig, OpenProtocolEvent, OutboundPluginCommand, PeerIdentity,
-    SELF_ANNOUNCE_RETRY_DELAY, SendReceipt, TimerRequest, TimerToken,
+    SELF_ANNOUNCE_RETRY_DELAY, SendOutcome, SendReceipt, TimerRequest, TimerToken,
 };
 
 /// 纯同步、无 IO 的 OpenProtocol 协议引擎，可嵌入单线程 Actor 或被异步托管层驱动。
@@ -23,10 +23,12 @@ pub struct OpenProtocolEngine {
     config: OpenProtocolConfig,
     self_clid: Option<i32>,
     self_channel_id: u64,
+    server_beacon_sent: bool,
     announce_state: AnnounceState,
     ack_limiter: AckRateLimiter,
     query_limiter: QueryRateLimiter,
     inflight_commands: InflightCommands,
+    probe_queue: ProbeQueue,
     peer_identities: HashMap<String, PeerIdentity>,
     peer_commands: HashMap<String, BotCommandList>,
 }
@@ -36,14 +38,23 @@ impl OpenProtocolEngine {
         config.commands = config.commands.map(sanitize_bot_command_list);
         let query_cooldown = config.query_cooldown;
         let fetch_ttl = config.commands_fetch_ttl;
+        let probe_interval = config.probe_interval;
+        let probe_initial_delay = config.probe_initial_delay;
+        let max_auto_discover_peers = config.max_auto_discover_peers;
         Self {
             config,
             self_clid: None,
             self_channel_id: 0,
+            server_beacon_sent: false,
             announce_state: AnnounceState::default(),
             ack_limiter: AckRateLimiter::new(now),
             query_limiter: QueryRateLimiter::new(query_cooldown),
             inflight_commands: InflightCommands::new(fetch_ttl),
+            probe_queue: ProbeQueue::new(
+                probe_interval,
+                probe_initial_delay,
+                max_auto_discover_peers,
+            ),
             peer_identities: HashMap::new(),
             peer_commands: HashMap::new(),
         }
@@ -92,11 +103,16 @@ impl OpenProtocolEngine {
     pub fn on_connected(&mut self, clid: i32, channel_id: u64, now: Instant) -> EngineEffects {
         self.self_clid = Some(clid);
         self.self_channel_id = channel_id;
-        if self.config.announce_on_join && channel_id != 0 {
+        if channel_id == 0 {
+            return EngineEffects::default();
+        }
+        let mut effects = if self.config.announce_on_join {
             self.begin_announce(AnnounceAttemptMode::Normal, true, now)
         } else {
             EngineEffects::default()
-        }
+        };
+        self.maybe_enqueue_server_beacon(&mut effects);
+        effects
     }
 
     pub fn on_self_moved(&mut self, channel_id: u64, now: Instant) -> EngineEffects {
@@ -104,15 +120,54 @@ impl OpenProtocolEngine {
             self.self_channel_id = 0;
             return EngineEffects::default();
         }
-        if channel_id == self.self_channel_id && self.announce_state.has_attempted() {
-            return EngineEffects::default();
+        let mut effects = EngineEffects::default();
+        if !(channel_id == self.self_channel_id && self.announce_state.has_attempted()) {
+            self.self_channel_id = channel_id;
+            if self.config.announce_on_join {
+                effects = self.begin_announce(AnnounceAttemptMode::Normal, true, now);
+            }
         }
-        self.self_channel_id = channel_id;
-        if self.config.announce_on_join {
-            self.begin_announce(AnnounceAttemptMode::Normal, true, now)
-        } else {
-            EngineEffects::default()
+        self.maybe_enqueue_server_beacon(&mut effects);
+        effects
+    }
+
+    pub fn sync_directory_peers(
+        &mut self,
+        peers: &[(i32, &str, u64)],
+        now: Instant,
+    ) -> EngineEffects {
+        let mut effects = EngineEffects::default();
+        if !self.config.auto_discover_peers || self.self_clid.is_none() {
+            return effects;
         }
+        if let Some(timer) = self.probe_queue.sync_peers(
+            self.self_clid,
+            self.self_channel_id,
+            peers,
+            &self.peer_identities,
+            now,
+        ) {
+            effects.timers.push(timer);
+        }
+        effects
+    }
+
+    pub fn on_peer_joined(&mut self, clid: i32, uid: &str, now: Instant) -> EngineEffects {
+        let mut effects = EngineEffects::default();
+        if !self.config.auto_discover_peers || self.self_clid.is_none() {
+            return effects;
+        }
+        if let Some(timer) =
+            self.probe_queue
+                .enqueue_joined(clid, uid, self.self_clid, &self.peer_identities, now)
+        {
+            effects.timers.push(timer);
+        }
+        effects
+    }
+
+    pub fn on_peer_left(&mut self, clid: i32) {
+        self.probe_queue.remove_clid(clid);
     }
 
     pub fn announce_now(&mut self, now: Instant) -> EngineEffects {
@@ -123,20 +178,23 @@ impl OpenProtocolEngine {
     }
 
     pub fn on_timer(&mut self, token: TimerToken, now: Instant) -> EngineEffects {
-        if self.self_channel_id == 0 {
-            return EngineEffects::default();
-        }
         match token {
             TimerToken::AnnounceTrailing => {
+                if self.self_channel_id == 0 {
+                    return EngineEffects::default();
+                }
                 self.begin_announce(AnnounceAttemptMode::Trailing, true, now)
             }
             TimerToken::AnnounceRetry { expected_seq } => {
-                if self.announce_state.should_run_failure_retry(expected_seq) {
+                if self.self_channel_id != 0
+                    && self.announce_state.should_run_failure_retry(expected_seq)
+                {
                     self.begin_announce(AnnounceAttemptMode::Normal, false, now)
                 } else {
                     EngineEffects::default()
                 }
             }
+            TimerToken::ProbeNext => self.step_probe_queue(now),
         }
     }
 
@@ -166,13 +224,16 @@ impl OpenProtocolEngine {
         };
 
         match message {
-            InboundMessage::IdentityAnnounce(maybe_identity) => {
+            InboundMessage::IdentityAnnounce {
+                identity: maybe_identity,
+                noreply,
+            } => {
                 let mut is_bot = false;
                 if let Some(identity) = maybe_identity {
                     is_bot = identity.client_type == ClientKind::Bot;
                     self.record_peer_identity(peer_uid, event.invoker_id, identity, &mut effects);
                 }
-                if !is_bot || self.config.reply_to_bots {
+                if !noreply && (!is_bot || self.config.reply_to_bots) {
                     self.enqueue_identity_ack(
                         &cooldown_key,
                         event.invoker_id,
@@ -245,8 +306,11 @@ impl OpenProtocolEngine {
         if self.self_clid.is_none() || self.self_clid == Some(clid) {
             return effects;
         }
-        let key = peer_uid
-            .filter(|u| !u.is_empty())
+        let clean_uid = peer_uid.filter(|u| !u.is_empty());
+        if let Some(uid) = clean_uid {
+            self.probe_queue.mark_discovered(uid);
+        }
+        let key = clean_uid
             .map(str::to_string)
             .unwrap_or_else(|| format!("clid:{clid}"));
         if !self.query_limiter.try_acquire(&key, now) {
@@ -293,13 +357,21 @@ impl OpenProtocolEngine {
         effects
     }
 
-    pub fn on_send_outcome(&mut self, receipt: SendReceipt, succeeded: bool) -> EngineEffects {
+    pub fn on_send_outcome(&mut self, receipt: SendReceipt, outcome: SendOutcome) -> EngineEffects {
         let mut effects = EngineEffects::default();
-        if succeeded {
-            if matches!(receipt, SendReceipt::Announce { .. }) {
-                self.announce_state.record_success();
+        let flood = match outcome {
+            SendOutcome::Succeeded => {
+                if matches!(receipt, SendReceipt::Announce { .. }) {
+                    self.announce_state.record_success();
+                }
+                return effects;
             }
-            return effects;
+            SendOutcome::Failed { flood } => flood,
+        };
+
+        if flood && !self.probe_queue.is_halted() {
+            self.probe_queue.halt_for_flood();
+            effects.events.push(OpenProtocolEvent::ProbeHaltedByFlood);
         }
 
         match receipt {
@@ -311,7 +383,7 @@ impl OpenProtocolEngine {
                 let should_retry = self
                     .announce_state
                     .rollback_failure(attempt_at, seq_at_start);
-                if allow_failure_retry && should_retry {
+                if allow_failure_retry && should_retry && !flood {
                     effects.timers.push(TimerRequest {
                         delay: SELF_ANNOUNCE_RETRY_DELAY,
                         token: TimerToken::AnnounceRetry {
@@ -320,6 +392,7 @@ impl OpenProtocolEngine {
                     });
                 }
             }
+            SendReceipt::ServerBeacon => {}
             SendReceipt::Ack {
                 peer,
                 action,
@@ -329,6 +402,14 @@ impl OpenProtocolEngine {
             }
             SendReceipt::Query { peer, acquired_at } => {
                 self.query_limiter.rollback(&peer, acquired_at);
+            }
+            SendReceipt::ProbeQuery {
+                peer_uid,
+                acquired_at,
+            } => {
+                if flood {
+                    self.query_limiter.rollback(&peer_uid, acquired_at);
+                }
             }
             SendReceipt::CommandsFetch {
                 peer_uid,
@@ -343,12 +424,62 @@ impl OpenProtocolEngine {
     pub fn reset(&mut self, now: Instant) {
         self.self_clid = None;
         self.self_channel_id = 0;
+        self.server_beacon_sent = false;
         self.peer_identities.clear();
         self.peer_commands.clear();
         self.announce_state.reset();
         self.ack_limiter.reset(now);
         self.query_limiter.reset();
         self.inflight_commands.reset();
+        self.probe_queue.reset();
+    }
+
+    fn maybe_enqueue_server_beacon(&mut self, effects: &mut EngineEffects) {
+        if !self.config.server_announce_on_join
+            || self.server_beacon_sent
+            || self.self_channel_id == 0
+        {
+            return;
+        }
+        self.server_beacon_sent = true;
+        let identity = self.effective_identity();
+        if let Some(data) =
+            encode_identity_announce(&identity, true, PluginCommandTarget::Server, None)
+        {
+            effects.outbound.push(OutboundPluginCommand {
+                plugin: IDENTITY_PLUGIN,
+                data,
+                target: PluginCommandTarget::Server,
+                target_id: None,
+                receipt: SendReceipt::ServerBeacon,
+            });
+        }
+    }
+
+    fn step_probe_queue(&mut self, now: Instant) -> EngineEffects {
+        let mut effects = EngineEffects::default();
+        if !self.config.auto_discover_peers || self.self_clid.is_none() {
+            return effects;
+        }
+        let (next, next_timer) = self.probe_queue.pop_next_ready(&self.peer_identities, now);
+        if let Some(timer) = next_timer {
+            effects.timers.push(timer);
+        }
+        if let Some((clid, uid)) = next
+            && self.query_limiter.try_acquire(&uid, now)
+        {
+            effects.outbound.push(OutboundPluginCommand {
+                plugin: IDENTITY_PLUGIN,
+                data: encode_query_message(),
+                target: PluginCommandTarget::Client,
+                target_id: Some(clid),
+                receipt: SendReceipt::ProbeQuery {
+                    peer_uid: uid,
+                    acquired_at: now,
+                },
+            });
+        }
+        effects
     }
 
     fn begin_announce(
@@ -359,12 +490,9 @@ impl OpenProtocolEngine {
     ) -> EngineEffects {
         let mut effects = EngineEffects::default();
         let identity = self.effective_identity();
-        let Some(data) = encode_identity_message(
-            "announce",
-            &identity,
-            PluginCommandTarget::CurrentChannel,
-            None,
-        ) else {
+        let Some(data) =
+            encode_identity_announce(&identity, false, PluginCommandTarget::CurrentChannel, None)
+        else {
             return effects;
         };
 
@@ -405,12 +533,7 @@ impl OpenProtocolEngine {
         effects: &mut EngineEffects,
     ) {
         let identity = self.effective_identity();
-        let Some(data) = encode_identity_message(
-            "announce_ack",
-            &identity,
-            PluginCommandTarget::Client,
-            Some(invoker_id),
-        ) else {
+        let Some(data) = encode_identity_ack(&identity, invoker_id) else {
             return;
         };
         if !self.ack_limiter.try_acquire(cooldown_key, action, now) {
@@ -436,9 +559,12 @@ impl OpenProtocolEngine {
         identity: PeerIdentity,
         effects: &mut EngineEffects,
     ) {
-        if self.config.cache_peers && !peer_uid.is_empty() {
-            self.peer_identities
-                .insert(peer_uid.to_string(), identity.clone());
+        if !peer_uid.is_empty() {
+            self.probe_queue.mark_discovered(peer_uid);
+            if self.config.cache_peers {
+                self.peer_identities
+                    .insert(peer_uid.to_string(), identity.clone());
+            }
         }
         effects.events.push(OpenProtocolEvent::PeerIdentityUpdated {
             peer_uid: peer_uid.to_string(),
@@ -466,18 +592,22 @@ mod tests {
     #[test]
     fn connected_and_duplicate_move_do_not_double_announce() {
         let t0 = Instant::now();
-        let mut engine = OpenProtocolEngine::new(bot_config(), t0);
+        let mut engine =
+            OpenProtocolEngine::new(bot_config().with_server_announce_on_join(true), t0);
 
         let e1 = engine.on_connected(7, 5, t0);
-        assert_eq!(e1.outbound.len(), 1);
+        assert_eq!(e1.outbound.len(), 2);
         assert_eq!(e1.outbound[0].target, PluginCommandTarget::CurrentChannel);
+        assert!(!e1.outbound[0].data.contains("noreply"));
+        assert_eq!(e1.outbound[1].target, PluginCommandTarget::Server);
+        assert!(e1.outbound[1].data.contains(r#""noreply":true"#));
 
-        // 同频道重复通知不触发额外尾随广播
+        // 同频道重复通知不触发额外广播或全服公告
         let e2 = engine.on_self_moved(5, t0 + Duration::from_millis(100));
         assert!(e2.outbound.is_empty());
         assert!(e2.timers.is_empty());
 
-        // 真正切换频道会调度尾随广播
+        // 真正切换频道只调度同频道尾随广播，不再重发全服单向公告
         let e3 = engine.on_self_moved(6, t0 + Duration::from_millis(200));
         assert!(e3.outbound.is_empty());
         assert_eq!(e3.timers.len(), 1);
@@ -491,7 +621,7 @@ mod tests {
         let e1 = engine.on_connected(7, 5, t0);
         let receipt = e1.outbound[0].receipt.clone();
 
-        let retry = engine.on_send_outcome(receipt, false);
+        let retry = engine.on_send_outcome(receipt, SendOutcome::Failed { flood: false });
         assert_eq!(retry.timers.len(), 1);
         let TimerToken::AnnounceRetry { expected_seq } = retry.timers[0].token else {
             panic!("expected AnnounceRetry timer");
@@ -502,8 +632,55 @@ mod tests {
             t0 + Duration::from_millis(500),
         );
         assert_eq!(e2.outbound.len(), 1);
-        let second_failure = engine.on_send_outcome(e2.outbound[0].receipt.clone(), false);
+        let second_failure = engine.on_send_outcome(
+            e2.outbound[0].receipt.clone(),
+            SendOutcome::Failed { flood: false },
+        );
         assert!(second_failure.timers.is_empty());
+    }
+
+    #[test]
+    fn noreply_announce_caches_without_ack_while_query_still_replies() {
+        let t0 = Instant::now();
+        let mut engine = OpenProtocolEngine::new(bot_config(), t0);
+        engine.on_connected(7, 5, t0);
+
+        let beacon = PluginCommandEvent {
+            name: IDENTITY_PLUGIN.to_string(),
+            data: serde_json::json!({
+                "v": 1,
+                "action": "announce",
+                "client_type": "flspeak",
+                "app_name": "FlSpeak",
+                "app_version": "0.1.14",
+                "noreply": true
+            })
+            .to_string(),
+            invoker_id: 21,
+            invoker_name: "Alice".to_string(),
+            invoker_uid: "alice-uid".to_string(),
+        };
+        let eff = engine.on_plugin_command(&beacon, None, t0);
+        assert!(eff.outbound.is_empty());
+        assert_eq!(
+            engine
+                .peer_identity("alice-uid")
+                .map(|i| i.app_name.as_str()),
+            Some("FlSpeak")
+        );
+
+        // 即使 query 报文被伪造携带 noreply: true，也必须正常回发 announce_ack
+        let query = PluginCommandEvent {
+            name: IDENTITY_PLUGIN.to_string(),
+            data: r#"{"v":1,"action":"query","noreply":true}"#.to_string(),
+            invoker_id: 21,
+            invoker_name: "Alice".to_string(),
+            invoker_uid: "alice-uid".to_string(),
+        };
+        let q_eff = engine.on_plugin_command(&query, None, t0);
+        assert_eq!(q_eff.outbound.len(), 1);
+        assert_eq!(q_eff.outbound[0].target, PluginCommandTarget::Client);
+        assert_eq!(q_eff.outbound[0].target_id, Some(21));
     }
 
     #[test]
@@ -543,6 +720,57 @@ mod tests {
     }
 
     #[test]
+    fn cross_channel_probe_queue_cancels_on_announce_and_trips_on_flood() {
+        let t0 = Instant::now();
+        let config =
+            OpenProtocolConfig::new(PeerIdentity::new(ClientKind::FlSpeak, "FlSpeak", "0.1.14"))
+                .with_auto_discover_peers(true);
+        let mut engine = OpenProtocolEngine::new(config, t0);
+        engine.on_connected(3, 1, t0);
+
+        let sync = engine.sync_directory_peers(
+            &[
+                (3, "self-uid", 1),
+                (12, "bot-uid", 8),
+                (13, "peer-a", 9),
+                (14, "peer-b", 10),
+            ],
+            t0,
+        );
+        assert_eq!(sync.timers.len(), 1);
+        assert_eq!(sync.timers[0].token, TimerToken::ProbeNext);
+
+        // 排队期间收到 peer-a 的 noreply 全服公告后，缓存更新且从待探测队列剔除
+        let beacon = PluginCommandEvent {
+            name: IDENTITY_PLUGIN.to_string(),
+            data: r#"{"v":1,"action":"announce","client_type":"flspeak","app_name":"FlSpeak","app_version":"0.1.14","noreply":true}"#.to_string(),
+            invoker_id: 13,
+            invoker_name: "PeerA".to_string(),
+            invoker_uid: "peer-a".to_string(),
+        };
+        let b_eff = engine.on_plugin_command(&beacon, None, t0 + Duration::from_millis(200));
+        assert!(b_eff.outbound.is_empty());
+
+        // 定时器首次触发：探测 bot-uid，并跳过已被剔除的 peer-a，再排下一次 peer-b
+        let t1 = t0 + Duration::from_millis(1500);
+        let p1 = engine.on_timer(TimerToken::ProbeNext, t1);
+        assert_eq!(p1.outbound.len(), 1);
+        assert_eq!(p1.outbound[0].target_id, Some(12));
+        assert_eq!(p1.timers.len(), 1);
+
+        // 遇到服务端防洪错误 524：立即熔断并清空队列，后续定时器不发任何包
+        let halt = engine.on_send_outcome(
+            p1.outbound[0].receipt.clone(),
+            SendOutcome::Failed { flood: true },
+        );
+        assert_eq!(halt.events, vec![OpenProtocolEvent::ProbeHaltedByFlood]);
+
+        let p2 = engine.on_timer(TimerToken::ProbeNext, t1 + Duration::from_millis(900));
+        assert!(p2.outbound.is_empty());
+        assert!(p2.timers.is_empty());
+    }
+
+    #[test]
     fn peer_discovery_caching_query_cooldown_and_inflight_ttl() {
         let t0 = Instant::now();
         let config =
@@ -572,7 +800,6 @@ mod tests {
             Some("TeamSpeakClaw")
         );
 
-        // 查询普通客户端带冷却防重
         let q1 = engine.request_query_peer(20, None, t0);
         assert_eq!(q1.outbound.len(), 1);
         let q2 = engine.request_query_peer(20, None, t0 + Duration::from_secs(5));
@@ -580,7 +807,6 @@ mod tests {
         let q3 = engine.request_query_peer(20, None, t0 + Duration::from_secs(31));
         assert_eq!(q3.outbound.len(), 1);
 
-        // 在途 list_req 在 TTL 到期后允许重新发起
         let f1 = engine.request_fetch_commands(12, "bot-uid", t0);
         assert_eq!(f1.outbound.len(), 1);
         let f2 = engine.request_fetch_commands(12, "bot-uid", t0 + Duration::from_secs(5));

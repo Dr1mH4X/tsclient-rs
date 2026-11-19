@@ -22,6 +22,9 @@ struct IdentityWirePayload {
     app_version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     capabilities: Vec<String>,
+    /// 仅作用于 `announce`：为 `true` 时通知接收方只更新缓存、不回发 `announce_ack`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    noreply: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,7 +54,10 @@ struct ActionOnlyPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundMessage {
-    IdentityAnnounce(Option<PeerIdentity>),
+    IdentityAnnounce {
+        identity: Option<PeerIdentity>,
+        noreply: bool,
+    },
     IdentityQuery,
     IdentityAnnounceAck(PeerIdentity),
     CommandsListReq,
@@ -208,9 +214,30 @@ pub fn fits_wire_budget(
     wire_command_len(plugin, data, target, target_id).is_some_and(|len| len < MAX_PAYLOAD_BYTES)
 }
 
-pub(crate) fn encode_identity_message(
+pub(crate) fn encode_identity_announce(
+    identity: &PeerIdentity,
+    noreply: bool,
+    target: PluginCommandTarget,
+    target_id: Option<i32>,
+) -> Option<String> {
+    encode_identity_payload("announce", identity, noreply, target, target_id)
+}
+
+pub(crate) fn encode_identity_ack(identity: &PeerIdentity, target_id: i32) -> Option<String> {
+    // noreply 仅允许用于 announce，ack 固定为 false。
+    encode_identity_payload(
+        "announce_ack",
+        identity,
+        false,
+        PluginCommandTarget::Client,
+        Some(target_id),
+    )
+}
+
+fn encode_identity_payload(
     action: &str,
     identity: &PeerIdentity,
+    noreply: bool,
     target: PluginCommandTarget,
     target_id: Option<i32>,
 ) -> Option<String> {
@@ -222,6 +249,7 @@ pub(crate) fn encode_identity_message(
         app_name: sanitized.app_name,
         app_version: sanitized.app_version,
         capabilities: sanitized.capabilities,
+        noreply: action == "announce" && noreply,
     };
     let json = serde_json::to_string(&payload).ok()?;
     fits_wire_budget(IDENTITY_PLUGIN, &json, target, target_id).then_some(json)
@@ -287,11 +315,15 @@ pub fn parse_inbound_message(plugin: &str, data: &str) -> Option<InboundMessage>
             match payload.action.as_str() {
                 "announce" => {
                     let parsed = parse_wire_identity(&payload);
-                    Some(InboundMessage::IdentityAnnounce(parsed))
+                    Some(InboundMessage::IdentityAnnounce {
+                        identity: parsed,
+                        noreply: payload.noreply,
+                    })
                 }
                 "announce_ack" => {
                     parse_wire_identity(&payload).map(InboundMessage::IdentityAnnounceAck)
                 }
+                // query 忽略 noreply，确保显式定向查询总是允许按冷却正常回包。
                 "query" => Some(InboundMessage::IdentityQuery),
                 _ => None,
             }
@@ -342,15 +374,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_omits_empty_capabilities_and_roundtrips() {
+    fn identity_omits_empty_capabilities_and_false_noreply_and_roundtrips() {
         let id = PeerIdentity::new(ClientKind::FlSpeak, "FlSpeak", "0.1.14");
-        let json =
-            encode_identity_message("announce", &id, PluginCommandTarget::CurrentChannel, None)
+        let normal_json =
+            encode_identity_announce(&id, false, PluginCommandTarget::CurrentChannel, None)
                 .expect("encode identity");
-        assert!(!json.contains("capabilities"));
+        assert!(!normal_json.contains("capabilities"));
+        assert!(!normal_json.contains("noreply"));
+        assert_eq!(
+            parse_inbound_message(IDENTITY_PLUGIN, &normal_json),
+            Some(InboundMessage::IdentityAnnounce {
+                identity: Some(id.clone()),
+                noreply: false,
+            })
+        );
 
-        let parsed = parse_inbound_message(IDENTITY_PLUGIN, &json);
-        assert_eq!(parsed, Some(InboundMessage::IdentityAnnounce(Some(id))));
+        let beacon_json = encode_identity_announce(&id, true, PluginCommandTarget::Server, None)
+            .expect("encode beacon");
+        assert!(beacon_json.contains(r#""noreply":true"#));
+        assert_eq!(
+            parse_inbound_message(IDENTITY_PLUGIN, &beacon_json),
+            Some(InboundMessage::IdentityAnnounce {
+                identity: Some(id.clone()),
+                noreply: true,
+            })
+        );
+
+        let ack_json = encode_identity_ack(&id, 7).expect("encode ack");
+        assert!(!ack_json.contains("noreply"));
+
+        // 即使收到带 noreply 的 query 报文，也必须解析为标准 IdentityQuery
+        assert_eq!(
+            parse_inbound_message(
+                IDENTITY_PLUGIN,
+                r#"{"v":1,"action":"query","noreply":true}"#
+            ),
+            Some(InboundMessage::IdentityQuery)
+        );
     }
 
     #[test]

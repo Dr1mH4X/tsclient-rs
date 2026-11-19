@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::types::{
-    ACK_GLOBAL_BURST, ACK_GLOBAL_RATE_PER_SEC, CooldownAction, SELF_ANNOUNCE_DEBOUNCE,
+    ACK_GLOBAL_BURST, ACK_GLOBAL_RATE_PER_SEC, CooldownAction, PeerIdentity,
+    SELF_ANNOUNCE_DEBOUNCE, TimerRequest, TimerToken,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -235,9 +236,218 @@ impl InflightCommands {
     }
 }
 
+/// 低速跨频道背景探测队列：每连接每 UID 最多探测一次，遇防洪错误立即熔断清空。
+pub struct ProbeQueue {
+    interval: Duration,
+    initial_delay: Duration,
+    max_peers: usize,
+    queue: VecDeque<(i32, String)>,
+    queued_uids: HashSet<String>,
+    probed_uids: HashSet<String>,
+    last_directory_size: usize,
+    next_probe_at: Option<Instant>,
+    timer_armed: bool,
+    halted_by_flood: bool,
+}
+
+impl ProbeQueue {
+    pub fn new(interval: Duration, initial_delay: Duration, max_peers: usize) -> Self {
+        Self {
+            interval,
+            initial_delay,
+            max_peers,
+            queue: VecDeque::new(),
+            queued_uids: HashSet::new(),
+            probed_uids: HashSet::new(),
+            last_directory_size: 0,
+            next_probe_at: None,
+            timer_armed: false,
+            halted_by_flood: false,
+        }
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.halted_by_flood
+    }
+
+    pub fn halt_for_flood(&mut self) {
+        self.halted_by_flood = true;
+        self.queue.clear();
+        self.queued_uids.clear();
+        self.timer_armed = false;
+    }
+
+    pub fn mark_discovered(&mut self, uid: &str) {
+        if uid.is_empty() {
+            return;
+        }
+        self.probed_uids.insert(uid.to_string());
+        if self.queued_uids.remove(uid) {
+            self.queue.retain(|(_, q_uid)| q_uid != uid);
+        }
+    }
+
+    pub fn remove_clid(&mut self, clid: i32) {
+        let queued_uids = &mut self.queued_uids;
+        self.queue.retain(|(q_clid, q_uid)| {
+            if *q_clid == clid {
+                queued_uids.remove(q_uid);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub fn sync_peers(
+        &mut self,
+        self_clid: Option<i32>,
+        self_channel_id: u64,
+        peers: &[(i32, &str, u64)],
+        known_identities: &HashMap<String, PeerIdentity>,
+        now: Instant,
+    ) -> Option<TimerRequest> {
+        self.last_directory_size = peers.len();
+        if self.halted_by_flood {
+            return None;
+        }
+        if peers.len() > self.max_peers {
+            self.queue.clear();
+            self.queued_uids.clear();
+            return None;
+        }
+
+        let mut live_by_uid: HashMap<&str, (i32, u64)> = HashMap::new();
+        for &(clid, uid, channel_id) in peers {
+            if clid > 0 && !uid.is_empty() && self_clid != Some(clid) {
+                live_by_uid.insert(uid, (clid, channel_id));
+            }
+        }
+
+        self.queued_uids.clear();
+        let mut retained = VecDeque::with_capacity(self.queue.len());
+        while let Some((_, uid)) = self.queue.pop_front() {
+            if let Some(&(live_clid, _)) = live_by_uid.get(uid.as_str())
+                && !known_identities.contains_key(&uid)
+                && !self.probed_uids.contains(&uid)
+                && self.queued_uids.insert(uid.clone())
+            {
+                retained.push_back((live_clid, uid));
+            }
+        }
+        self.queue = retained;
+
+        let mut same_channel = Vec::new();
+        let mut other_channels = Vec::new();
+        for &(clid, uid, channel_id) in peers {
+            if clid <= 0
+                || uid.is_empty()
+                || self_clid == Some(clid)
+                || known_identities.contains_key(uid)
+                || self.probed_uids.contains(uid)
+                || self.queued_uids.contains(uid)
+            {
+                continue;
+            }
+            if self_channel_id != 0 && channel_id == self_channel_id {
+                same_channel.push((clid, uid.to_string()));
+            } else {
+                other_channels.push((clid, uid.to_string()));
+            }
+        }
+
+        for (clid, uid) in same_channel.into_iter().chain(other_channels) {
+            if self.queued_uids.insert(uid.clone()) {
+                self.queue.push_back((clid, uid));
+            }
+        }
+
+        self.arm_timer(now, self.initial_delay)
+    }
+
+    pub fn enqueue_joined(
+        &mut self,
+        clid: i32,
+        uid: &str,
+        self_clid: Option<i32>,
+        known_identities: &HashMap<String, PeerIdentity>,
+        now: Instant,
+    ) -> Option<TimerRequest> {
+        if self.halted_by_flood
+            || self.last_directory_size >= self.max_peers
+            || clid <= 0
+            || uid.is_empty()
+            || self_clid == Some(clid)
+            || known_identities.contains_key(uid)
+            || self.probed_uids.contains(uid)
+            || !self.queued_uids.insert(uid.to_string())
+        {
+            return None;
+        }
+        self.queue.push_back((clid, uid.to_string()));
+        self.arm_timer(now, self.initial_delay)
+    }
+
+    pub fn pop_next_ready(
+        &mut self,
+        known_identities: &HashMap<String, PeerIdentity>,
+        now: Instant,
+    ) -> (Option<(i32, String)>, Option<TimerRequest>) {
+        self.timer_armed = false;
+        if self.halted_by_flood {
+            self.queue.clear();
+            self.queued_uids.clear();
+            return (None, None);
+        }
+
+        while let Some((clid, uid)) = self.queue.pop_front() {
+            self.queued_uids.remove(&uid);
+            if known_identities.contains_key(&uid) || self.probed_uids.contains(&uid) {
+                continue;
+            }
+            self.probed_uids.insert(uid.clone());
+            self.next_probe_at = Some(now + self.interval);
+            let next_timer = self.arm_timer(now, self.interval);
+            return (Some((clid, uid)), next_timer);
+        }
+
+        (None, None)
+    }
+
+    pub fn reset(&mut self) {
+        self.queue.clear();
+        self.queued_uids.clear();
+        self.probed_uids.clear();
+        self.last_directory_size = 0;
+        self.next_probe_at = None;
+        self.timer_armed = false;
+        self.halted_by_flood = false;
+    }
+
+    fn arm_timer(&mut self, now: Instant, min_delay: Duration) -> Option<TimerRequest> {
+        if self.queue.is_empty() || self.timer_armed || self.halted_by_flood {
+            return None;
+        }
+        self.timer_armed = true;
+        let paced = self.next_probe_at.map_or(min_delay, |next| {
+            next.saturating_duration_since(now).max(min_delay)
+        });
+        Some(TimerRequest {
+            delay: paced,
+            token: TimerToken::ProbeNext,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::open_protocol::types::ClientKind;
 
     #[test]
     fn ack_rate_limiter_isolates_actions_enforces_bucket_and_rolls_back() {
@@ -339,5 +549,56 @@ mod tests {
         assert!(query.try_acquire("peer_1", t0 + Duration::from_secs(1)));
         assert!(!query.try_acquire("peer_1", t0 + Duration::from_secs(5)));
         assert!(query.try_acquire("peer_1", t0 + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn probe_queue_dedups_cancels_on_discovery_and_halts_on_flood() {
+        let t0 = Instant::now();
+        let mut queue =
+            ProbeQueue::new(Duration::from_millis(900), Duration::from_millis(1500), 64);
+        let known = HashMap::from([(
+            "known-uid".to_string(),
+            PeerIdentity::new(ClientKind::FlSpeak, "FlSpeak", "0.1.14"),
+        )]);
+        let peers = vec![
+            (1, "self-uid", 5),
+            (2, "known-uid", 5),
+            (3, "other-a", 9),
+            (4, "same-b", 5),
+            (5, "other-c", 10),
+        ];
+
+        let timer = queue
+            .sync_peers(Some(1), 5, &peers, &known, t0)
+            .expect("timer armed");
+        assert_eq!(timer.delay, Duration::from_millis(1500));
+        assert_eq!(queue.queued_len(), 3);
+
+        // 收到 announce 后反向剔除排队成员
+        queue.mark_discovered("other-a");
+        assert_eq!(queue.queued_len(), 2);
+
+        // 同频道未识别成员优先出队
+        let (first, next_timer) = queue.pop_next_ready(&known, t0 + Duration::from_millis(1500));
+        assert_eq!(first, Some((4, "same-b".to_string())));
+        assert_eq!(
+            next_timer.map(|t| t.delay),
+            Some(Duration::from_millis(900))
+        );
+
+        // 防洪熔断立即清空剩余队列并拒绝新入队
+        queue.halt_for_flood();
+        assert!(queue.is_halted());
+        assert_eq!(queue.queued_len(), 0);
+        assert!(
+            queue
+                .enqueue_joined(6, "late-uid", Some(1), &known, t0 + Duration::from_secs(2))
+                .is_none()
+        );
+        let (popped_after_halt, _) = queue.pop_next_ready(&known, t0 + Duration::from_secs(3));
+        assert_eq!(popped_after_halt, None);
+
+        queue.reset();
+        assert!(!queue.is_halted());
     }
 }
