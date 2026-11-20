@@ -1622,6 +1622,7 @@ impl Client {
             cmd,
             timeout_ms,
             None,
+            None,
         )
         .await
     }
@@ -2058,7 +2059,7 @@ impl Client {
             Self::build_cmd_handler_simple(&self.inner.lock().unwrap().cmd_middlewares, &sender);
     }
 
-    #[cfg(feature = "open-protocol")]
+    #[cfg(any(feature = "open-protocol", feature = "stream"))]
     pub(crate) fn weak_handle(&self) -> ClientWeak {
         ClientWeak {
             inner: Arc::downgrade(&self.inner),
@@ -2102,9 +2103,73 @@ impl Client {
         }
         Self::flush_deferred_events(&self.inner, &self.final_event_handler);
     }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn install_stream_test_handler<F>(&self, handler: F)
+    where
+        F: Fn(String) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        *self.final_cmd_handler.lock().unwrap() = Arc::new(handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn inject_stream_test_line(&self, clid: i32, line: &str) {
+        let sender = self.handler.lock().unwrap().create_packet_sender();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.clid = clid;
+            inner.defer_events = true;
+            inner.handle_command_str(line, &sender);
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn set_stream_test_connected(&self, clid: i32) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.clid = clid;
+            inner.status = ClientStatus::Connected;
+            inner.cmd_track.signal_welcome_complete();
+            inner.defer_events = true;
+            inner.mark_connected();
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn trigger_stream_test_disconnect(&self, err: Option<Error>) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.cmd_track.reset();
+            inner.defer_events = true;
+            inner.handle_connection_closed(err);
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn trigger_stream_test_overflow(&self) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.defer_events = true;
+            inner.dispatch_event(Event::NotificationOverflow {
+                queue: "raw_notification".to_string(),
+            });
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn resolve_stream_test_rc(&self, rc: i32, err: Option<Error>) {
+        self.inner.lock().unwrap().cmd_track.resolve(rc, err);
+    }
 }
 
-#[cfg(feature = "open-protocol")]
+#[cfg(any(feature = "open-protocol", feature = "stream"))]
 #[derive(Clone)]
 pub(crate) struct ClientWeak {
     inner: std::sync::Weak<Mutex<ClientInner>>,
@@ -2113,7 +2178,7 @@ pub(crate) struct ClientWeak {
     logger: std::sync::Weak<dyn Logger>,
 }
 
-#[cfg(feature = "open-protocol")]
+#[cfg(any(feature = "open-protocol", feature = "stream"))]
 impl ClientWeak {
     pub(crate) fn upgrade(&self) -> Option<ClientHandle> {
         Some(ClientHandle {
@@ -2125,7 +2190,7 @@ impl ClientWeak {
     }
 }
 
-#[cfg(feature = "open-protocol")]
+#[cfg(any(feature = "open-protocol", feature = "stream"))]
 pub(crate) struct ClientHandle {
     inner: Arc<Mutex<ClientInner>>,
     throttle: Arc<tokio::sync::Mutex<CommandThrottle>>,
@@ -2133,12 +2198,13 @@ pub(crate) struct ClientHandle {
     logger: Arc<dyn Logger>,
 }
 
-#[cfg(feature = "open-protocol")]
+#[cfg(any(feature = "open-protocol", feature = "stream"))]
 impl ClientHandle {
     pub(crate) fn status(&self) -> ClientStatus {
         self.inner.lock().unwrap().status
     }
 
+    #[cfg(feature = "open-protocol")]
     pub(crate) fn connection_epoch(&self) -> u64 {
         self.inner.lock().unwrap().connection_epoch
     }
@@ -2147,6 +2213,7 @@ impl ClientHandle {
         self.inner.lock().unwrap().clid
     }
 
+    #[cfg(feature = "open-protocol")]
     pub(crate) fn channel_id(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner
@@ -2161,6 +2228,17 @@ impl ClientHandle {
         inner.directory_ready.then(|| inner.directory.snapshot())
     }
 
+    #[cfg(feature = "stream")]
+    pub(crate) fn server_info(&self) -> Option<ServerInfo> {
+        self.inner.lock().unwrap().server_info()
+    }
+
+    #[cfg(feature = "stream")]
+    pub(crate) fn client_info(&self, clid: i32) -> Option<ClientInfo> {
+        self.inner.lock().unwrap().directory.client(clid).cloned()
+    }
+
+    #[cfg(feature = "open-protocol")]
     pub(crate) async fn send_plugin_command_for_epoch(
         &self,
         name: &str,
@@ -2178,9 +2256,30 @@ impl ClientHandle {
             &cmd,
             crate::api::CMD_TIMEOUT_MS,
             Some(expected_epoch),
+            None,
         )
         .await?;
         Ok(())
+    }
+
+    #[cfg(feature = "stream")]
+    pub(crate) async fn exec_command_for_stream(
+        &self,
+        cmd: &str,
+        timeout_ms: u64,
+        sent_flag: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<HashMap<String, String>>, Error> {
+        exec_command_parts(
+            &self.inner,
+            &self.throttle,
+            &self.final_cmd_handler,
+            &*self.logger,
+            cmd,
+            timeout_ms,
+            None,
+            sent_flag,
+        )
+        .await
     }
 }
 
@@ -2192,6 +2291,7 @@ async fn exec_command_parts(
     cmd: &str,
     timeout_ms: u64,
     expected_epoch: Option<u64>,
+    sent_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<HashMap<String, String>>, Error> {
     if cmd
         .split_whitespace()
@@ -2228,6 +2328,9 @@ async fn exec_command_parts(
             let handler = final_cmd_handler_arc.lock().unwrap().clone();
             handler(commands::append_return_code(cmd, rc)).await?;
             sent = true;
+            if let Some(flag) = sent_flag {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
             drop(throttle);
             rx.await
                 .map_err(|_| Error::Teamspeak("command channel closed".into()))
@@ -2752,6 +2855,7 @@ mod tests {
             input_muted: None,
             output_muted: None,
             channel_commander: None,
+            is_streaming: false,
         }
     }
 
@@ -4146,7 +4250,10 @@ mod tests {
             make_voice_packet(PacketType::Voice, 10, 7, 4, &[1], now),
         );
         assert_eq!(*mw_seen.lock().unwrap(), vec![10]);
-        assert_eq!(*client_probe.lock().unwrap(), Some(ClientStatus::Disconnected));
+        assert_eq!(
+            *client_probe.lock().unwrap(),
+            Some(ClientStatus::Disconnected)
+        );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.on_voice_data(Arc::new(move |ev| {

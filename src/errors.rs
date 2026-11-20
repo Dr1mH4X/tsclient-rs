@@ -1,6 +1,46 @@
 use std::fmt;
 use thiserror::Error;
 
+/// Known TeamSpeak server error codes exposed for typed matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ErrorCode {
+    StreamNotFound = 0x1603,
+    StreamNotParticipating = 0x1604,
+    StreamAlreadyJoined = 0x1606,
+    StreamJoinRequestRedacted = 0x1607,
+}
+
+impl ErrorCode {
+    /// Return the numeric server error code.
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// Match a numeric server error code against known variants.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0x1603 => Some(Self::StreamNotFound),
+            0x1604 => Some(Self::StreamNotParticipating),
+            0x1606 => Some(Self::StreamAlreadyJoined),
+            0x1607 => Some(Self::StreamJoinRequestRedacted),
+            _ => None,
+        }
+    }
+
+    /// Parse a decimal `id` string from a server `error` packet.
+    pub fn from_id(id: &str) -> Option<Self> {
+        let code = id.trim().parse::<u32>().ok()?;
+        Self::from_code(code)
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{:04x}", self.code())
+    }
+}
+
 // ---- Individual error types (1:1 with TS) -----------------------------------
 
 #[derive(Debug, Clone)]
@@ -32,6 +72,18 @@ impl fmt::Display for ServerError {
 }
 
 impl std::error::Error for ServerError {}
+
+impl ServerError {
+    /// Parse `id` into its numeric server error code when present and valid.
+    pub fn code(&self) -> Option<u32> {
+        self.id.trim().parse::<u32>().ok()
+    }
+
+    /// Match `id` against [`ErrorCode`].
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        ErrorCode::from_id(&self.id)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CommandTimeoutError {
@@ -269,6 +321,30 @@ impl Error {
         matches!(self, Self::ServerError { id, .. } if id == "524")
     }
 
+    /// Return the server error `id` string when this is [`Error::ServerError`].
+    pub fn server_error_id(&self) -> Option<&str> {
+        match self {
+            Self::ServerError { id, .. } => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Return the parsed numeric server error code when this is [`Error::ServerError`].
+    pub fn server_error_code(&self) -> Option<u32> {
+        self.server_error_id()
+            .and_then(|id| id.trim().parse::<u32>().ok())
+    }
+
+    /// Match this error's server code against [`ErrorCode`].
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        self.server_error_id().and_then(ErrorCode::from_id)
+    }
+
+    /// Check whether this error carries the given [`ErrorCode`].
+    pub fn is_server_error_code(&self, code: ErrorCode) -> bool {
+        self.error_code() == Some(code)
+    }
+
     pub(crate) fn flood_retry_delay(&self) -> Option<std::time::Duration> {
         if !self.is_flood_error() {
             return None;
@@ -299,5 +375,40 @@ impl Error {
         Some(std::time::Duration::from_millis(
             digits.parse::<u64>().ok()? * multiplier,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_error_codes_match_wire_decimal_and_hex_values() {
+        assert_eq!(ErrorCode::StreamNotFound.code(), 0x1603);
+        assert_eq!(ErrorCode::StreamNotParticipating.code(), 0x1604);
+        assert_eq!(ErrorCode::StreamAlreadyJoined.code(), 0x1606);
+        assert_eq!(ErrorCode::StreamJoinRequestRedacted.code(), 0x1607);
+
+        assert_eq!(ErrorCode::from_id("5635"), Some(ErrorCode::StreamNotFound));
+        assert_eq!(
+            ErrorCode::from_id("5636"),
+            Some(ErrorCode::StreamNotParticipating)
+        );
+        assert_eq!(
+            ErrorCode::from_id("5638"),
+            Some(ErrorCode::StreamAlreadyJoined)
+        );
+        assert_eq!(
+            ErrorCode::from_id("5639"),
+            Some(ErrorCode::StreamJoinRequestRedacted)
+        );
+
+        let err = Error::ServerError {
+            id: "5635".to_string(),
+            server_message: "not found".to_string(),
+            extra_message: None,
+        };
+        assert_eq!(err.server_error_code(), Some(5635));
+        assert!(err.is_server_error_code(ErrorCode::StreamNotFound));
     }
 }

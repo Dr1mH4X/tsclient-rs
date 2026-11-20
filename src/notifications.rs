@@ -104,6 +104,7 @@ fn handle_client_enter_view(
         input_muted: None,
         output_muted: None,
         channel_commander: None,
+        is_streaming: false,
     });
 
     if info.id != 0 {
@@ -403,6 +404,7 @@ mod tests {
             input_muted: None,
             output_muted: None,
             channel_commander: None,
+            is_streaming: false,
         }));
         let params = make_params(&[("clid", "42"), ("reasonid", "1"), ("reasonmsg", "left")]);
         let result = handle_client_left_view(&params, 99, &mut clients);
@@ -431,6 +433,7 @@ mod tests {
             input_muted: None,
             output_muted: None,
             channel_commander: None,
+            is_streaming: false,
         }));
         let params = make_params(&[
             ("invokerid", "10"),
@@ -500,6 +503,7 @@ mod tests {
             input_muted: None,
             output_muted: None,
             channel_commander: None,
+            is_streaming: false,
         });
         let cmd_no_invoker = crate::command::parse_command(
             "notifyplugincmd name=query_test data=payload invokerid=99",

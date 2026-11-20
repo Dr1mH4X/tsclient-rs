@@ -97,6 +97,8 @@ pub struct ClientInfo {
     /// Whether the client speaks as channel commander
     /// (`client_is_channel_commander`).
     pub channel_commander: Option<bool>,
+    /// Whether the client is currently sharing a stream (`client_is_streaming`).
+    pub is_streaming: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +128,9 @@ pub struct ServerInfo {
     pub hostbanner_gfx_url: Option<String>,
     pub platform: String,
     pub version: String,
+    /// Comma-separated protocol extensions reported in `virtualserver_capability_extensions`,
+    /// trimmed, non-empty, and deduplicated in server order.
+    pub extensions: Vec<String>,
     pub raw: HashMap<String, String>,
 }
 
@@ -310,7 +315,7 @@ pub struct ResolvedAddr {
 
 // ---- AbortSignal (TS AbortSignal equivalent) --------------------------------
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AbortSignal {
     tx: tokio::sync::watch::Sender<bool>,
     rx: tokio::sync::watch::Receiver<bool>,
