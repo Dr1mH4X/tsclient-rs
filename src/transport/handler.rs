@@ -42,6 +42,7 @@ struct ResendPacket {
     last_send: Instant,
     retry_count: u32,
     next_interval: u64,
+    dummy: bool,
 }
 
 struct HandlerCore {
@@ -136,6 +137,7 @@ impl HandlerCore {
             last_send: Instant::now(),
             retry_count: 0,
             next_interval: RESEND_BASE_INTERVAL_MS,
+            dummy: !self.crypt.crypto_init_complete,
         };
 
         if p_type == PacketType::Init1 {
@@ -689,6 +691,9 @@ fn handle_raw_packet(
 
     let (parsed_id, parsed_type_flagged) = super::packet::parse_s2c_header(header);
     let p_type_val = parsed_type_flagged & 0x0f;
+    if p_type_val == PacketType::Init1 as u8 && c.crypt.crypto_init_complete {
+        return;
+    }
 
     let generation_id = resolve_generation(c, parsed_id, p_type_val);
 
@@ -1028,11 +1033,6 @@ fn try_decompress(logger: &Arc<dyn Logger>, packet: &mut Packet) {
 fn update_post_receive_state(c: &mut HandlerCore, p: &Packet) {
     let p_type = packet_type(p);
 
-    if p_type == PacketType::Init1 {
-        c.init_packet_check = None;
-        return;
-    }
-
     if (p_type == PacketType::Ack || p_type == PacketType::AckLow) && p.data.len() >= 2 {
         let ack_id = u16::from_be_bytes([p.data[0], p.data[1]]);
         let target_type = if p_type == PacketType::Ack {
@@ -1049,12 +1049,13 @@ fn update_post_receive_state(c: &mut HandlerCore, p: &Packet) {
 
 fn check_resends_sync(c: &mut HandlerCore, now: Instant, on_close: &Arc<Mutex<Option<OnClose>>>) {
     if now.duration_since(c.last_message_received).as_millis() as u64 > PACKET_TIMEOUT_MS {
+        c.logger.warn("idle timeout", &[]);
         trigger_close(c, on_close, Some(Error::from("idle timeout")));
         return;
     }
 
     if let Some(ref mut rp) = c.init_packet_check {
-        do_resend_sync(&mut c.crypt, rp, now, &mut c.pending_sends);
+        do_resend_sync(&mut c.crypt, rp, now, &mut c.pending_sends, &c.logger);
     }
 
     // Iterate in insertion order (matching JS Map iteration).
@@ -1071,7 +1072,7 @@ fn check_resends_sync(c: &mut HandlerCore, now: Instant, on_close: &Arc<Mutex<Op
             return;
         }
 
-        do_resend_sync(&mut c.crypt, &mut rp, now, &mut c.pending_sends);
+        do_resend_sync(&mut c.crypt, &mut rp, now, &mut c.pending_sends, &c.logger);
         c.ack_manager.insert(key, rp);
     }
 }
@@ -1081,6 +1082,7 @@ fn do_resend_sync(
     rp: &mut ResendPacket,
     now: Instant,
     pending_sends: &mut Vec<Vec<u8>>,
+    logger: &Arc<dyn Logger>,
 ) {
     if (now.duration_since(rp.last_send).as_millis() as u64) < rp.next_interval {
         return;
@@ -1090,10 +1092,15 @@ fn do_resend_sync(
     rp.retry_count += 1;
     rp.next_interval = (rp.next_interval * 2).min(MAX_RETRY_INTERVAL_MS);
 
-    let dummy = !crypt.crypto_init_complete;
+    let dummy = rp.dummy;
     let unencrypted = (packet_flags(&rp.packet) & PacketFlags::Unencrypted) != 0;
     let header = build_c2s_header(&rp.packet);
     let p_type = packet_type(&rp.packet);
+
+    logger.debug(
+        "resending packet",
+        &[&(p_type as u8), &rp.packet.id, &rp.retry_count],
+    );
 
     let (ciphertext, tag) = crypt
         .encrypt(
@@ -1373,7 +1380,9 @@ mod tests {
 
     fn crypt_with_session_secret() -> Crypt {
         let mut crypt = Crypt::new(crate::crypto::generate_identity(0));
-        crypt.set_shared_secret(&[1u8; 10], &[2u8; 10], &[3u8; 20]);
+        crypt
+            .set_shared_secret(&[1u8; 10], &[2u8; 10], &[3u8; 20])
+            .unwrap();
         crypt
     }
 
@@ -1498,5 +1507,109 @@ mod tests {
         }
 
         assert_eq!(*received.lock().unwrap(), vec![expected_at]);
+    }
+
+    #[test]
+    fn init1_resend_survives_incoming_init1_until_final_ack_and_drops_after_init() {
+        let crypt = Crypt::new(crate::crypto::generate_identity(0));
+        let handler = PacketHandler::new(crypt, Arc::new(crate::types::NoopLogger));
+        let delivered = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let delivered_cb = Arc::clone(&delivered);
+        let on_packet: Arc<Mutex<Option<OnPacket>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |p| {
+                delivered_cb.lock().unwrap().push(p.type_flagged & 0x0f);
+            }))));
+        let on_close: Arc<Mutex<Option<OnClose>>> = Arc::new(Mutex::new(None));
+
+        let mut raw_init1 = Vec::with_capacity(TAG_SIZE + 3 + 21);
+        raw_init1.extend_from_slice(b"TS3INIT1");
+        raw_init1.extend_from_slice(&101u16.to_be_bytes());
+        raw_init1.push(PacketType::Init1 as u8);
+        raw_init1.extend_from_slice(&[0x55u8; 21]);
+
+        {
+            let mut core = handler.core.lock().unwrap();
+            let first = core.build_and_track_packet(PacketType::Init1, vec![0xaa, 0xbb], 0, true);
+            assert!(core.init_packet_check.is_some());
+
+            // Incoming Init1 does not clear init_packet_check.
+            handle_raw_packet(&mut core, &raw_init1, Instant::now(), &on_packet);
+            assert!(core.init_packet_check.is_some());
+            assert_eq!(*delivered.lock().unwrap(), vec![PacketType::Init1 as u8]);
+
+            let future = Instant::now() + Duration::from_millis(RESEND_BASE_INTERVAL_MS + 50);
+            check_resends_sync(&mut core, future, &on_close);
+            assert_eq!(core.pending_sends, vec![first]);
+            core.pending_sends.clear();
+        }
+
+        // Only received_final_init_ack clears init_packet_check and stops resends.
+        handler.received_final_init_ack();
+        {
+            let mut core = handler.core.lock().unwrap();
+            assert!(core.init_packet_check.is_none());
+            let future = Instant::now() + Duration::from_millis(RESEND_BASE_INTERVAL_MS * 4);
+            check_resends_sync(&mut core, future, &on_close);
+            assert!(core.pending_sends.is_empty());
+
+            // After crypto_init_complete == true, incoming Init1 is dropped before on_packet.
+            core.crypt
+                .set_shared_secret(&[1u8; 10], &[2u8; 10], &[3u8; 20])
+                .unwrap();
+            handle_raw_packet(&mut core, &raw_init1, Instant::now(), &on_packet);
+            assert_eq!(delivered.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn clientek_resends_with_dummy_key_even_after_crypto_init_completes() {
+        let crypt = Crypt::new(crate::crypto::generate_identity(0));
+        let handler = PacketHandler::new(crypt, Arc::new(crate::types::NoopLogger));
+        let on_close: Arc<Mutex<Option<OnClose>>> = Arc::new(Mutex::new(None));
+        let payload = b"clientek ek=x proof=y";
+
+        let first_datagram = {
+            let mut core = handler.core.lock().unwrap();
+            let flags = apply_protocol_flags(PacketType::Command, 0);
+            core.build_and_track_packet(PacketType::Command, payload.to_vec(), flags, true)
+        };
+
+        // crypto_init2 completes right after clientek is sent.
+        {
+            let mut core = handler.core.lock().unwrap();
+            core.crypt
+                .set_shared_secret(&[4u8; 10], &[5u8; 20], &[6u8; 30])
+                .unwrap();
+            let future = Instant::now() + Duration::from_millis(RESEND_BASE_INTERVAL_MS + 50);
+            check_resends_sync(&mut core, future, &on_close);
+            assert_eq!(core.pending_sends.len(), 1);
+            let resent = core.pending_sends.pop().unwrap();
+            assert_eq!(resent, first_datagram);
+
+            // Decrypt the resent C2S datagram using the dummy key (from_server=false).
+            let tag = &resent[..TAG_SIZE];
+            let header = &resent[TAG_SIZE..TAG_SIZE + HEADER_SIZE];
+            let ciphertext = &resent[TAG_SIZE + HEADER_SIZE..];
+            let p_id = u16::from_be_bytes([header[0], header[1]]);
+            let p_type = header[4] & 0x0f;
+
+            let (dummy_key, dummy_nonce) =
+                core.crypt.get_key_nonce(false, p_id, 0, p_type, true);
+            let decrypted = crate::crypto::EAX::new(&dummy_key)
+                .unwrap()
+                .decrypt(&dummy_nonce, header, ciphertext, tag)
+                .expect("resent clientek must decrypt with dummy key");
+            assert_eq!(decrypted, payload);
+
+            // Session key must fail to decrypt the resent clientek.
+            let (sess_key, sess_nonce) =
+                core.crypt.get_key_nonce(false, p_id, 0, p_type, false);
+            assert!(
+                crate::crypto::EAX::new(&sess_key)
+                    .unwrap()
+                    .decrypt(&sess_nonce, header, ciphertext, tag)
+                    .is_err()
+            );
+        }
     }
 }

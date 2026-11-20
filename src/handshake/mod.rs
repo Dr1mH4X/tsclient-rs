@@ -26,6 +26,8 @@ pub fn handle_handshake_init_iv(
     sender: &PacketSender,
     params: &HashMap<String, String>,
 ) {
+    sender.received_final_init_ack();
+
     let alpha = params.get("alpha").map(|s| s.as_str()).unwrap_or("");
     let beta = params.get("beta").map(|s| s.as_str()).unwrap_or("");
     let omega = params.get("omega").map(|s| s.as_str()).unwrap_or("");

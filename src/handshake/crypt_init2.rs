@@ -40,7 +40,7 @@ pub fn crypto_init2(
     let shared_secret = get_shared_secret2(&key, private_key)?;
 
     let alpha_tmp = crypt.alpha_tmp.clone();
-    crypt.set_shared_secret(&alpha_tmp, &beta_bytes, &shared_secret);
+    crypt.set_shared_secret(&alpha_tmp, &beta_bytes, &shared_secret)?;
     Ok(())
 }
 

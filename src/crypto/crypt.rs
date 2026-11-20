@@ -26,6 +26,12 @@ pub struct KeyNonce {
     pub r#gen: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnsweredInit1Challenge {
+    pub(crate) challenge: Vec<u8>,
+    pub(crate) response: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct Crypt {
     pub identity: Identity,
@@ -33,6 +39,8 @@ pub struct Crypt {
     pub fake_signature: Vec<u8>,
     pub alpha_tmp: Vec<u8>,
     pub crypto_init_complete: bool,
+    pub(crate) init1_step: Option<u8>,
+    pub(crate) answered_init1_challenge: Option<AnsweredInit1Challenge>,
     cached_keys: HashMap<i64, KeyNonce>,
 }
 
@@ -44,8 +52,15 @@ impl Crypt {
             fake_signature: vec![0u8; FAKE_SIGNATURE_SIZE],
             alpha_tmp: Vec::new(),
             crypto_init_complete: false,
+            init1_step: None,
+            answered_init1_challenge: None,
             cached_keys: HashMap::new(),
         }
+    }
+
+    pub(crate) fn reset_init1_state(&mut self) {
+        self.init1_step = None;
+        self.answered_init1_challenge = None;
     }
 
     pub fn solve_rsa_challenge(
@@ -57,12 +72,18 @@ impl Crypt {
         if level < 0 || level > 1_000_000 {
             return Err(Error::Teamspeak("RSA challenge level out of range".into()));
         }
+        if offset.checked_add(128).is_none_or(|end| data.len() < end) {
+            return Err(Error::Teamspeak("RSA challenge data too short".into()));
+        }
 
         let x_bytes = &data[offset..offset + 64];
         let n_bytes = &data[offset + 64..offset + 128];
 
         let y = bytes_to_bigint(x_bytes);
         let n = bytes_to_bigint(n_bytes);
+        if n == num_bigint::BigInt::ZERO {
+            return Err(Error::Teamspeak("RSA challenge modulus is zero".into()));
+        }
 
         let mut y = y;
         for _ in 0..level {
@@ -83,15 +104,25 @@ impl Crypt {
         let server_pub = super::identity::import_public_key(&omega_bytes)?;
         let shared_secret = self.get_shared_secret(&server_pub);
 
-        self.set_shared_secret(&alpha_bytes, &beta_bytes, &shared_secret);
+        self.set_shared_secret(&alpha_bytes, &beta_bytes, &shared_secret)?;
         Ok(())
     }
 
-    pub fn set_shared_secret(&mut self, alpha: &[u8], beta: &[u8], shared_key: &[u8]) {
+    pub fn set_shared_secret(
+        &mut self,
+        alpha: &[u8],
+        beta: &[u8],
+        shared_key: &[u8],
+    ) -> Result<(), Error> {
+        if alpha.len() != IV_ALPHA_SIZE || beta.is_empty() {
+            return Err(Error::Teamspeak("invalid alpha or beta length".into()));
+        }
+
+        self.cached_keys.clear();
         self.iv_struct = Vec::with_capacity(IV_ALPHA_SIZE + beta.len());
         for i in 0..IV_ALPHA_SIZE {
             let a = shared_key.get(i).copied().unwrap_or(0);
-            let b = alpha.get(i).copied().unwrap_or(0);
+            let b = alpha[i];
             self.iv_struct.push(a ^ b);
         }
         for i in 0..beta.len() {
@@ -103,6 +134,7 @@ impl Crypt {
         let hash = Sha1::digest(&self.iv_struct);
         self.fake_signature = hash[..FAKE_SIGNATURE_SIZE].to_vec();
         self.crypto_init_complete = true;
+        Ok(())
     }
 
     pub fn get_key_nonce(
@@ -236,4 +268,46 @@ fn bigint_to_bytes(value: &num_bigint::BigInt, size: usize) -> Vec<u8> {
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::generate_identity;
+
+    #[test]
+    fn set_shared_secret_validates_alpha_and_beta_lengths() {
+        let mut crypt = Crypt::new(generate_identity(0));
+
+        assert!(crypt.set_shared_secret(&[1u8; 9], &[2u8; 1], &[3u8; 20]).is_err());
+        assert!(!crypt.crypto_init_complete);
+
+        assert!(crypt.set_shared_secret(&[1u8; 11], &[2u8; 1], &[3u8; 20]).is_err());
+        assert!(!crypt.crypto_init_complete);
+
+        assert!(crypt.set_shared_secret(&[1u8; 10], &[], &[3u8; 20]).is_err());
+        assert!(!crypt.crypto_init_complete);
+
+        assert!(crypt.set_shared_secret(&[1u8; 10], &[2u8; 1], &[3u8; 20]).is_ok());
+        assert!(crypt.crypto_init_complete);
+    }
+
+    #[test]
+    fn set_shared_secret_clears_cached_keys() {
+        let mut crypt = Crypt::new(generate_identity(0));
+        crypt.set_shared_secret(&[1u8; 10], &[2u8; 10], &[3u8; 20]).unwrap();
+        let first = crypt.get_key_nonce(true, 1, 0, 2, false);
+
+        let alpha = [7u8; 10];
+        let beta = [8u8; 10];
+        let secret = [9u8; 20];
+        crypt.set_shared_secret(&alpha, &beta, &secret).unwrap();
+
+        let mut reference = Crypt::new(generate_identity(0));
+        reference.set_shared_secret(&alpha, &beta, &secret).unwrap();
+
+        let second = crypt.get_key_nonce(true, 1, 0, 2, false);
+        assert_ne!(second, first);
+        assert_eq!(second, reference.get_key_nonce(true, 1, 0, 2, false));
+    }
 }

@@ -498,6 +498,9 @@ impl ClientInner {
         if p_type == 8
         /* Init1 */
         {
+            if self.crypt.crypto_init_complete {
+                return;
+            }
             match crate::handshake::process_init1(&mut self.crypt, Some(&p.data)) {
                 Ok(Some(response)) => {
                     sender.set_crypt(self.crypt.clone());
@@ -650,7 +653,6 @@ impl ClientInner {
                 }
                 "initivexpand2" => {
                     crate::handshake::handle_handshake_expand2(self, sender, &cmd.params);
-                    sender.set_crypt(self.crypt.clone());
                 }
                 "initserver" => {
                     crate::handshake::handle_init_server(self, sender, &cmd.params);
