@@ -244,10 +244,7 @@ fn pop_last_char(s: &mut String) -> bool {
 }
 
 fn drop_excess_capability(caps: &mut Vec<String>) -> bool {
-    if let Some(pos) = caps
-        .iter()
-        .rposition(|cap| cap != CAP_CHAT_SLASH_COMMANDS)
-    {
+    if let Some(pos) = caps.iter().rposition(|cap| cap != CAP_CHAT_SLASH_COMMANDS) {
         caps.remove(pos);
         true
     } else if !caps.is_empty() {
@@ -575,7 +572,9 @@ mod tests {
             Some(65535),
         )
         .unwrap();
-        assert!(crate::commands::append_return_code(&trimmed_wire, i32::MAX).len() < MAX_PAYLOAD_BYTES);
+        assert!(
+            crate::commands::append_return_code(&trimmed_wire, i32::MAX).len() < MAX_PAYLOAD_BYTES
+        );
         let Some(InboundMessage::CommandsListAck(trimmed_decoded)) =
             parse_inbound_message(COMMANDS_PLUGIN, &trimmed_json)
         else {
@@ -591,12 +590,8 @@ mod tests {
             .map(|i| format!("{i:02}_") + &"/".repeat(29))
             .collect();
         caps.push(CAP_CHAT_SLASH_COMMANDS.to_string());
-        let oversized = PeerIdentity::new(
-            ClientKind::Bot,
-            "🚀".repeat(32),
-            "\\".repeat(32),
-        )
-        .with_capabilities(caps);
+        let oversized = PeerIdentity::new(ClientKind::Bot, "🚀".repeat(32), "\\".repeat(32))
+            .with_capabilities(caps);
 
         let ack = encode_identity_ack(&oversized, 65535).expect("trims to fit wire budget");
         let wire = build_plugin_command_line(

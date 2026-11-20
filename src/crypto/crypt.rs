@@ -279,23 +279,41 @@ mod tests {
     fn set_shared_secret_validates_alpha_and_beta_lengths() {
         let mut crypt = Crypt::new(generate_identity(0));
 
-        assert!(crypt.set_shared_secret(&[1u8; 9], &[2u8; 1], &[3u8; 20]).is_err());
+        assert!(
+            crypt
+                .set_shared_secret(&[1u8; 9], &[2u8; 1], &[3u8; 20])
+                .is_err()
+        );
         assert!(!crypt.crypto_init_complete);
 
-        assert!(crypt.set_shared_secret(&[1u8; 11], &[2u8; 1], &[3u8; 20]).is_err());
+        assert!(
+            crypt
+                .set_shared_secret(&[1u8; 11], &[2u8; 1], &[3u8; 20])
+                .is_err()
+        );
         assert!(!crypt.crypto_init_complete);
 
-        assert!(crypt.set_shared_secret(&[1u8; 10], &[], &[3u8; 20]).is_err());
+        assert!(
+            crypt
+                .set_shared_secret(&[1u8; 10], &[], &[3u8; 20])
+                .is_err()
+        );
         assert!(!crypt.crypto_init_complete);
 
-        assert!(crypt.set_shared_secret(&[1u8; 10], &[2u8; 1], &[3u8; 20]).is_ok());
+        assert!(
+            crypt
+                .set_shared_secret(&[1u8; 10], &[2u8; 1], &[3u8; 20])
+                .is_ok()
+        );
         assert!(crypt.crypto_init_complete);
     }
 
     #[test]
     fn set_shared_secret_clears_cached_keys() {
         let mut crypt = Crypt::new(generate_identity(0));
-        crypt.set_shared_secret(&[1u8; 10], &[2u8; 10], &[3u8; 20]).unwrap();
+        crypt
+            .set_shared_secret(&[1u8; 10], &[2u8; 10], &[3u8; 20])
+            .unwrap();
         let first = crypt.get_key_nonce(true, 1, 0, 2, false);
 
         let alpha = [7u8; 10];

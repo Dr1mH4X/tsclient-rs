@@ -573,10 +573,7 @@ mod tests {
                 .await
                 .expect("identity event timeout")
                 .expect("event channel open");
-            assert!(matches!(
-                evt,
-                OpenProtocolEvent::PeerIdentityUpdated { .. }
-            ));
+            assert!(matches!(evt, OpenProtocolEvent::PeerIdentityUpdated { .. }));
             assert!(handle.peer_identity("bot-uid").is_some());
 
             client.mark_connected();
@@ -624,8 +621,7 @@ mod tests {
         sent_cmds.lock().unwrap().clear();
 
         handle.set_commands(Some(BotCommandList::new(vec![BotCommand::new(
-            "ping",
-            "Ping bot",
+            "ping", "Ping bot",
         )])));
         // Wait past debounce or flush if immediate; set_commands schedules trailing or sends immediately.
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -635,8 +631,6 @@ mod tests {
         })
         .await
         .expect("capability update announce");
-        assert!(
-            sent_cmds.lock().unwrap()[0].contains("chat:slash_commands")
-        );
+        assert!(sent_cmds.lock().unwrap()[0].contains("chat:slash_commands"));
     }
 }
