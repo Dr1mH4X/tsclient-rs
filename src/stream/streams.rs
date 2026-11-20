@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-use crate::client::{Client, ClientStatus, ClientWeak};
+use crate::client::{Client, ClientHandle, ClientStatus, ClientWeak};
 use crate::{Event, ServerInfo};
 
 use super::emitter::{EventHub, MAX_KEPT, StreamSubscription};
@@ -31,6 +31,7 @@ const MAX_EARLY_SIGNALS: usize = MAX_KEPT;
 const MAX_DENIED: usize = 1024;
 const MAX_CLOSED_VIEWS: usize = 1024;
 pub(crate) const GONE_GRACE_MS: u64 = 2_000;
+pub(crate) const REFRESH_COOLDOWN_MS: u64 = 2_000;
 const ANNOUNCE_WINDOW_MS: u64 = 5_000;
 const MAX_ORPHANS: usize = 16;
 const MAX_STOPPED: usize = 256;
@@ -100,6 +101,7 @@ impl PublishAttempt {
 }
 
 struct WatchEntry {
+    token: u64,
     streamer: i32,
     early: Vec<String>,
     overflowed: bool,
@@ -121,10 +123,13 @@ struct StreamsState {
     infos: HashMap<String, StreamInfo>,
     info_order: Vec<String>,
     asked: HashSet<i32>,
+    discover_in_flight: HashMap<i32, usize>,
+    last_discover_at: HashMap<i32, tokio::time::Instant>,
     known_client_streaming: HashMap<i32, bool>,
     next_gone_token: u64,
     gone_timers: HashMap<i32, GoneTimerEntry>,
     published: HashMap<String, PublishedStream>,
+    next_watch_token: u64,
     watching: HashMap<String, WatchEntry>,
     denied: BoundedSet<String>,
     closed_views: BoundedSet<String>,
@@ -142,10 +147,13 @@ impl StreamsState {
             infos: HashMap::new(),
             info_order: Vec::new(),
             asked: HashSet::new(),
+            discover_in_flight: HashMap::new(),
+            last_discover_at: HashMap::new(),
             known_client_streaming: HashMap::new(),
             next_gone_token: 0,
             gone_timers: HashMap::new(),
             published: HashMap::new(),
+            next_watch_token: 0,
             watching: HashMap::new(),
             denied: BoundedSet::new(MAX_DENIED),
             closed_views: BoundedSet::new(MAX_CLOSED_VIEWS),
@@ -172,8 +180,10 @@ impl StreamsState {
         removed
     }
 
-    fn has_streams_for_client(&self, clid: i32) -> bool {
-        self.infos.values().any(|info| info.client_id == clid)
+    fn has_forgettable_streams_for_client(&self, clid: i32) -> bool {
+        self.infos
+            .values()
+            .any(|info| info.client_id == clid && !self.published.contains_key(&info.id))
     }
 
     fn list_infos(&self) -> Vec<StreamInfo> {
@@ -233,6 +243,7 @@ pub(crate) struct StreamsInner {
     state: Mutex<StreamsState>,
     hub: EventHub<StreamsEvent>,
     gone_grace: Duration,
+    refresh_cooldown: Duration,
 }
 
 impl Drop for StreamsInner {
@@ -536,8 +547,17 @@ impl StreamsInner {
     where
         F: std::future::Future<Output = Result<(), StreamError>> + Send + 'static,
     {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            self.spawn_best_effort_on(&rt, fut);
+        }
+    }
+
+    fn spawn_best_effort_on<F>(self: &Arc<Self>, rt: &tokio::runtime::Handle, fut: F)
+    where
+        F: std::future::Future<Output = Result<(), StreamError>> + Send + 'static,
+    {
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
+        rt.spawn(async move {
             if let Err(err) = fut.await
                 && !err.is_not_connected()
                 && let Some(streams) = weak.upgrade()
@@ -547,23 +567,50 @@ impl StreamsInner {
         });
     }
 
-    fn discover(self: &Arc<Self>, clid: i32) {
-        let Some(handle) = self.client.upgrade() else {
-            return;
-        };
+    fn can_query_client(&self, clid: i32) -> Option<ClientHandle> {
+        let handle = self.client.upgrade()?;
         if handle.status() != ClientStatus::Connected || clid == 0 || clid == handle.client_id() {
-            return;
+            return None;
         }
         if !self.supported() {
-            return;
+            return None;
         }
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.disposed || !state.asked.insert(clid) {
-                return;
+        Some(handle)
+    }
+
+    fn record_query_start(state: &mut StreamsState, clid: i32, cooldown: Duration) {
+        let now = tokio::time::Instant::now();
+        *state.discover_in_flight.entry(clid).or_insert(0) += 1;
+        state.last_discover_at.insert(clid, now);
+        if state.last_discover_at.len() > 1024 {
+            state
+                .last_discover_at
+                .retain(|_, ts| now.saturating_duration_since(*ts) < cooldown);
+        }
+    }
+
+    fn finish_query_in_flight(state: &mut StreamsState, clid: i32) {
+        if let Some(count) = state.discover_in_flight.get_mut(&clid) {
+            if *count <= 1 {
+                state.discover_in_flight.remove(&clid);
+            } else {
+                *count -= 1;
             }
         }
+    }
+
+    fn send_info_query(
+        self: &Arc<Self>,
+        handle: ClientHandle,
+        clid: i32,
+        clear_asked_on_err: bool,
+    ) {
         let Ok(cmd) = build_info_command(clid) else {
+            let mut state = self.state.lock().unwrap();
+            Self::finish_query_in_flight(&mut state, clid);
+            if clear_asked_on_err {
+                state.asked.remove(&clid);
+            }
             return;
         };
         let weak = Arc::downgrade(self);
@@ -571,15 +618,61 @@ impl StreamsInner {
             let res = handle
                 .exec_command_for_stream(&cmd, crate::api::CMD_TIMEOUT_MS, None)
                 .await;
-            if let Err(err) = res
-                && let Some(streams) = weak.upgrade()
-            {
-                streams.state.lock().unwrap().asked.remove(&clid);
-                if !is_not_connected_client_error(&err) {
-                    streams.report(StreamError::Client(err));
+            if let Some(streams) = weak.upgrade() {
+                let mut report_err = None;
+                {
+                    let mut state = streams.state.lock().unwrap();
+                    Self::finish_query_in_flight(&mut state, clid);
+                    if let Err(err) = res {
+                        if clear_asked_on_err {
+                            state.asked.remove(&clid);
+                        }
+                        if !is_not_connected_client_error(&err) {
+                            report_err = Some(StreamError::Client(err));
+                        }
+                    }
+                }
+                if let Some(err) = report_err {
+                    streams.report(err);
                 }
             }
         });
+    }
+
+    fn discover(self: &Arc<Self>, clid: i32) {
+        let Some(handle) = self.can_query_client(clid) else {
+            return;
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.disposed || !state.asked.insert(clid) {
+                return;
+            }
+            Self::record_query_start(&mut state, clid, self.refresh_cooldown);
+        }
+        self.send_info_query(handle, clid, true);
+    }
+
+    fn refresh_client(self: &Arc<Self>, clid: i32) {
+        let Some(handle) = self.can_query_client(clid) else {
+            return;
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.disposed || state.discover_in_flight.contains_key(&clid) {
+                return;
+            }
+            let now = tokio::time::Instant::now();
+            if state
+                .last_discover_at
+                .get(&clid)
+                .is_some_and(|prev| now.saturating_duration_since(*prev) < self.refresh_cooldown)
+            {
+                return;
+            }
+            Self::record_query_start(&mut state, clid, self.refresh_cooldown);
+        }
+        self.send_info_query(handle, clid, false);
     }
 
     fn scan_directory_snapshot(self: &Arc<Self>, reset_asked: bool) {
@@ -596,13 +689,13 @@ impl StreamsInner {
         let streaming_ids: Vec<i32> = snapshot
             .clients
             .iter()
-            .filter(|c| c.is_streaming && c.id != self_clid)
+            .filter(|c| c.is_streaming == Some(true) && c.id != self_clid)
             .map(|c| c.id)
             .collect();
         let stopped_ids: Vec<i32> = snapshot
             .clients
             .iter()
-            .filter(|c| !c.is_streaming)
+            .filter(|c| c.is_streaming == Some(false) && c.id != self_clid)
             .map(|c| c.id)
             .collect();
 
@@ -615,7 +708,11 @@ impl StreamsInner {
         {
             let mut state = self.state.lock().unwrap();
             for c in &snapshot.clients {
-                state.known_client_streaming.insert(c.id, c.is_streaming);
+                if c.id != self_clid
+                    && let Some(streaming) = c.is_streaming
+                {
+                    state.known_client_streaming.insert(c.id, streaming);
+                }
             }
         }
         for clid in streaming_ids {
@@ -630,38 +727,39 @@ impl StreamsInner {
     }
 
     fn forget(self: &Arc<Self>, clid: i32) {
-        let handle = {
-            let mut state = self.state.lock().unwrap();
-            state.asked.remove(&clid);
-            if state.disposed
-                || state.gone_timers.contains_key(&clid)
-                || !state.has_streams_for_client(clid)
-            {
-                return;
+        let self_clid = self.client.upgrade().map_or(0, |h| h.client_id());
+        if clid == 0 || (self_clid != 0 && clid == self_clid) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.asked.remove(&clid);
+        if state.disposed
+            || state.gone_timers.contains_key(&clid)
+            || !state.has_forgettable_streams_for_client(clid)
+        {
+            return;
+        }
+        state.next_gone_token = state.next_gone_token.wrapping_add(1);
+        let token = state.next_gone_token;
+        let weak = Arc::downgrade(self);
+        let grace = self.gone_grace;
+        let join = tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            if let Some(streams) = weak.upgrade() {
+                streams.expire_gone(clid, token);
             }
-            state.next_gone_token = state.next_gone_token.wrapping_add(1);
-            let token = state.next_gone_token;
-            let weak = Arc::downgrade(self);
-            let grace = self.gone_grace;
-            let join = tokio::spawn(async move {
-                tokio::time::sleep(grace).await;
-                if let Some(streams) = weak.upgrade() {
-                    streams.expire_gone(clid, token);
-                }
-            });
-            state.gone_timers.insert(
-                clid,
-                GoneTimerEntry {
-                    token,
-                    handle: join,
-                },
-            );
-            None::<()>
-        };
-        let _ = handle;
+        });
+        state.gone_timers.insert(
+            clid,
+            GoneTimerEntry {
+                token,
+                handle: join,
+            },
+        );
     }
 
     fn expire_gone(&self, clid: i32, token: u64) {
+        let self_clid = self.client.upgrade().map_or(0, |h| h.client_id());
         let stream_ids: Vec<String> = {
             let mut state = self.state.lock().unwrap();
             if state
@@ -672,10 +770,13 @@ impl StreamsInner {
                 return;
             }
             state.gone_timers.remove(&clid);
+            if clid == 0 || (self_clid != 0 && clid == self_clid) {
+                return;
+            }
             state
                 .infos
                 .values()
-                .filter(|info| info.client_id == clid)
+                .filter(|info| info.client_id == clid && !state.published.contains_key(&info.id))
                 .map(|info| info.id.clone())
                 .collect()
         };
@@ -989,7 +1090,7 @@ impl StreamsInner {
             let info = state.remove_info(id);
             let cancel_timer = info
                 .as_ref()
-                .filter(|removed| !state.has_streams_for_client(removed.client_id))
+                .filter(|removed| !state.has_forgettable_streams_for_client(removed.client_id))
                 .and_then(|removed| state.gone_timers.remove(&removed.client_id));
             let published = state.published.remove(id);
             let watch = state.watching.remove(id);
@@ -1050,6 +1151,8 @@ impl StreamsInner {
             state.infos.clear();
             state.info_order.clear();
             state.asked.clear();
+            state.discover_in_flight.clear();
+            state.last_discover_at.clear();
             state.known_client_streaming.clear();
             state.closed_views.clear();
             (attempts, published, watching, gone_timers)
@@ -1270,7 +1373,7 @@ impl StreamsInner {
         let streamer = known.client_id;
         let cmd = build_join_command(&id, streamer, &options.message, false)?;
         let (tx, mut rx) = oneshot::channel();
-        {
+        let token = {
             let mut state = self.state.lock().unwrap();
             if state.watching.contains_key(&id) {
                 return Err(StreamError::Client(crate::Error::Teamspeak(format!(
@@ -1278,9 +1381,12 @@ impl StreamsInner {
                 ))));
             }
             state.closed_views.remove(&id);
+            state.next_watch_token = state.next_watch_token.wrapping_add(1);
+            let token = state.next_watch_token;
             state.watching.insert(
                 id.clone(),
                 WatchEntry {
+                    token,
                     streamer,
                     early: Vec::new(),
                     overflowed: false,
@@ -1288,11 +1394,21 @@ impl StreamsInner {
                     settled_tx: Some(tx),
                 },
             );
-        }
+            token
+        };
 
         let timeout_ms = options.timeout_ms.unwrap_or(DEFAULT_WATCH_TIMEOUT_MS);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-        let sent_flag = AtomicBool::new(false);
+        let sent_flag = Arc::new(AtomicBool::new(false));
+        let mut guard = WatchGuard {
+            streams: Arc::clone(self),
+            id: id.clone(),
+            streamer,
+            token,
+            sent_flag: Arc::clone(&sent_flag),
+            rt: tokio::runtime::Handle::try_current().ok(),
+            armed: true,
+        };
 
         let send_outcome = run_with_timeout_and_abort(
             self.send_checked_command(&cmd, Some(&id), timeout_ms, Some(&sent_flag)),
@@ -1320,7 +1436,10 @@ impl StreamsInner {
         };
 
         match final_outcome {
-            Ok(view) => Ok(view),
+            Ok(view) => {
+                guard.disarm();
+                Ok(view)
+            }
             Err(err) => {
                 let existing_view = self
                     .state
@@ -1328,17 +1447,33 @@ impl StreamsInner {
                     .unwrap()
                     .watching
                     .get(&id)
+                    .filter(|w| w.token == token)
                     .and_then(|w| w.view.clone());
                 if let Some(view) = existing_view {
+                    guard.disarm();
                     return Ok(view);
                 }
                 if !matches!(err, StreamError::Ended(_))
                     && let Ok(settled) = rx.try_recv()
                 {
+                    guard.disarm();
                     return settled;
                 }
 
-                let was_pending = self.state.lock().unwrap().watching.remove(&id).is_some();
+                let was_pending = {
+                    let mut state = self.state.lock().unwrap();
+                    if state
+                        .watching
+                        .get(&id)
+                        .is_some_and(|entry| entry.token == token)
+                    {
+                        state.watching.remove(&id);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                guard.disarm();
                 if let StreamError::Ended(_) = &err {
                     if was_pending {
                         self.end_stream(&id, 0, StreamEndCause::Gone);
@@ -1359,6 +1494,66 @@ impl StreamsInner {
                     }
                 }
                 Err(err)
+            }
+        }
+    }
+}
+
+struct WatchGuard {
+    streams: Arc<StreamsInner>,
+    id: String,
+    streamer: i32,
+    token: u64,
+    sent_flag: Arc<AtomicBool>,
+    rt: Option<tokio::runtime::Handle>,
+    armed: bool,
+}
+
+impl WatchGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (removed_pending, unreturned_view) = {
+            let Ok(mut state) = self.streams.state.lock() else {
+                return;
+            };
+            let Some(entry) = state.watching.get(&self.id) else {
+                return;
+            };
+            if entry.token != self.token {
+                return;
+            }
+            let mut entry = state.watching.remove(&self.id).expect("checked present");
+            if let Some(view) = entry.view.take() {
+                state.closed_views.insert(self.id.clone());
+                (false, Some(view))
+            } else {
+                (true, None)
+            }
+        };
+        let has_unreturned_view = unreturned_view.is_some();
+        if let Some(view) = unreturned_view {
+            view.inner.end(PeerClosed {
+                cause: PeerCloseCause::Closed,
+                reason: None,
+            });
+        }
+        if has_unreturned_view || (removed_pending && self.sent_flag.load(Ordering::Acquire)) {
+            let streams = Arc::clone(&self.streams);
+            let leave_id = self.id.clone();
+            let streamer = self.streamer;
+            let fut = async move { streams.leave_on_server(&leave_id, streamer).await };
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                self.streams.spawn_best_effort_on(&rt, fut);
+            } else if let Some(rt) = self.rt.as_ref() {
+                self.streams.spawn_best_effort_on(rt, fut);
             }
         }
     }
@@ -1414,7 +1609,12 @@ impl Streams {
     /// 若调用时客户端已处于连接状态且目录快照已就绪，会立即扫描其中 `is_streaming == true`
     /// 的成员并触发 `requeststreaminfo`。
     pub fn new(client: &Client, options: StreamsOptions) -> Self {
-        Self::build(client, options, Duration::from_millis(GONE_GRACE_MS))
+        Self::build(
+            client,
+            options,
+            Duration::from_millis(GONE_GRACE_MS),
+            Duration::from_millis(REFRESH_COOLDOWN_MS),
+        )
     }
 
     #[cfg(test)]
@@ -1423,15 +1623,81 @@ impl Streams {
         options: StreamsOptions,
         gone_grace: Duration,
     ) -> Self {
-        Self::build(client, options, gone_grace)
+        Self::build(
+            client,
+            options,
+            gone_grace,
+            Duration::from_millis(REFRESH_COOLDOWN_MS),
+        )
     }
 
-    fn build(client: &Client, options: StreamsOptions, gone_grace: Duration) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_with_refresh_cooldown(
+        client: &Client,
+        options: StreamsOptions,
+        refresh_cooldown: Duration,
+    ) -> Self {
+        Self::build(
+            client,
+            options,
+            Duration::from_millis(GONE_GRACE_MS),
+            refresh_cooldown,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_forget(&self, clid: i32) {
+        self.inner.forget(clid);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_gone_timer(&self, clid: i32) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .gone_timers
+            .contains_key(&clid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_adopt_published(&self, info: StreamInfo) -> PublishedStream {
+        let mut state = self.inner.state.lock().unwrap();
+        self.inner.adopt(&mut state, info)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_published(&self, id: &str) -> bool {
+        self.inner.state.lock().unwrap().published.contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_expire_gone_with_timer(&self, clid: i32, token: u64) {
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state.gone_timers.insert(
+                clid,
+                GoneTimerEntry {
+                    token,
+                    handle: tokio::spawn(async {}),
+                },
+            );
+        }
+        self.inner.expire_gone(clid, token);
+    }
+
+    fn build(
+        client: &Client,
+        options: StreamsOptions,
+        gone_grace: Duration,
+        refresh_cooldown: Duration,
+    ) -> Self {
         let inner = Arc::new(StreamsInner {
             client: client.weak_handle(),
             state: Mutex::new(StreamsState::new(options.remember_denied)),
             hub: EventHub::new(2, streams_event_bucket),
             gone_grace,
+            refresh_cooldown,
         });
         Self::register_client_hooks(client, &inner);
         if client.status() == ClientStatus::Connected {
@@ -1458,13 +1724,17 @@ impl Streams {
                 {
                     let mut state = streams.state.lock().unwrap();
                     for client_info in &snapshot.clients {
-                        state
-                            .known_client_streaming
-                            .insert(client_info.id, client_info.is_streaming);
+                        if client_info.id != self_clid
+                            && let Some(streaming) = client_info.is_streaming
+                        {
+                            state
+                                .known_client_streaming
+                                .insert(client_info.id, streaming);
+                        }
                     }
                 }
                 for client_info in &snapshot.clients {
-                    if client_info.is_streaming && client_info.id != self_clid {
+                    if client_info.is_streaming == Some(true) && client_info.id != self_clid {
                         streams.cancel_gone(client_info.id);
                         streams.discover(client_info.id);
                     }
@@ -1478,17 +1748,23 @@ impl Streams {
                 return;
             };
             if let Event::ClientEnter(info) = event {
-                streams
-                    .state
-                    .lock()
-                    .unwrap()
-                    .known_client_streaming
-                    .insert(info.id, info.is_streaming);
-                if info.is_streaming {
-                    streams.cancel_gone(info.id);
-                    streams.discover(info.id);
-                } else {
-                    streams.forget(info.id);
+                let self_clid = streams.client.upgrade().map_or(0, |h| h.client_id());
+                if self_clid != 0 && info.id == self_clid {
+                    return;
+                }
+                if let Some(streaming) = info.is_streaming {
+                    streams
+                        .state
+                        .lock()
+                        .unwrap()
+                        .known_client_streaming
+                        .insert(info.id, streaming);
+                    if streaming {
+                        streams.cancel_gone(info.id);
+                        streams.discover(info.id);
+                    } else {
+                        streams.forget(info.id);
+                    }
                 }
             }
         }));
@@ -1499,17 +1775,23 @@ impl Streams {
                 return;
             };
             if let Event::ClientUpdated(info) = event {
-                let prev = streams
-                    .state
-                    .lock()
-                    .unwrap()
-                    .known_client_streaming
-                    .insert(info.id, info.is_streaming);
-                if info.is_streaming {
-                    streams.cancel_gone(info.id);
-                    streams.discover(info.id);
-                } else if prev == Some(true) {
-                    streams.forget(info.id);
+                let self_clid = streams.client.upgrade().map_or(0, |h| h.client_id());
+                if self_clid != 0 && info.id == self_clid {
+                    return;
+                }
+                if let Some(streaming) = info.is_streaming {
+                    let prev = streams
+                        .state
+                        .lock()
+                        .unwrap()
+                        .known_client_streaming
+                        .insert(info.id, streaming);
+                    if streaming {
+                        streams.cancel_gone(info.id);
+                        streams.discover(info.id);
+                    } else if prev != Some(false) {
+                        streams.forget(info.id);
+                    }
                 }
             }
         }));
@@ -1523,6 +1805,7 @@ impl Streams {
                 let published: Vec<PublishedStream> = {
                     let mut state = streams.state.lock().unwrap();
                     state.asked.remove(&leave.id);
+                    state.last_discover_at.remove(&leave.id);
                     state.known_client_streaming.remove(&leave.id);
                     state.published.values().cloned().collect()
                 };
@@ -1569,6 +1852,11 @@ impl Streams {
     /// 按流 ID 查询当前已知的流描述。
     pub fn get(&self, id: &str) -> Option<StreamInfo> {
         self.inner.state.lock().unwrap().infos.get(id).cloned()
+    }
+
+    /// 主动查询指定客户端的活动流信息（带在途去重与冷却限流保护的 `requeststreaminfo`）。
+    pub fn refresh_client(&self, client_id: u16) {
+        self.inner.refresh_client(i32::from(client_id));
     }
 
     /// 订阅 [`StreamsEvent`] 事件流（`Error` 与 `Warning` 在首个订阅者接入前保留最多 256 条）。

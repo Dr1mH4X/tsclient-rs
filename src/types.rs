@@ -97,8 +97,9 @@ pub struct ClientInfo {
     /// Whether the client speaks as channel commander
     /// (`client_is_channel_commander`).
     pub channel_commander: Option<bool>,
-    /// Whether the client is currently sharing a stream (`client_is_streaming`).
-    pub is_streaming: bool,
+    /// Whether the client is currently sharing a stream (`client_is_streaming`);
+    /// `None` when the row omitted the flag, distinct from an explicit `Some(false)`.
+    pub is_streaming: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

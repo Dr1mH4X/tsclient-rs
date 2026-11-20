@@ -9,7 +9,7 @@ use super::types::{
     JoinRequestCloseCause, JoinRequestEvent, JoinRequestState, PeerCloseCause, PeerClosed,
     StreamEndCause, StreamEnded, StreamInfo, StreamWarning, ViewerIdentity,
 };
-use super::wire::{build_respond_command, build_signal_command};
+use super::wire::{build_remove_client_command, build_respond_command, build_signal_command};
 
 const MAX_CLOSED_VIEWERS: usize = 1024;
 
@@ -114,6 +114,18 @@ impl PeerHost for ViewerPeerHost {
         None
     }
 
+    fn send_kick_command(
+        &self,
+        stream_id: String,
+        peer_id: i32,
+        reason: u16,
+    ) -> Option<BoxFuture<'static, Result<(), StreamError>>> {
+        match build_remove_client_command(&stream_id, peer_id, reason) {
+            Ok(cmd) => Some(self.publish_host.send_command(cmd, Some(stream_id))),
+            Err(err) => Some(Box::pin(async move { Err(err) })),
+        }
+    }
+
     fn on_closed(&self, peer: &Arc<PeerInner>) {
         if let Some(published) = self.published.upgrade() {
             published.remove_closed_viewer(self.client_id, peer);
@@ -186,10 +198,9 @@ impl PublishedInner {
     }
 
     pub(crate) fn request(self: &Arc<Self>, client_id: i32, message: String) {
-        {
+        let replaced_peer = {
             let mut state = self.state.lock().unwrap();
             if state.ended
-                || state.peers.contains_key(&client_id)
                 || state.resolving.contains_key(&client_id)
                 || state
                     .pending
@@ -198,6 +209,7 @@ impl PublishedInner {
             {
                 return;
             }
+            let replaced_peer = state.peers.get(&client_id).cloned();
             state.next_slot_token = state.next_slot_token.wrapping_add(1);
             let token = state.next_slot_token;
             state.resolving.insert(client_id, token);
@@ -207,6 +219,13 @@ impl PublishedInner {
                 message,
                 identity: None,
                 looking: false,
+            });
+            replaced_peer
+        };
+        if let Some(peer) = replaced_peer {
+            peer.inner.end(PeerClosed {
+                cause: PeerCloseCause::Left,
+                reason: None,
             });
         }
         self.advance();
@@ -302,7 +321,8 @@ impl PublishedInner {
             let client_id = viewer.client_id;
             let request = JoinRequest {
                 inner: Arc::new(JoinRequestInner {
-                    stream: Arc::clone(self),
+                    stream_id: self.id.clone(),
+                    stream: Arc::downgrade(self),
                     viewer,
                     message,
                     state: Mutex::new(JoinRequestState::Pending),
@@ -453,21 +473,28 @@ impl PublishedStream {
     }
 
     /// 停止发布当前流（调用 `stopstream`）。
+    ///
+    /// 即使服务端返回非 `5635` 错误或超时，也会清理本地已发布流与观众会话状态并返回对应错误，
+    /// 避免 `Streams` 内部残留无人管理的已发布流。
     pub async fn stop(&self, reason: u32) -> Result<(), StreamError> {
         if self.ended() {
             return Ok(());
         }
-        self.inner
+        let res = self
+            .inner
             .host
             .stop_stream(self.inner.id.clone(), reason)
-            .await?;
-        self.inner.host.mark_stopped(&self.inner.id, reason);
-        Ok(())
+            .await;
+        if !self.ended() {
+            self.inner.host.mark_stopped(&self.inner.id, reason);
+        }
+        res
     }
 }
 
 struct JoinRequestInner {
-    stream: Arc<PublishedInner>,
+    stream_id: String,
+    stream: Weak<PublishedInner>,
     viewer: ViewerIdentity,
     message: String,
     state: Mutex<JoinRequestState>,
@@ -524,7 +551,7 @@ impl std::fmt::Debug for JoinRequest {
 
 impl JoinRequest {
     pub fn stream_id(&self) -> &str {
-        &self.inner.stream.id
+        &self.inner.stream_id
     }
 
     pub fn viewer(&self) -> &ViewerIdentity {
@@ -553,6 +580,9 @@ impl JoinRequest {
             ));
         }
         self.inner.assert_pending()?;
+        let Some(stream) = self.inner.stream.upgrade() else {
+            return Err(StreamError::Disposed);
+        };
         let cmd = build_respond_command(
             self.stream_id(),
             self.inner.viewer.client_id,
@@ -571,15 +601,13 @@ impl JoinRequest {
             *state = JoinRequestState::Accepted;
         }
         if !super::wire::has_audio_section(offer) {
-            self.inner.stream.host.warn(no_audio_warning(
+            stream.host.warn(no_audio_warning(
                 self.stream_id(),
                 self.inner.viewer.client_id,
             ));
         }
-        let peer = self.inner.stream.open_viewer(self.inner.viewer.client_id);
-        let send_res = self
-            .inner
-            .stream
+        let peer = stream.open_viewer(self.inner.viewer.client_id);
+        let send_res = stream
             .host
             .send_command(cmd, Some(self.stream_id().to_string()))
             .await;
@@ -597,6 +625,9 @@ impl JoinRequest {
     /// 拒绝观看申请（`offer` 显式为空串以满足 TS6 协议要求）。
     pub async fn deny(&self, reason: &str) -> Result<(), StreamError> {
         self.inner.assert_pending()?;
+        let Some(stream) = self.inner.stream.upgrade() else {
+            return Err(StreamError::Disposed);
+        };
         let cmd = build_respond_command(
             self.stream_id(),
             self.inner.viewer.client_id,
@@ -614,9 +645,7 @@ impl JoinRequest {
             }
             *state = JoinRequestState::Denied;
         }
-        let send_res = self
-            .inner
-            .stream
+        let send_res = stream
             .host
             .send_command(cmd, Some(self.stream_id().to_string()))
             .await;
@@ -624,7 +653,7 @@ impl JoinRequest {
             *self.inner.state.lock().unwrap() = JoinRequestState::Failed;
             return Err(err);
         }
-        self.inner.stream.host.remember_denied(&self.inner.viewer);
+        stream.host.remember_denied(&self.inner.viewer);
         Ok(())
     }
 }

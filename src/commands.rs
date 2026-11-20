@@ -325,6 +325,26 @@ impl CommandTracker {
         self.welcome_complete = false;
         self.next_rc = 0;
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, rc: i32) -> bool {
+        self.pending.contains_key(&rc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_abandoned(&self, rc: i32) -> bool {
+        self.abandoned.contains(&rc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_order(&self, rc: i32) -> bool {
+        self.order.contains(&rc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_correlated_spec(&self, rc: i32) -> bool {
+        self.correlated_specs.contains_key(&rc)
+    }
 }
 
 /// Parse and handle an `error` command from the server.

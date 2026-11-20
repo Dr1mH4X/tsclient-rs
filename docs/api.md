@@ -46,11 +46,11 @@ is true when a row was rejected by those limits. `directory_snapshot()` returns
 wait for a complete snapshot.
 
 `ClientInfo` carries live client state alongside identity: `away`,
-`away_message`, `input_muted`, `output_muted` and `channel_commander`.
-Each is `Option`-typed: `None` means the server has not reported the flag
-yet, which is distinct from a reported `Some(false)`. Mute and away toggles
-arrive through `notifyclientupdated`, are reflected in later snapshots, and
-dispatch `client_updated` events carrying the fresh record.
+`away_message`, `input_muted`, `output_muted`, `channel_commander` and
+`is_streaming`. Each is `Option`-typed: `None` means the server has not reported
+the flag yet, which is distinct from a reported `Some(false)`. Mute, away, and
+streaming toggles arrive through `notifyclientupdated`, are reflected in later
+snapshots, and dispatch `client_updated` events carrying the fresh record.
 Welcome traffic is reconciled against live events: updates that arrive
 before a client's row are replayed once the row inserts the client, and
 clients an enterview introduced or a left view removed are never replaced
@@ -148,14 +148,14 @@ so consumers can safely teardown and reconnect.
 
 ### 核心层常驻能力（无需额外 feature）
 
-- **`ClientInfo.is_streaming: bool`**：在目录解析、欢迎行、`clientlist`（`list_clients`）、`notifycliententerview` 与 `notifyclientupdated` 中解析 `client_is_streaming`。
+- **`ClientInfo.is_streaming: Option<bool>`**：在目录解析、欢迎行、`clientlist`（`list_clients`）、`notifycliententerview` 与 `notifyclientupdated` 中解析 `client_is_streaming`，区分字段缺失（`None`）与显式 `0`（`Some(false)`）。
 - **服务端能力扩展**：`ServerInfo.extensions` 保留去重后的 `virtualserver_capability_extensions` 列表；提供 `ServerInfo::capability_extensions()`、`ServerInfo::has_capability_extension(name)`、`ServerInfo::supports_stream_p2p()`，以及 `parse_capability_extensions` / `STREAM_P2P_EXTENSION`。
-- **关联响应与错误码**：`CommandTracker` 将 `setupstream` 与带匹配 `return_code` 的 `notifystreamstarted` 关联；`ErrorCode` 提供 `StreamNotFound (0x1603)`、`StreamNotParticipating (0x1604)`、`StreamAlreadyJoined (0x1606)`、`StreamJoinRequestRedacted (0x1607)`，并可通过 `ServerError::{code, error_code}` 与 `Error::{server_error_code, error_code, is_server_error_code}` 查询。
+- **关联响应与错误码**：`CommandTracker` 将 `setupstream` 与带匹配 `return_code` 的 `notifystreamstarted` 关联；`ErrorCode` 提供 `CommandNotFound (0x0100)`、`StreamNotFound (0x1603)`、`StreamNotParticipating (0x1604)`、`StreamAlreadyJoined (0x1606)`、`StreamJoinRequestRedacted (0x1607)`，并可通过 `ServerError::{code, error_code}` 与 `Error::{server_error_code, error_code, is_server_error_code}` 查询。
 
 ### `tsclient_rs::stream`（`features = ["stream"]`）
 
 对齐 `@honeybbq/teamspeak/stream` 控制面与信令透传，不引入任何 WebRTC 或媒体依赖：
 
-- **入口与挂载**：`Streams::new(&client, StreamsOptions { remember_denied })` 独立挂载至 `Client`，提供 `supported()`、`list()`、`get(id)`、`subscribe()`（`StreamsEvent::{Started, Updated, Stopped, ViewerJoined, ViewerLeft, Error, Warning}`）、`publish(PublishOptions)`、`watch(WatchTarget, WatchOptions)` 与 `dispose()`。
-- **句柄类型**：`PublishedStream`（`id`、`info`、`ended`、`viewers()`、`stop(reason)`、`subscribe()` 接收 `PublishedStreamEvent::{Request, Ended}`）、`JoinRequest`（`accept(offer, message) -> ViewerPeer`、`deny(reason)`）、`ViewerPeer`（`send_offer`、`send_candidate`、`send_signal`、`close`）与 `StreamView`（`offer`、`answer(sdp)`、`send_candidate`、`send_signal`、`leave`）。
+- **入口与挂载**：`Streams::new(&client, StreamsOptions { remember_denied })` 独立挂载至 `Client`，提供 `supported()`、`list()`、`get(id)`、`refresh_client(client_id)`、`subscribe()`（`StreamsEvent::{Started, Updated, Stopped, ViewerJoined, ViewerLeft, Error, Warning}`）、`publish(PublishOptions)`、`watch(WatchTarget, WatchOptions)` 与 `dispose()`。
+- **句柄类型**：`PublishedStream`（`id`、`info`、`ended`、`viewers()`、`stop(reason)` 即使在非 5635 错误下也清理本地流状态、`subscribe()` 接收 `PublishedStreamEvent::{Request, Ended}`）、`JoinRequest`（`accept(offer, message) -> ViewerPeer`、`deny(reason)`）、`ViewerPeer`（`send_offer`、`send_candidate`、`send_signal`、`close` 纯本地关闭、`kick(reason)` 发送 `removeclientfromstream` 并忽略非致命错误后关闭）与 `StreamView`（`offer`、`answer(sdp)`、`send_candidate`、`send_signal`、`leave`）。
 - **协议校验与发现**：全部通过带 `return_code` 与限流重试的 `exec_command` 通道发送，发送前按转义后 UTF-8 字节检查 `MAX_COMMAND_LINE_BYTES = 9_150`；使用 `has_audio_section(sdp)` 在缺失 `m=audio` 时发出 `StreamWarningCode::OfferWithoutAudio` 警告；覆盖构造已连接扫描、`DirectorySnapshot`、`ClientEnter`/`ClientUpdated` 及 `NotificationOverflow` 自动发现，并在 `client_is_streaming` 清除后经 2s（`GONE_GRACE_MS = 2000`）宽限期未收到 `notifystreamstopped` 时按 `StreamEndCause::Gone` 清理。

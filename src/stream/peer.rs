@@ -29,6 +29,15 @@ pub(crate) trait PeerHost: Send + Sync {
         peer_id: i32,
     ) -> Option<BoxFuture<'static, Result<(), StreamError>>>;
 
+    fn send_kick_command(
+        &self,
+        _stream_id: String,
+        _peer_id: i32,
+        _reason: u16,
+    ) -> Option<BoxFuture<'static, Result<(), StreamError>>> {
+        None
+    }
+
     fn on_closed(&self, peer: &Arc<PeerInner>);
     fn on_error(&self, err: StreamError);
     fn on_warning(&self, warning: StreamWarning);
@@ -175,6 +184,32 @@ impl PeerInner {
         }
         Ok(())
     }
+
+    async fn kick(self: &Arc<Self>, reason: u16) -> Result<(), StreamError> {
+        if self.is_closed() {
+            return Ok(());
+        }
+        let fut = self
+            .host
+            .send_kick_command(self.stream_id.clone(), self.client_id, reason);
+        self.end(PeerClosed {
+            cause: PeerCloseCause::Closed,
+            reason: Some(u32::from(reason)),
+        });
+        let Some(fut) = fut else {
+            return Ok(());
+        };
+        match fut.await {
+            Ok(()) | Err(StreamError::Ended(_)) => Ok(()),
+            Err(err)
+                if err.is_server_error_code(crate::ErrorCode::StreamNotParticipating)
+                    || err.is_server_error_code(crate::ErrorCode::CommandNotFound) =>
+            {
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 /// 发布者侧对应单一观众的信令句柄。
@@ -228,8 +263,17 @@ impl ViewerPeer {
         self.inner.send_signal(cmd, args).await
     }
 
+    /// 仅关闭本地观众会话，不向服务端发送移除命令（与 `teamspeak-js` 语义一致）。
     pub async fn close(&self) -> Result<(), StreamError> {
         self.inner.close().await
+    }
+
+    /// 将指定观众移出流（发送 `removeclientfromstream` 并完成本地关闭）。
+    ///
+    /// 服务端返回 `StreamNotParticipating` (`5636`)、`CommandNotFound` (`256`)
+    /// 或流已结束 (`5635`) 时视为非致命错误并静默忽略。
+    pub async fn kick(&self, reason: u16) -> Result<(), StreamError> {
+        self.inner.kick(reason).await
     }
 }
 

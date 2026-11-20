@@ -250,7 +250,7 @@ pub async fn list_clients(client: &Client) -> Result<Vec<ClientInfo>, Error> {
                 input_muted: parse_bool(item.get("client_input_muted")),
                 output_muted: parse_bool(item.get("client_output_muted")),
                 channel_commander: parse_bool(item.get("client_is_channel_commander")),
-                is_streaming: parse_bool(item.get("client_is_streaming")).unwrap_or(false),
+                is_streaming: parse_bool(item.get("client_is_streaming")),
             }
         })
         .collect())

@@ -622,7 +622,7 @@ pub fn parse_client(params: &HashMap<String, String>) -> Option<ClientInfo> {
         input_muted: parse_bool(params.get("client_input_muted")),
         output_muted: parse_bool(params.get("client_output_muted")),
         channel_commander: parse_bool(params.get("client_is_channel_commander")),
-        is_streaming: parse_bool(params.get("client_is_streaming")).unwrap_or(false),
+        is_streaming: parse_bool(params.get("client_is_streaming")),
     })
 }
 
@@ -755,8 +755,8 @@ pub(crate) fn apply_client_notification(
             }
         }
         if let Some(value) = parse_bool(params.get("client_is_streaming")) {
-            if current.is_streaming != value {
-                current.is_streaming = value;
+            if current.is_streaming != Some(value) {
+                current.is_streaming = Some(value);
                 changed = true;
             }
         }
@@ -1420,7 +1420,7 @@ mod tests {
                 input_muted: None,
                 output_muted: None,
                 channel_commander: None,
-                is_streaming: false,
+                is_streaming: None,
             }));
         }
         directory.finish_welcome();
@@ -1621,7 +1621,7 @@ mod tests {
             ("client_is_streaming", "1"),
         ]))
         .expect("client parsed");
-        assert!(streaming.is_streaming);
+        assert_eq!(streaming.is_streaming, Some(true));
         assert!(directory.insert_client(streaming));
 
         let no_change = apply_client_notification(
@@ -1637,11 +1637,11 @@ mod tests {
             &mut directory,
         )
         .expect("is_streaming cleared");
-        assert!(!stopped.is_streaming);
-        assert!(!directory.client(12).unwrap().is_streaming);
+        assert_eq!(stopped.is_streaming, Some(false));
+        assert_eq!(directory.client(12).unwrap().is_streaming, Some(false));
 
         let absent_flag = parse_client(&map(&[("clid", "13"), ("cid", "3")]))
             .expect("client without flag parsed");
-        assert!(!absent_flag.is_streaming);
+        assert_eq!(absent_flag.is_streaming, None);
     }
 }

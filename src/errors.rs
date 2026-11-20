@@ -5,6 +5,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum ErrorCode {
+    CommandNotFound = 0x0100,
     StreamNotFound = 0x1603,
     StreamNotParticipating = 0x1604,
     StreamAlreadyJoined = 0x1606,
@@ -20,6 +21,7 @@ impl ErrorCode {
     /// Match a numeric server error code against known variants.
     pub const fn from_code(code: u32) -> Option<Self> {
         match code {
+            0x0100 => Some(Self::CommandNotFound),
             0x1603 => Some(Self::StreamNotFound),
             0x1604 => Some(Self::StreamNotParticipating),
             0x1606 => Some(Self::StreamAlreadyJoined),
@@ -384,11 +386,13 @@ mod tests {
 
     #[test]
     fn stream_error_codes_match_wire_decimal_and_hex_values() {
+        assert_eq!(ErrorCode::CommandNotFound.code(), 0x0100);
         assert_eq!(ErrorCode::StreamNotFound.code(), 0x1603);
         assert_eq!(ErrorCode::StreamNotParticipating.code(), 0x1604);
         assert_eq!(ErrorCode::StreamAlreadyJoined.code(), 0x1606);
         assert_eq!(ErrorCode::StreamJoinRequestRedacted.code(), 0x1607);
 
+        assert_eq!(ErrorCode::from_id("256"), Some(ErrorCode::CommandNotFound));
         assert_eq!(ErrorCode::from_id("5635"), Some(ErrorCode::StreamNotFound));
         assert_eq!(
             ErrorCode::from_id("5636"),
