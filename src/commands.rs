@@ -40,6 +40,12 @@ pub struct CommandTracker {
     /// return_codes whose caller gave up (timeout or send failure).
     abandoned: HashSet<i32>,
     notifications: HashMap<i32, &'static str>,
+    /// Correlated commands matched to notifications by a named parameter (`return_code`).
+    correlated_specs: HashMap<i32, (&'static str, &'static str)>,
+    /// Buffered correlated notification rows keyed by `return_code`.
+    correlated_rows: HashMap<i32, Vec<HashMap<String, String>>>,
+    /// Correlated commands that received `error id=0` before their notification arrived.
+    settled_ok: HashSet<i32>,
     next_rc: i32,
     welcome_complete: bool,
 }
@@ -52,24 +58,39 @@ impl CommandTracker {
             rows: HashMap::new(),
             abandoned: HashSet::new(),
             notifications: HashMap::new(),
+            correlated_specs: HashMap::new(),
+            correlated_rows: HashMap::new(),
+            settled_ok: HashSet::new(),
             next_rc: 0,
             welcome_complete: false,
         }
     }
 
-    pub fn register(&mut self) -> (i32, oneshot::Receiver<CommandResult>) {
+    fn allocate_pending(&mut self) -> (i32, oneshot::Receiver<CommandResult>) {
         self.next_rc += 1;
         let rc = self.next_rc;
         let (tx, rx) = oneshot::channel();
         self.pending.insert(rc, tx);
+        (rc, rx)
+    }
+
+    pub fn register(&mut self) -> (i32, oneshot::Receiver<CommandResult>) {
+        let (rc, rx) = self.allocate_pending();
         self.order.push_back(rc);
         self.rows.insert(rc, Vec::new());
         (rc, rx)
     }
 
     pub fn register_command(&mut self, command: &str) -> (i32, oneshot::Receiver<CommandResult>) {
+        let cmd_name = command.split_whitespace().next().unwrap_or("");
+        if cmd_name == "setupstream" {
+            let (rc, response) = self.allocate_pending();
+            self.correlated_specs
+                .insert(rc, ("notifystreamstarted", "return_code"));
+            return (rc, response);
+        }
         let (rc, response) = self.register();
-        let expected = match command.split_whitespace().next().unwrap_or("") {
+        let expected = match cmd_name {
             "apikeyadd" => Some("notifyapikeyadd"),
             "apikeylist" => Some("notifyapikeylist"),
             "banfind" => Some("notifybanfind"),
@@ -122,6 +143,9 @@ impl CommandTracker {
     }
 
     pub fn buffer_notification(&mut self, name: &str, params: HashMap<String, String>) {
+        if self.offer_correlated(name, &params) {
+            return;
+        }
         let Some(rc) = self.order.front() else {
             return;
         };
@@ -130,10 +154,50 @@ impl CommandTracker {
         }
     }
 
+    fn offer_correlated(&mut self, name: &str, params: &HashMap<String, String>) -> bool {
+        if self.correlated_specs.is_empty() {
+            return false;
+        }
+        let matched_rc = self
+            .correlated_specs
+            .iter()
+            .find_map(|(&rc, &(expected_name, key))| {
+                if expected_name != name {
+                    return None;
+                }
+                let row_rc = params.get(key)?.trim().parse::<i32>().ok()?;
+                (row_rc == rc).then_some(rc)
+            });
+        let Some(rc) = matched_rc else {
+            return false;
+        };
+        self.correlated_rows
+            .entry(rc)
+            .or_default()
+            .push(params.clone());
+        if self.settled_ok.remove(&rc) {
+            self.correlated_specs.remove(&rc);
+            let rows = self.correlated_rows.remove(&rc).unwrap_or_default();
+            if let Some(sender) = self.pending.remove(&rc) {
+                let _ = sender.send(CommandResult {
+                    err: None,
+                    data: rows,
+                });
+            }
+        }
+        true
+    }
+
     /// The caller stopped waiting for `rc`. Keep the slot in `order` until the
     /// server's `error` line for it arrives (or a later command resolves past
     /// it), so in-flight rows are not misattributed to the next command.
     pub fn unregister(&mut self, rc: i32) {
+        if self.correlated_specs.remove(&rc).is_some() {
+            self.pending.remove(&rc);
+            self.correlated_rows.remove(&rc);
+            self.settled_ok.remove(&rc);
+            return;
+        }
         if self.pending.remove(&rc).is_some() {
             self.abandoned.insert(rc);
         }
@@ -146,6 +210,9 @@ impl CommandTracker {
         self.rows.remove(&rc);
         self.notifications.remove(&rc);
         self.abandoned.remove(&rc);
+        self.correlated_specs.remove(&rc);
+        self.correlated_rows.remove(&rc);
+        self.settled_ok.remove(&rc);
     }
 
     pub fn signal_welcome_complete(&mut self) {
@@ -167,7 +234,43 @@ impl CommandTracker {
         }
     }
 
+    fn resolve_correlated(&mut self, rc: i32, err: Option<Error>) {
+        if err.is_some() {
+            self.correlated_specs.remove(&rc);
+            self.correlated_rows.remove(&rc);
+            self.settled_ok.remove(&rc);
+            if let Some(sender) = self.pending.remove(&rc) {
+                let _ = sender.send(CommandResult {
+                    err,
+                    data: Vec::new(),
+                });
+            }
+            return;
+        }
+        if let Some(rows) = self.correlated_rows.remove(&rc) {
+            self.correlated_specs.remove(&rc);
+            self.settled_ok.remove(&rc);
+            if let Some(sender) = self.pending.remove(&rc) {
+                let _ = sender.send(CommandResult {
+                    err: None,
+                    data: rows,
+                });
+            }
+            return;
+        }
+        if self.pending.contains_key(&rc) {
+            // `error id=0` arrived before the correlated notification; hold resolution until it arrives.
+            self.settled_ok.insert(rc);
+        } else {
+            self.correlated_specs.remove(&rc);
+        }
+    }
+
     pub fn resolve(&mut self, rc: i32, err: Option<Error>) {
+        if self.correlated_specs.contains_key(&rc) {
+            self.resolve_correlated(rc, err);
+            return;
+        }
         // The server answers in order, so an abandoned command ahead of `rc`
         // that is still unresolved never received a reply: the rows buffered for
         // it actually belong to `rc` and must be carried over. If instead its
@@ -216,8 +319,31 @@ impl CommandTracker {
         self.order.clear();
         self.rows.clear();
         self.abandoned.clear();
+        self.correlated_specs.clear();
+        self.correlated_rows.clear();
+        self.settled_ok.clear();
         self.welcome_complete = false;
         self.next_rc = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, rc: i32) -> bool {
+        self.pending.contains_key(&rc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_abandoned(&self, rc: i32) -> bool {
+        self.abandoned.contains(&rc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_order(&self, rc: i32) -> bool {
+        self.order.contains(&rc)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_correlated_spec(&self, rc: i32) -> bool {
+        self.correlated_specs.contains_key(&rc)
     }
 }
 
@@ -391,5 +517,111 @@ mod tests {
             super::append_return_code("sendtextmessage msg=a\\sreturn_code=1", 7),
             "sendtextmessage msg=a\\sreturn_code=1 return_code=7"
         );
+    }
+
+    #[test]
+    fn setupstream_resolves_when_notification_arrives_before_error() {
+        let mut tracker = tracker_past_welcome();
+        let (rc, mut response) = tracker.register_command("setupstream name=Demo");
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), "stream-1".to_string());
+        row.insert("return_code".to_string(), rc.to_string());
+        tracker.buffer_notification("notifystreamstarted", row);
+        assert!(response.try_recv().is_err());
+
+        tracker.resolve(rc, None);
+        let res = response.try_recv().expect("resolved");
+        assert!(res.err.is_none());
+        assert_eq!(
+            res.data
+                .first()
+                .and_then(|r| r.get("id"))
+                .map(String::as_str),
+            Some("stream-1")
+        );
+    }
+
+    #[test]
+    fn setupstream_waits_for_correlated_notification_after_ok_error() {
+        let mut tracker = tracker_past_welcome();
+        let (rc, mut response) = tracker.register_command("setupstream name=Late");
+        tracker.resolve(rc, None);
+        assert!(response.try_recv().is_err());
+
+        let mut other = HashMap::new();
+        other.insert("id".to_string(), "other-stream".to_string());
+        tracker.buffer_notification("notifystreamstarted", other);
+        assert!(response.try_recv().is_err());
+
+        let mut own = HashMap::new();
+        own.insert("id".to_string(), "own-stream".to_string());
+        own.insert("return_code".to_string(), rc.to_string());
+        tracker.buffer_notification("notifystreamstarted", own);
+
+        let res = response.try_recv().expect("resolved after notify");
+        assert!(res.err.is_none());
+        assert_eq!(
+            res.data
+                .first()
+                .and_then(|r| r.get("id"))
+                .map(String::as_str),
+            Some("own-stream")
+        );
+    }
+
+    #[test]
+    fn setupstream_matches_concurrent_calls_and_does_not_block_inline_queries() {
+        let mut tracker = tracker_past_welcome();
+        let (rc1, mut rx1) = tracker.register_command("setupstream name=A");
+        let (rc2, mut rx2) = tracker.register_command("setupstream name=B");
+        let (rc_list, mut rx_list) = tracker.register_command("servergrouplist");
+
+        tracker.resolve(rc1, None);
+        tracker.resolve(rc2, None);
+        tracker.buffer_notification("notifyservergrouplist", row("group-row"));
+        tracker.resolve(rc_list, None);
+
+        assert_eq!(keys(&rx_list.try_recv().unwrap().data), vec!["group-row"]);
+        assert!(rx1.try_recv().is_err());
+        assert!(rx2.try_recv().is_err());
+
+        let mut r2 = HashMap::new();
+        r2.insert("id".to_string(), "s2".to_string());
+        r2.insert("return_code".to_string(), rc2.to_string());
+        tracker.buffer_notification("notifystreamstarted", r2);
+
+        let mut r1 = HashMap::new();
+        r1.insert("id".to_string(), "s1".to_string());
+        r1.insert("return_code".to_string(), rc1.to_string());
+        tracker.buffer_notification("notifystreamstarted", r1);
+
+        assert_eq!(
+            rx2.try_recv().unwrap().data[0]
+                .get("id")
+                .map(String::as_str),
+            Some("s2")
+        );
+        assert_eq!(
+            rx1.try_recv().unwrap().data[0]
+                .get("id")
+                .map(String::as_str),
+            Some("s1")
+        );
+    }
+
+    #[test]
+    fn setupstream_fails_immediately_on_server_error() {
+        let mut tracker = tracker_past_welcome();
+        let (rc, mut rx) = tracker.register_command("setupstream name=Denied");
+        tracker.resolve(
+            rc,
+            Some(crate::errors::Error::ServerError {
+                id: "2568".to_string(),
+                server_message: "insufficient client permissions".to_string(),
+                extra_message: None,
+            }),
+        );
+        let res = rx.try_recv().expect("error resolved immediately");
+        assert!(res.err.is_some());
     }
 }

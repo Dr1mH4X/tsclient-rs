@@ -49,6 +49,9 @@ mod types;
 #[cfg(feature = "open-protocol")]
 pub mod open_protocol;
 
+#[cfg(feature = "stream")]
+pub mod stream;
+
 // ---- Main client ----------------------------------------------------------------
 
 pub use client::{Client, ClientStatus};
@@ -76,10 +79,12 @@ pub use types::{
 pub use errors::Error;
 
 pub use errors::{
-    AlreadyConnectedError, CommandTimeoutError, CryptoInitError, EAXTagMismatchError,
+    AlreadyConnectedError, CommandTimeoutError, CryptoInitError, EAXTagMismatchError, ErrorCode,
     FakeSignatureMismatchError, FileTransferError, FileTransferTimeoutError, InvalidIdentityError,
     ServerError, TeamspeakError,
 };
+
+pub use server_info::{STREAM_P2P_EXTENSION, parse_capability_extensions};
 
 // ---- High-level API helpers ----------------------------------------------------
 

@@ -1622,6 +1622,7 @@ impl Client {
             cmd,
             timeout_ms,
             None,
+            None,
         )
         .await
     }
@@ -2058,7 +2059,7 @@ impl Client {
             Self::build_cmd_handler_simple(&self.inner.lock().unwrap().cmd_middlewares, &sender);
     }
 
-    #[cfg(feature = "open-protocol")]
+    #[cfg(any(feature = "open-protocol", feature = "stream"))]
     pub(crate) fn weak_handle(&self) -> ClientWeak {
         ClientWeak {
             inner: Arc::downgrade(&self.inner),
@@ -2102,9 +2103,73 @@ impl Client {
         }
         Self::flush_deferred_events(&self.inner, &self.final_event_handler);
     }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn install_stream_test_handler<F>(&self, handler: F)
+    where
+        F: Fn(String) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        *self.final_cmd_handler.lock().unwrap() = Arc::new(handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn inject_stream_test_line(&self, clid: i32, line: &str) {
+        let sender = self.handler.lock().unwrap().create_packet_sender();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.clid = clid;
+            inner.defer_events = true;
+            inner.handle_command_str(line, &sender);
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn set_stream_test_connected(&self, clid: i32) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.clid = clid;
+            inner.status = ClientStatus::Connected;
+            inner.cmd_track.signal_welcome_complete();
+            inner.defer_events = true;
+            inner.mark_connected();
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn trigger_stream_test_disconnect(&self, err: Option<Error>) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.cmd_track.reset();
+            inner.defer_events = true;
+            inner.handle_connection_closed(err);
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn trigger_stream_test_overflow(&self) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.defer_events = true;
+            inner.dispatch_event(Event::NotificationOverflow {
+                queue: "raw_notification".to_string(),
+            });
+        }
+        Self::flush_deferred_events(&self.inner, &self.final_event_handler);
+    }
+
+    #[cfg(all(test, feature = "stream"))]
+    pub(crate) fn resolve_stream_test_rc(&self, rc: i32, err: Option<Error>) {
+        self.inner.lock().unwrap().cmd_track.resolve(rc, err);
+    }
 }
 
-#[cfg(feature = "open-protocol")]
+#[cfg(any(feature = "open-protocol", feature = "stream"))]
 #[derive(Clone)]
 pub(crate) struct ClientWeak {
     inner: std::sync::Weak<Mutex<ClientInner>>,
@@ -2113,7 +2178,7 @@ pub(crate) struct ClientWeak {
     logger: std::sync::Weak<dyn Logger>,
 }
 
-#[cfg(feature = "open-protocol")]
+#[cfg(any(feature = "open-protocol", feature = "stream"))]
 impl ClientWeak {
     pub(crate) fn upgrade(&self) -> Option<ClientHandle> {
         Some(ClientHandle {
@@ -2125,7 +2190,7 @@ impl ClientWeak {
     }
 }
 
-#[cfg(feature = "open-protocol")]
+#[cfg(any(feature = "open-protocol", feature = "stream"))]
 pub(crate) struct ClientHandle {
     inner: Arc<Mutex<ClientInner>>,
     throttle: Arc<tokio::sync::Mutex<CommandThrottle>>,
@@ -2133,12 +2198,13 @@ pub(crate) struct ClientHandle {
     logger: Arc<dyn Logger>,
 }
 
-#[cfg(feature = "open-protocol")]
+#[cfg(any(feature = "open-protocol", feature = "stream"))]
 impl ClientHandle {
     pub(crate) fn status(&self) -> ClientStatus {
         self.inner.lock().unwrap().status
     }
 
+    #[cfg(feature = "open-protocol")]
     pub(crate) fn connection_epoch(&self) -> u64 {
         self.inner.lock().unwrap().connection_epoch
     }
@@ -2147,6 +2213,7 @@ impl ClientHandle {
         self.inner.lock().unwrap().clid
     }
 
+    #[cfg(feature = "open-protocol")]
     pub(crate) fn channel_id(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner
@@ -2161,6 +2228,17 @@ impl ClientHandle {
         inner.directory_ready.then(|| inner.directory.snapshot())
     }
 
+    #[cfg(feature = "stream")]
+    pub(crate) fn server_info(&self) -> Option<ServerInfo> {
+        self.inner.lock().unwrap().server_info()
+    }
+
+    #[cfg(feature = "stream")]
+    pub(crate) fn client_info(&self, clid: i32) -> Option<ClientInfo> {
+        self.inner.lock().unwrap().directory.client(clid).cloned()
+    }
+
+    #[cfg(feature = "open-protocol")]
     pub(crate) async fn send_plugin_command_for_epoch(
         &self,
         name: &str,
@@ -2178,9 +2256,72 @@ impl ClientHandle {
             &cmd,
             crate::api::CMD_TIMEOUT_MS,
             Some(expected_epoch),
+            None,
         )
         .await?;
         Ok(())
+    }
+
+    #[cfg(feature = "stream")]
+    pub(crate) async fn exec_command_for_stream(
+        &self,
+        cmd: &str,
+        timeout_ms: u64,
+        sent_flag: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<HashMap<String, String>>, Error> {
+        exec_command_parts(
+            &self.inner,
+            &self.throttle,
+            &self.final_cmd_handler,
+            &*self.logger,
+            cmd,
+            timeout_ms,
+            None,
+            sent_flag,
+        )
+        .await
+    }
+}
+
+struct CommandRegistrationGuard<'a> {
+    inner: &'a Arc<Mutex<ClientInner>>,
+    rc: Option<i32>,
+    sent: bool,
+}
+
+impl<'a> CommandRegistrationGuard<'a> {
+    fn new(inner: &'a Arc<Mutex<ClientInner>>) -> Self {
+        Self {
+            inner,
+            rc: None,
+            sent: false,
+        }
+    }
+
+    fn set_registered(&mut self, rc: i32) {
+        self.rc = Some(rc);
+    }
+
+    fn mark_sent(&mut self) {
+        self.sent = true;
+    }
+
+    fn cleanup(&mut self) {
+        if let Some(rc) = self.rc.take()
+            && let Ok(mut inner) = self.inner.lock()
+        {
+            if self.sent {
+                inner.cmd_track.unregister(rc);
+            } else {
+                inner.cmd_track.discard_unsent(rc);
+            }
+        }
+    }
+}
+
+impl Drop for CommandRegistrationGuard<'_> {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 
@@ -2192,6 +2333,7 @@ async fn exec_command_parts(
     cmd: &str,
     timeout_ms: u64,
     expected_epoch: Option<u64>,
+    sent_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<HashMap<String, String>>, Error> {
     if cmd
         .split_whitespace()
@@ -2203,9 +2345,8 @@ async fn exec_command_parts(
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     for refused in 0..=3 {
-        let mut registered = None;
-        let mut sent = false;
-        let attempt = async {
+        let mut reg_guard = CommandRegistrationGuard::new(inner_arc);
+        let result = tokio::time::timeout_at(deadline, async {
             let mut throttle = throttle_arc.lock().await;
             throttle.wait(None).await?;
             let (rc, rx) = {
@@ -2217,7 +2358,7 @@ async fn exec_command_parts(
                 }
                 inner.cmd_track.register_command(cmd)
             };
-            registered = Some(rc);
+            reg_guard.set_registered(rc);
             logger.debug(
                 &format!(
                     "command {} awaiting response rc={rc}",
@@ -2227,20 +2368,16 @@ async fn exec_command_parts(
             );
             let handler = final_cmd_handler_arc.lock().unwrap().clone();
             handler(commands::append_return_code(cmd, rc)).await?;
-            sent = true;
+            reg_guard.mark_sent();
+            if let Some(flag) = sent_flag {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
             drop(throttle);
             rx.await
                 .map_err(|_| Error::Teamspeak("command channel closed".into()))
-        };
-        let result = tokio::time::timeout_at(deadline, attempt).await;
-        if let Some(rc) = registered {
-            let mut inner = inner_arc.lock().unwrap();
-            if sent {
-                inner.cmd_track.unregister(rc);
-            } else {
-                inner.cmd_track.discard_unsent(rc);
-            }
-        }
+        })
+        .await;
+        reg_guard.cleanup();
         let result = result.map_err(|_| Error::CommandTimeout {
             command: cmd.split_whitespace().next().unwrap_or("").to_string(),
         })??;
@@ -2752,6 +2889,7 @@ mod tests {
             input_muted: None,
             output_muted: None,
             channel_commander: None,
+            is_streaming: None,
         }
     }
 
@@ -4146,7 +4284,10 @@ mod tests {
             make_voice_packet(PacketType::Voice, 10, 7, 4, &[1], now),
         );
         assert_eq!(*mw_seen.lock().unwrap(), vec![10]);
-        assert_eq!(*client_probe.lock().unwrap(), Some(ClientStatus::Disconnected));
+        assert_eq!(
+            *client_probe.lock().unwrap(),
+            Some(ClientStatus::Disconnected)
+        );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.on_voice_data(Arc::new(move |ev| {
@@ -4350,5 +4491,156 @@ mod tests {
             *log.lock().unwrap(),
             vec!["connected", "disconnected", "connected", "disconnected"]
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_exec_command_via_select_unregisters_rc_and_keeps_next_query_clean() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        );
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .cmd_track
+            .signal_welcome_complete();
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (unsent_gate_tx, unsent_gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let unsent_gate_rx = Arc::new(tokio::sync::Mutex::new(Some(unsent_gate_rx)));
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            let sent_tx = sent_tx.clone();
+            let unsent_gate_rx = Arc::clone(&unsent_gate_rx);
+            Box::pin(async move {
+                let _ = sent_tx.send(line.clone());
+                if line.starts_with("clientdblist ")
+                    && let Some(rx) = unsent_gate_rx.lock().await.take()
+                {
+                    let _ = rx.await;
+                }
+                Ok(())
+            })
+        });
+
+        // 1. Sent command cancelled via select! while awaiting server response: must unregister(rc).
+        let exec_fut = client.exec_command_with_response("banlist", 5_000);
+        let rc_sent: i32 = tokio::select! {
+            _ = exec_fut => panic!("first command unexpectedly completed"),
+            line = sent_rx.recv() => line
+                .expect("sent line")
+                .split_whitespace()
+                .find_map(|p| p.strip_prefix("return_code="))
+                .unwrap()
+                .parse()
+                .unwrap(),
+        };
+        {
+            let inner = client.inner.lock().unwrap();
+            assert!(!inner.cmd_track.is_pending(rc_sent));
+            assert!(inner.cmd_track.is_abandoned(rc_sent));
+        }
+        // Late server reply for the cancelled sent command is drained cleanly without leaking into later queries.
+        {
+            let sender = client.handler.lock().unwrap().create_packet_sender();
+            let mut inner = client.inner.lock().unwrap();
+            inner.handle_command_str("notifybanlist banid=99", &sender);
+            inner.handle_command_str(&format!("error id=0 msg=ok return_code={rc_sent}"), &sender);
+            assert!(!inner.cmd_track.is_in_order(rc_sent));
+            assert!(!inner.cmd_track.is_abandoned(rc_sent));
+        }
+
+        // 2. Unsent command cancelled during handler send: must discard_unsent(rc) from order.
+        let unsent_fut = client.exec_command_with_response("clientdblist", 5_000);
+        let rc_unsent: i32 = tokio::select! {
+            _ = unsent_fut => panic!("unsent command unexpectedly completed"),
+            line = sent_rx.recv() => line
+                .expect("line")
+                .split_whitespace()
+                .find_map(|p| p.strip_prefix("return_code="))
+                .unwrap()
+                .parse()
+                .unwrap(),
+        };
+        {
+            let inner = client.inner.lock().unwrap();
+            assert!(!inner.cmd_track.is_pending(rc_unsent));
+            assert!(!inner.cmd_track.is_in_order(rc_unsent));
+        }
+        drop(unsent_gate_tx);
+
+        // 3. Subsequent command still receives its own rows without interference from skipped/abandoned slots.
+        let next_client = Arc::new(client);
+        let c2 = Arc::clone(&next_client);
+        let next_task = tokio::spawn(async move {
+            c2.exec_command_with_response("servergrouplist", 5_000)
+                .await
+        });
+        let next_line = sent_rx.recv().await.expect("next line");
+        let rc_next: i32 = next_line
+            .split_whitespace()
+            .find_map(|p| p.strip_prefix("return_code="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let sender = next_client.handler.lock().unwrap().create_packet_sender();
+        {
+            let mut inner = next_client.inner.lock().unwrap();
+            inner.handle_command_str("notifyservergrouplist sgid=9 name=Admin", &sender);
+            inner.handle_command_str(&format!("error id=0 msg=ok return_code={rc_next}"), &sender);
+        }
+        let rows = next_task.await.unwrap().expect("next command succeeded");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("sgid").map(String::as_str), Some("9"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_correlated_setupstream_via_select_clears_correlated_spec() {
+        let client = Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        );
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .cmd_track
+            .signal_welcome_complete();
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *client.final_cmd_handler.lock().unwrap() = Arc::new(move |line: String| {
+            let sent_tx = sent_tx.clone();
+            Box::pin(async move {
+                let _ = sent_tx.send(line);
+                Ok(())
+            })
+        });
+
+        let fut = exec_command_parts(
+            &client.inner,
+            &client.throttle,
+            &client.final_cmd_handler,
+            &*client.logger,
+            "setupstream name=Test",
+            5_000,
+            None,
+            None,
+        );
+        let rc: i32 = tokio::select! {
+            _ = fut => panic!("setupstream unexpectedly completed"),
+            line = sent_rx.recv() => {
+                line.expect("sent line")
+                    .split_whitespace()
+                    .find_map(|p| p.strip_prefix("return_code="))
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            }
+        };
+        let inner = client.inner.lock().unwrap();
+        assert!(!inner.cmd_track.is_pending(rc));
+        assert!(!inner.cmd_track.has_correlated_spec(rc));
     }
 }

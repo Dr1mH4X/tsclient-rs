@@ -66,6 +66,43 @@ pub(crate) fn merge_server_properties(
     changed
 }
 
+/// 服务端扩展名常量：点对点屏幕共享控制面能力。
+pub const STREAM_P2P_EXTENSION: &str = "STREAM_P2P";
+
+/// 解析 `virtualserver_capability_extensions`：按逗号拆分、去除空白与空项，
+/// 并按服务端原始顺序去重。
+pub fn parse_capability_extensions(value: Option<&str>) -> Vec<String> {
+    let Some(raw) = value else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+impl ServerInfo {
+    /// 返回服务端声明的能力扩展列表（`virtualserver_capability_extensions`）。
+    pub fn capability_extensions(&self) -> &[String] {
+        &self.extensions
+    }
+
+    /// 判断服务端是否声明了指定扩展名（按精确大小写匹配）。
+    pub fn has_capability_extension(&self, name: &str) -> bool {
+        self.extensions.iter().any(|ext| ext == name)
+    }
+
+    /// 检查服务端是否声明 `STREAM_P2P` 能力扩展。
+    pub fn supports_stream_p2p(&self) -> bool {
+        self.has_capability_extension(STREAM_P2P_EXTENSION)
+    }
+}
+
 /// 从已解码（`parse_command` 已完成 `unescape`）的键值表构建 [`ServerInfo`]。
 pub(crate) fn build_server_info(raw: &HashMap<String, String>) -> ServerInfo {
     ServerInfo {
@@ -97,6 +134,10 @@ pub(crate) fn build_server_info(raw: &HashMap<String, String>) -> ServerInfo {
             .get("virtualserver_version")
             .cloned()
             .unwrap_or_default(),
+        extensions: parse_capability_extensions(
+            raw.get("virtualserver_capability_extensions")
+                .map(String::as_str),
+        ),
         raw: raw.clone(),
     }
 }
@@ -203,5 +244,23 @@ mod tests {
 
         let missing_icon = build_server_info(&params(&[("virtualserver_icon_id", "bad")]));
         assert_eq!(missing_icon.icon_id, None);
+    }
+
+    #[test]
+    fn capability_extensions_are_trimmed_deduplicated_and_detect_stream_p2p() {
+        let info = build_server_info(&params(&[(
+            "virtualserver_capability_extensions",
+            " FILETIME , , STREAM_P2P , FILETIME , s3 ",
+        )]));
+        assert_eq!(
+            info.capability_extensions(),
+            &["FILETIME", "STREAM_P2P", "s3"]
+        );
+        assert!(info.has_capability_extension("FILETIME"));
+        assert!(info.supports_stream_p2p());
+
+        let legacy = build_server_info(&params(&[("virtualserver_version", "3.13.8")]));
+        assert!(legacy.capability_extensions().is_empty());
+        assert!(!legacy.supports_stream_p2p());
     }
 }

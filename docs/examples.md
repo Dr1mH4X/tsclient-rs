@@ -321,3 +321,41 @@ cargo run --example channel_icons
 先通过 `client.exec_command_with_response("permissionlist", 5000)` 读取服务器的权限名称表，再使用对应 id 调用 `client.permission_value(id)`。返回 `None` 表示未知或已撤销，界面应禁用相应管理操作；最终操作仍由服务器校验。
 
 `Error::ServerError` 的 `extra_message` 可读取服务端附加说明。命令执行器自动处理带等待时间的防刷拒绝；超时或没有等待时间的拒绝直接返回，不重发已执行结果未知的请求。
+
+## TS6 屏幕共享控制面（`stream` feature）
+
+```rust
+use tsclient_rs::stream::{
+    PublishOptions, PublishedStreamEvent, Streams, StreamsEvent, StreamsOptions, WatchOptions,
+};
+use tsclient_rs::*;
+
+# async fn demo(client: Client) -> Result<(), tsclient_rs::stream::StreamError> {
+let streams = Streams::new(&client, StreamsOptions { remember_denied: true });
+let mut events = streams.subscribe();
+
+if streams.supported() {
+    let published = streams.publish(PublishOptions::new("Desktop")).await?;
+    let mut pub_events = published.subscribe();
+    if let Some(PublishedStreamEvent::Request(req)) = pub_events.recv().await {
+        let peer = req.accept("v=0\r\nm=audio 9 ...\r\nm=video 9 ...", "").await?;
+        peer.close().await?;
+    }
+    published.stop(0).await?;
+}
+
+if let Some(info) = streams.list().first() {
+    let view = streams.watch(info, WatchOptions::default()).await?;
+    view.answer("v=0\r\nm=audio 9 ...").await?;
+    view.leave().await?;
+}
+
+while let Ok(ev) = events.try_recv() {
+    if let StreamsEvent::Warning(w) = ev {
+        println!("warning: {}", w.message);
+    }
+}
+streams.dispose();
+# Ok(())
+# }
+```

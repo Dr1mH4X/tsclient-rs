@@ -622,6 +622,7 @@ pub fn parse_client(params: &HashMap<String, String>) -> Option<ClientInfo> {
         input_muted: parse_bool(params.get("client_input_muted")),
         output_muted: parse_bool(params.get("client_output_muted")),
         channel_commander: parse_bool(params.get("client_is_channel_commander")),
+        is_streaming: parse_bool(params.get("client_is_streaming")),
     })
 }
 
@@ -750,6 +751,12 @@ pub(crate) fn apply_client_notification(
         if let Some(value) = parse_bool(params.get("client_is_channel_commander")) {
             if current.channel_commander != Some(value) {
                 current.channel_commander = Some(value);
+                changed = true;
+            }
+        }
+        if let Some(value) = parse_bool(params.get("client_is_streaming")) {
+            if current.is_streaming != Some(value) {
+                current.is_streaming = Some(value);
                 changed = true;
             }
         }
@@ -1413,6 +1420,7 @@ mod tests {
                 input_muted: None,
                 output_muted: None,
                 channel_commander: None,
+                is_streaming: None,
             }));
         }
         directory.finish_welcome();
@@ -1595,5 +1603,45 @@ mod tests {
             &mut directory
         ));
         assert_eq!(directory.snapshot().channels[0].icon_id, Some(3009859579));
+    }
+
+    #[test]
+    fn client_is_streaming_parses_enter_and_updates_directory() {
+        let map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        let mut directory = DirectoryCache::default();
+        let streaming = parse_client(&map(&[
+            ("clid", "12"),
+            ("cid", "3"),
+            ("client_nickname", "Streamer"),
+            ("client_is_streaming", "1"),
+        ]))
+        .expect("client parsed");
+        assert_eq!(streaming.is_streaming, Some(true));
+        assert!(directory.insert_client(streaming));
+
+        let no_change = apply_client_notification(
+            "notifyclientupdated",
+            &map(&[("clid", "12"), ("client_is_streaming", "1")]),
+            &mut directory,
+        );
+        assert!(no_change.is_none());
+
+        let stopped = apply_client_notification(
+            "notifyclientupdated",
+            &map(&[("clid", "12"), ("client_is_streaming", "0")]),
+            &mut directory,
+        )
+        .expect("is_streaming cleared");
+        assert_eq!(stopped.is_streaming, Some(false));
+        assert_eq!(directory.client(12).unwrap().is_streaming, Some(false));
+
+        let absent_flag = parse_client(&map(&[("clid", "13"), ("cid", "3")]))
+            .expect("client without flag parsed");
+        assert_eq!(absent_flag.is_streaming, None);
     }
 }

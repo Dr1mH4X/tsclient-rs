@@ -1593,8 +1593,7 @@ mod tests {
             let p_id = u16::from_be_bytes([header[0], header[1]]);
             let p_type = header[4] & 0x0f;
 
-            let (dummy_key, dummy_nonce) =
-                core.crypt.get_key_nonce(false, p_id, 0, p_type, true);
+            let (dummy_key, dummy_nonce) = core.crypt.get_key_nonce(false, p_id, 0, p_type, true);
             let decrypted = crate::crypto::EAX::new(&dummy_key)
                 .unwrap()
                 .decrypt(&dummy_nonce, header, ciphertext, tag)
@@ -1602,8 +1601,7 @@ mod tests {
             assert_eq!(decrypted, payload);
 
             // Session key must fail to decrypt the resent clientek.
-            let (sess_key, sess_nonce) =
-                core.crypt.get_key_nonce(false, p_id, 0, p_type, false);
+            let (sess_key, sess_nonce) = core.crypt.get_key_nonce(false, p_id, 0, p_type, false);
             assert!(
                 crate::crypto::EAX::new(&sess_key)
                     .unwrap()

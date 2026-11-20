@@ -214,29 +214,61 @@ mod tests {
 
         let mut step2_pkt = vec![0u8; INIT_VERSION_LEN + INIT_TYPE_LEN + 16 + 4];
         step2_pkt[0] = 0x02;
-        assert!(process_init1(&mut crypt, Some(&step2_pkt)).unwrap().is_some());
+        assert!(
+            process_init1(&mut crypt, Some(&step2_pkt))
+                .unwrap()
+                .is_some()
+        );
 
         let mut step1_pkt = vec![0u8; INIT_STEP_LEN];
         step1_pkt[0] = 0x01;
-        assert!(process_init1(&mut crypt, Some(&step1_pkt)).unwrap().is_none());
+        assert!(
+            process_init1(&mut crypt, Some(&step1_pkt))
+                .unwrap()
+                .is_none()
+        );
 
         let mut step0_pkt = vec![0u8; INIT_STEP_LEN];
         step0_pkt[0] = 0x00;
-        assert!(process_init1(&mut crypt, Some(&step0_pkt)).unwrap().is_none());
+        assert!(
+            process_init1(&mut crypt, Some(&step0_pkt))
+                .unwrap()
+                .is_none()
+        );
 
         let challenge = make_step3_challenge(1, true);
-        assert!(process_init1(&mut crypt, Some(&challenge)).unwrap().is_some());
-        assert!(process_init1(&mut crypt, Some(&step2_pkt)).unwrap().is_none());
+        assert!(
+            process_init1(&mut crypt, Some(&challenge))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            process_init1(&mut crypt, Some(&step2_pkt))
+                .unwrap()
+                .is_none()
+        );
 
         // 0x7f resets Init1 state while crypto_init_complete is false.
         assert!(process_init1(&mut crypt, Some(&[0x7f])).unwrap().is_some());
-        assert!(process_init1(&mut crypt, Some(&step1_pkt)).unwrap().is_some());
+        assert!(
+            process_init1(&mut crypt, Some(&step1_pkt))
+                .unwrap()
+                .is_some()
+        );
 
         crypt.crypto_init_complete = true;
         assert!(process_init1(&mut crypt, None).unwrap().is_none());
         assert!(process_init1(&mut crypt, Some(&[0x7f])).unwrap().is_none());
-        assert!(process_init1(&mut crypt, Some(&step2_pkt)).unwrap().is_none());
-        assert!(process_init1(&mut crypt, Some(&challenge)).unwrap().is_none());
+        assert!(
+            process_init1(&mut crypt, Some(&step2_pkt))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            process_init1(&mut crypt, Some(&challenge))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
