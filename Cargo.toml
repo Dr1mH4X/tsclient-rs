@@ -9,6 +9,7 @@ edition = "2024"
 [features]
 default = []
 open-protocol = ["dep:serde", "dep:serde_json"]
+stream = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 thiserror = "2"
