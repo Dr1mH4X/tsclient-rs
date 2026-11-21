@@ -46,11 +46,11 @@ is true when a row was rejected by those limits. `directory_snapshot()` returns
 wait for a complete snapshot.
 
 `ClientInfo` carries live client state alongside identity: `away`,
-`away_message`, `input_muted`, `output_muted`, `channel_commander` and
-`is_streaming`. Each is `Option`-typed: `None` means the server has not reported
-the flag yet, which is distinct from a reported `Some(false)`. Mute, away, and
-streaming toggles arrive through `notifyclientupdated`, are reflected in later
-snapshots, and dispatch `client_updated` events carrying the fresh record.
+`away_message`, `input_muted`, `output_muted`, `channel_commander`,
+`is_streaming` and `avatar_hash`. Each is `Option`-typed: `None` means the server has not reported
+the flag yet (or for `avatar_hash`, `client_flag_avatar` was absent or empty), which is distinct from a reported `Some(false)`. Mute, away, avatar, and
+streaming updates arrive through `notifyclientupdated`, are reflected in later
+snapshots, and dispatch `client_updated` events carrying the fresh record (without falling into `Event::RawNotification`).
 Welcome traffic is reconciled against live events: updates that arrive
 before a client's row are replayed once the row inserts the client, and
 clients an enterview introduced or a left view removed are never replaced
@@ -103,15 +103,20 @@ so consumers can safely teardown and reconnect.
 - `notifyserveredited` 总是派发 `Event::ServerEdited(ServerEditedEvent)`（包含操作者与变更键值；TS6 修改欢迎语等场景下 `changes` 可能为空），同时局部合并进缓存；`notifyserverupdated` 与 `serverinfo` 会过滤 15 个易变计数器（如 `virtualserver_uptime`、`virtualserver_clientsonline`）后合并进缓存，实际发生变化时串行派发 `Event::ServerInfoUpdated(ServerInfo)`。
 - `ServerInfo.icon_id` 复用 `ChannelInfo.icon_id` 的无符号 32 位解析规则，可直接传入 `icon_file_name(id)` 与 `download_icon` 下载服务器图标。
 
-## 频道图标
+## 频道图标与客户端头像
 
 `ChannelInfo.icon_id` 保存 `channel_icon_id`，类型为 `Option<u32>`。`None` 表示服务器未报告该字段，`Some(0)` 表示没有自定义图标；协议中的有符号 32 位 id 以及零扩展到 64 位的无符号形式都会按同一组位转换成无符号值。频道创建和编辑通知会更新后续目录快照，未携带图标字段的通知保留已有值。`listChannels` 请求 `channellist -icon`，因此该接口返回的频道也带有图标 id。
+
+`ClientInfo.avatar_hash` 保存 `client_flag_avatar`，类型为 `Option<String>`，空值规范化为 `None`；`notifyclientupdated` 中携带空 `client_flag_avatar=` 会显式清空为 `None`，缺省该键时保留原有值。
 
 | API | 用途 |
 | --- | --- |
 | `icon_file_name(id)` / `iconFileName(id)` | 返回频道 0 文件区中的 `/icon_<unsigned id>` |
 | `client.download_icon(host, id, max_bytes)` | 下载自定义图标，拒绝 0 id、空文件和超过限制的声明长度 |
 | `download_icon(&client, host, id, max_bytes)` / `downloadIcon(...)` | 上一接口的独立函数形式 |
+| `avatar_file_name(uid)` / `avatarFileName(uid)` | 将 base64 解码后为 20 字节（TS3）或 32 字节（TS6）的客户端 UID 映射为 `/avatar_<a-p nibbles>`，非法输入返回 `Error::FileTransfer` |
+| `client.download_avatar(host, uid, max_bytes)` | 下载客户端头像，拒绝空文件和超过限制的声明长度，服务端错误透传为 `Error::ServerError` |
+| `download_avatar(&client, host, uid, max_bytes)` / `downloadAvatar(...)` | 上一接口的独立函数形式 |
 
 需要控制协议请求与 TCP 传输时，可先调用 `client.file_transfer_init_download(0, &icon_file_name(id), "")`，校验返回的 `size` 后调用 `downloadFileData(host, &info, writer)`。`host` 由调用者提供，不取第三方主机；应用自身负责访问策略和缓存。
 
@@ -127,7 +132,7 @@ so consumers can safely teardown and reconnect.
 
 `client.permission_value(permid)` 返回服务器通过 `notifyclientneededpermissions` 最近推送的本端有效权限；未报告或撤销时返回 `None`，断开连接后清空。`on_own_permissions_changed` 收到 `Event::OwnPermissionsChanged` 后，调用方可重新读取受影响的操作权限。权限 id 由服务器的 `permissionlist` 数据确定，不能跨服务器版本写死。
 
-文件传输协商中的 `notifystatusfiletransfer` 拒绝结果以 `Error::ServerError` 返回，保留数字错误码与服务器文案，调用方可以区分频道密码错误和权限不足。
+文件传输协商中的 `notifystatusfiletransfer` 拒绝结果以 `Error::ServerError` 返回，保留数字错误码与服务器文案，调用方可通过 `ErrorCode`（包含 `FileNotFound` / `2051`、`FileInvalidPath` / `2054`、`PermissionsClientInsufficient` / `2568`、`Permissions` / `2572` 等）区分文件不存在、频道密码错误和权限不足。
 
 命令错误保留服务端 `extra_msg`。只有错误 524 携带明确等待时间时才在原调用时限内重试，最多三次；节流等待计入调用超时。
 

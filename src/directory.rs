@@ -623,6 +623,7 @@ pub fn parse_client(params: &HashMap<String, String>) -> Option<ClientInfo> {
         output_muted: parse_bool(params.get("client_output_muted")),
         channel_commander: parse_bool(params.get("client_is_channel_commander")),
         is_streaming: parse_bool(params.get("client_is_streaming")),
+        avatar_hash: parse_avatar_hash(params.get("client_flag_avatar")),
     })
 }
 
@@ -760,6 +761,13 @@ pub(crate) fn apply_client_notification(
                 changed = true;
             }
         }
+        if let Some(value) = params.get("client_flag_avatar") {
+            let next_hash = (!value.is_empty()).then(|| value.clone());
+            if current.avatar_hash != next_hash {
+                current.avatar_hash = next_hash;
+                changed = true;
+            }
+        }
         changed
     });
     if changed {
@@ -812,6 +820,10 @@ pub(crate) fn parse_bool(value: Option<&String>) -> Option<bool> {
     }
 }
 
+pub(crate) fn parse_avatar_hash(value: Option<&String>) -> Option<String> {
+    value.filter(|s| !s.is_empty()).cloned()
+}
+
 fn channel_size(channel: &ChannelInfo) -> usize {
     size_of::<ChannelInfo>() + channel.name.len() + channel.description.len()
 }
@@ -826,6 +838,7 @@ fn client_size(client: &ClientInfo) -> usize {
             .map(|group| size_of::<String>() + group.len())
             .sum::<usize>()
         + client.away_message.as_deref().map_or(0, str::len)
+        + client.avatar_hash.as_deref().map_or(0, str::len)
 }
 
 fn ordered_channels_from_index(
@@ -1421,6 +1434,7 @@ mod tests {
                 output_muted: None,
                 channel_commander: None,
                 is_streaming: None,
+                avatar_hash: None,
             }));
         }
         directory.finish_welcome();
@@ -1643,5 +1657,103 @@ mod tests {
         let absent_flag = parse_client(&map(&[("clid", "13"), ("cid", "3")]))
             .expect("client without flag parsed");
         assert_eq!(absent_flag.is_streaming, None);
+    }
+
+    #[test]
+    fn parse_client_normalizes_avatar_hash_variants() {
+        let with_hash = parse_client(&row(&[
+            ("clid", "1"),
+            ("cid", "1"),
+            ("client_flag_avatar", "d41d8cd98f00b204e9800998ecf8427e"),
+        ]))
+        .expect("client");
+        assert_eq!(
+            with_hash.avatar_hash.as_deref(),
+            Some("d41d8cd98f00b204e9800998ecf8427e")
+        );
+
+        let empty_hash = parse_client(&row(&[
+            ("clid", "2"),
+            ("cid", "1"),
+            ("client_flag_avatar", ""),
+        ]))
+        .expect("client");
+        assert_eq!(empty_hash.avatar_hash, None);
+
+        let absent_hash = parse_client(&row(&[("clid", "3"), ("cid", "1")])).expect("client");
+        assert_eq!(absent_hash.avatar_hash, None);
+    }
+
+    #[test]
+    fn client_avatar_hash_updates_incrementally_and_preserves_when_omitted() {
+        let mut directory = DirectoryCache::default();
+        assert!(
+            directory.insert_client(
+                parse_client(&row(&[
+                    ("clid", "7"),
+                    ("cid", "1"),
+                    ("client_nickname", "Alice"),
+                ]))
+                .expect("client"),
+            )
+        );
+        assert_eq!(directory.client(7).unwrap().avatar_hash, None);
+
+        // 1. 新增头像 hash
+        let added = apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_flag_avatar", "hash_v1")]),
+            &mut directory,
+        )
+        .expect("avatar added");
+        assert_eq!(added.avatar_hash.as_deref(), Some("hash_v1"));
+        assert_eq!(
+            directory.client(7).unwrap().avatar_hash.as_deref(),
+            Some("hash_v1")
+        );
+
+        // 2. 不带 client_flag_avatar 键的更新（如仅修改昵称/静音）保留原有 avatar_hash
+        let renamed = apply_client_notification(
+            "notifyclientupdated",
+            &row(&[
+                ("clid", "7"),
+                ("client_nickname", "Alice2"),
+                ("client_input_muted", "1"),
+            ]),
+            &mut directory,
+        )
+        .expect("client renamed");
+        assert_eq!(renamed.nickname, "Alice2");
+        assert_eq!(renamed.input_muted, Some(true));
+        assert_eq!(renamed.avatar_hash.as_deref(), Some("hash_v1"));
+
+        // 3. 相同 hash 重复下发不视为变更
+        assert!(
+            apply_client_notification(
+                "notifyclientupdated",
+                &row(&[("clid", "7"), ("client_flag_avatar", "hash_v1")]),
+                &mut directory,
+            )
+            .is_none()
+        );
+
+        // 4. 变更 hash
+        let changed = apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_flag_avatar", "hash_v2")]),
+            &mut directory,
+        )
+        .expect("avatar changed");
+        assert_eq!(changed.avatar_hash.as_deref(), Some("hash_v2"));
+
+        // 5. 空值 client_flag_avatar= 显式清空为 None
+        let cleared = apply_client_notification(
+            "notifyclientupdated",
+            &row(&[("clid", "7"), ("client_flag_avatar", "")]),
+            &mut directory,
+        )
+        .expect("avatar cleared");
+        assert_eq!(cleared.avatar_hash, None);
+        assert_eq!(directory.client(7).unwrap().avatar_hash, None);
     }
 }

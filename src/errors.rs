@@ -3,9 +3,23 @@ use thiserror::Error;
 
 /// Known TeamSpeak server error codes exposed for typed matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 #[repr(u32)]
 pub enum ErrorCode {
     CommandNotFound = 0x0100,
+    FileInvalidName = 0x0800,
+    FileInvalidPermissions = 0x0801,
+    FileAlreadyExists = 0x0802,
+    FileNotFound = 0x0803,
+    FileIOError = 0x0804,
+    FileInvalidTransferId = 0x0805,
+    FileInvalidPath = 0x0806,
+    FileNoFilesAvailable = 0x0807,
+    FileInvalidSize = 0x0809,
+    FileTransferServerQuotaExceeded = 0x0814,
+    FileTransferClientQuotaExceeded = 0x0815,
+    PermissionsClientInsufficient = 0x0a08,
+    Permissions = 0x0a0c,
     StreamNotFound = 0x1603,
     StreamNotParticipating = 0x1604,
     StreamAlreadyJoined = 0x1606,
@@ -22,6 +36,19 @@ impl ErrorCode {
     pub const fn from_code(code: u32) -> Option<Self> {
         match code {
             0x0100 => Some(Self::CommandNotFound),
+            0x0800 => Some(Self::FileInvalidName),
+            0x0801 => Some(Self::FileInvalidPermissions),
+            0x0802 => Some(Self::FileAlreadyExists),
+            0x0803 => Some(Self::FileNotFound),
+            0x0804 => Some(Self::FileIOError),
+            0x0805 => Some(Self::FileInvalidTransferId),
+            0x0806 => Some(Self::FileInvalidPath),
+            0x0807 => Some(Self::FileNoFilesAvailable),
+            0x0809 => Some(Self::FileInvalidSize),
+            0x0814 => Some(Self::FileTransferServerQuotaExceeded),
+            0x0815 => Some(Self::FileTransferClientQuotaExceeded),
+            0x0a08 => Some(Self::PermissionsClientInsufficient),
+            0x0a0c => Some(Self::Permissions),
             0x1603 => Some(Self::StreamNotFound),
             0x1604 => Some(Self::StreamNotParticipating),
             0x1606 => Some(Self::StreamAlreadyJoined),
@@ -414,5 +441,35 @@ mod tests {
         };
         assert_eq!(err.server_error_code(), Some(5635));
         assert!(err.is_server_error_code(ErrorCode::StreamNotFound));
+    }
+
+    #[test]
+    fn file_and_permission_error_codes_match_wire_decimal_and_hex_values() {
+        let cases = [
+            (ErrorCode::FileInvalidName, 0x0800, "2048"),
+            (ErrorCode::FileInvalidPermissions, 0x0801, "2049"),
+            (ErrorCode::FileAlreadyExists, 0x0802, "2050"),
+            (ErrorCode::FileNotFound, 0x0803, "2051"),
+            (ErrorCode::FileIOError, 0x0804, "2052"),
+            (ErrorCode::FileInvalidTransferId, 0x0805, "2053"),
+            (ErrorCode::FileInvalidPath, 0x0806, "2054"),
+            (ErrorCode::FileNoFilesAvailable, 0x0807, "2055"),
+            (ErrorCode::FileInvalidSize, 0x0809, "2057"),
+            (ErrorCode::FileTransferServerQuotaExceeded, 0x0814, "2068"),
+            (ErrorCode::FileTransferClientQuotaExceeded, 0x0815, "2069"),
+            (ErrorCode::PermissionsClientInsufficient, 0x0a08, "2568"),
+            (ErrorCode::Permissions, 0x0a0c, "2572"),
+        ];
+
+        for (variant, hex_code, wire_id) in cases {
+            assert_eq!(variant.code(), hex_code);
+            assert_eq!(ErrorCode::from_id(wire_id), Some(variant));
+            let err = Error::ServerError {
+                id: wire_id.to_string(),
+                server_message: "refused".to_string(),
+                extra_message: None,
+            };
+            assert!(err.is_server_error_code(variant));
+        }
     }
 }

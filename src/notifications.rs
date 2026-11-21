@@ -19,6 +19,7 @@ pub enum NotificationResult {
     ClientMoved {
         event: ClientMovedEvent,
     },
+    ClientUpdated,
     TextMessage {
         message: TextMessage,
     },
@@ -61,6 +62,7 @@ pub fn handle_notification(
         "notifycliententerview" => handle_client_enter_view(params, clients, nickname),
         "notifyclientleftview" => handle_client_left_view(params, self_clid, clients),
         "notifyclientmoved" => handle_client_moved(params, clients),
+        "notifyclientupdated" => NotificationResult::ClientUpdated,
         "notifytextmessage" => handle_text_message(params, clients),
         "notifyclientpoke" => handle_client_poked(params),
         "notifyserveredited" => handle_server_edited(params),
@@ -105,6 +107,7 @@ fn handle_client_enter_view(
         output_muted: None,
         channel_commander: None,
         is_streaming: None,
+        avatar_hash: None,
     });
 
     if info.id != 0 {
@@ -405,6 +408,7 @@ mod tests {
             output_muted: None,
             channel_commander: None,
             is_streaming: None,
+            avatar_hash: None,
         }));
         let params = make_params(&[("clid", "42"), ("reasonid", "1"), ("reasonmsg", "left")]);
         let result = handle_client_left_view(&params, 99, &mut clients);
@@ -434,6 +438,7 @@ mod tests {
             output_muted: None,
             channel_commander: None,
             is_streaming: None,
+            avatar_hash: None,
         }));
         let params = make_params(&[
             ("invokerid", "10"),
@@ -504,6 +509,7 @@ mod tests {
             output_muted: None,
             channel_commander: None,
             is_streaming: None,
+            avatar_hash: None,
         });
         let cmd_no_invoker = crate::command::parse_command(
             "notifyplugincmd name=query_test data=payload invokerid=99",
@@ -623,5 +629,15 @@ mod tests {
             }
             _ => panic!("expected ServerUpdated"),
         }
+    }
+
+    #[test]
+    fn test_client_updated_is_typed_notification() {
+        let mut clients = DirectoryCache::default();
+        let cmd =
+            crate::command::parse_command("notifyclientupdated clid=7 client_flag_avatar=abc123")
+                .expect("parse command");
+        let result = handle_notification(&cmd.name, &cmd.params, 0, &mut clients, "");
+        assert!(matches!(result, NotificationResult::ClientUpdated));
     }
 }

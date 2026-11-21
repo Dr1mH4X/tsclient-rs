@@ -837,6 +837,7 @@ impl ClientInner {
                 self.dispatch_event(Event::ClientMoved(event));
                 self.mark_directory_changed();
             }
+            NotificationResult::ClientUpdated => {}
             NotificationResult::TextMessage { message } => {
                 self.dispatch_event(Event::TextMessage(message));
             }
@@ -2001,6 +2002,16 @@ impl Client {
         crate::api::download_icon(self, host, icon_id, max_bytes).await
     }
 
+    /// 下载服务器文件区中的客户端头像，限制下载前的声明大小。
+    pub async fn download_avatar(
+        &self,
+        host: &str,
+        uid: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        crate::api::download_avatar(self, host, uid, max_bytes).await
+    }
+
     // ---- Internal (package-visible) -------------------------------------------
 
     /// Called by handshake when the server acknowledges our connection.
@@ -2818,6 +2829,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notifyclientupdated_updates_avatar_hash_and_skips_raw_notification() {
+        let client = Arc::new(Client::new(
+            crate::crypto::generate_identity(0),
+            "127.0.0.1:9987".to_string(),
+            "bot".to_string(),
+            ClientOptions::default(),
+        ));
+        let sender = client.handler.lock().unwrap().create_packet_sender();
+        client.inner.lock().unwrap().status = ClientStatus::Connecting;
+        client.inner.lock().unwrap().handle_command_str(
+            "channelclientlist clid=7 cid=3 client_nickname=Alice client_flag_avatar=",
+            &sender,
+        );
+        assert_eq!(
+            client
+                .inner
+                .lock()
+                .unwrap()
+                .directory
+                .client(7)
+                .unwrap()
+                .avatar_hash,
+            None
+        );
+
+        let (updated_tx, mut updated_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.on_client_updated(Arc::new(move |event| {
+            if let Event::ClientUpdated(info) = event {
+                let _ = updated_tx.send(info);
+            }
+        }));
+        client.on_raw_notification(Arc::new(move |event| {
+            if let Event::RawNotification { name, .. } = event {
+                let _ = raw_tx.send(name);
+            }
+        }));
+
+        // 1. 新增 avatar_hash
+        client.inner.lock().unwrap().handle_command_str(
+            "notifyclientupdated clid=7 client_flag_avatar=hash_one",
+            &sender,
+        );
+        let ev1 = tokio::time::timeout(Duration::from_secs(1), updated_rx.recv())
+            .await
+            .expect("avatar added event timeout")
+            .unwrap();
+        assert_eq!(ev1.avatar_hash.as_deref(), Some("hash_one"));
+
+        // 2. 不带 client_flag_avatar 仅改昵称 -> 保留原有 avatar_hash
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyclientupdated clid=7 client_nickname=Alice2", &sender);
+        let ev2 = tokio::time::timeout(Duration::from_secs(1), updated_rx.recv())
+            .await
+            .expect("nickname update event timeout")
+            .unwrap();
+        assert_eq!(ev2.nickname, "Alice2");
+        assert_eq!(ev2.avatar_hash.as_deref(), Some("hash_one"));
+
+        // 3. 变更 avatar_hash
+        client.inner.lock().unwrap().handle_command_str(
+            "notifyclientupdated clid=7 client_flag_avatar=hash_two",
+            &sender,
+        );
+        let ev3 = tokio::time::timeout(Duration::from_secs(1), updated_rx.recv())
+            .await
+            .expect("avatar changed event timeout")
+            .unwrap();
+        assert_eq!(ev3.avatar_hash.as_deref(), Some("hash_two"));
+
+        // 4. 空值 client_flag_avatar= 显式清空为 None
+        client
+            .inner
+            .lock()
+            .unwrap()
+            .handle_command_str("notifyclientupdated clid=7 client_flag_avatar=", &sender);
+        let ev4 = tokio::time::timeout(Duration::from_secs(1), updated_rx.recv())
+            .await
+            .expect("avatar cleared event timeout")
+            .unwrap();
+        assert_eq!(ev4.avatar_hash, None);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(raw_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn welcome_group_ops_replay_when_the_client_row_arrives() {
         let client = Arc::new(Client::new(
             crate::crypto::generate_identity(0),
@@ -2890,6 +2991,7 @@ mod tests {
             output_muted: None,
             channel_commander: None,
             is_streaming: None,
+            avatar_hash: None,
         }
     }
 

@@ -89,10 +89,11 @@ pub use server_info::{STREAM_P2P_EXTENSION, parse_capability_extensions};
 // ---- High-level API helpers ----------------------------------------------------
 
 pub use api::{
-    ban_client as banClient, client_kick as clientKick, client_move as clientMove,
-    client_update as clientUpdate, download_icon, download_icon as downloadIcon,
-    file_transfer_delete_file as fileTransferDeleteFile, get_channel_description,
-    get_channel_description as getChannelDescription, get_channel_info,
+    avatar_file_name, avatar_file_name as avatarFileName, ban_client as banClient,
+    client_kick as clientKick, client_move as clientMove, client_update as clientUpdate,
+    download_avatar, download_avatar as downloadAvatar, download_icon,
+    download_icon as downloadIcon, file_transfer_delete_file as fileTransferDeleteFile,
+    get_channel_description, get_channel_description as getChannelDescription, get_channel_info,
     get_channel_info as getChannelInfo, get_client_info as getClientInfo, get_server_info,
     get_server_info as getServerInfo, get_server_variables,
     get_server_variables as getServerVariables, icon_file_name, icon_file_name as iconFileName,

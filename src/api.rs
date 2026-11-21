@@ -2,10 +2,12 @@
 
 use std::collections::HashMap;
 
+use base64::Engine as _;
+
 use crate::Client;
 use crate::Error;
 use crate::command::{build_command, build_command_ordered, unescape};
-use crate::directory::{parse_bool, parse_channel, parse_channel_info};
+use crate::directory::{parse_avatar_hash, parse_bool, parse_channel, parse_channel_info};
 use crate::helpers;
 use crate::types::*;
 
@@ -251,6 +253,7 @@ pub async fn list_clients(client: &Client) -> Result<Vec<ClientInfo>, Error> {
                 output_muted: parse_bool(item.get("client_output_muted")),
                 channel_commander: parse_bool(item.get("client_is_channel_commander")),
                 is_streaming: parse_bool(item.get("client_is_streaming")),
+                avatar_hash: parse_avatar_hash(item.get("client_flag_avatar")),
             }
         })
         .collect())
@@ -322,6 +325,25 @@ pub async fn file_transfer_delete_file(
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
+async fn download_channel_zero_file(
+    client: &Client,
+    host: &str,
+    file_name: &str,
+    kind: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Error> {
+    let info = client.file_transfer_init_download(0, file_name, "").await?;
+    if info.size == 0 || info.size > max_bytes as u64 {
+        return Err(Error::FileTransfer(format!(
+            "invalid {kind} size {} (limit {max_bytes})",
+            info.size
+        )));
+    }
+    let mut data = Vec::new();
+    crate::transfer::download_file_data(host, &info, &mut data).await?;
+    Ok(data)
+}
+
 /// 图标文件位于频道 0，文件名使用无符号 CRC-32 十进制值。
 pub fn icon_file_name(icon_id: u32) -> String {
     format!("/icon_{icon_id}")
@@ -337,18 +359,43 @@ pub async fn download_icon(
     if icon_id == 0 {
         return Err(Error::FileTransfer("icon ID must be non-zero".into()));
     }
-    let info = client
-        .file_transfer_init_download(0, &icon_file_name(icon_id), "")
-        .await?;
-    if info.size == 0 || info.size > max_bytes as u64 {
+    download_channel_zero_file(client, host, &icon_file_name(icon_id), "icon", max_bytes).await
+}
+
+/// 头像文件位于频道 0，文件名根据客户端 UID 解码字节映射为 `/avatar_<a-p>`。
+///
+/// 支持 base64 解码后为 20 字节（TS3）或 32 字节（TS6）的 UID。
+pub fn avatar_file_name(uid: &str) -> Result<String, Error> {
+    if uid.is_empty() {
+        return Err(Error::FileTransfer("invalid base64 UID".into()));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(uid)
+        .map_err(|_| Error::FileTransfer("invalid base64 UID".into()))?;
+    if bytes.len() != 20 && bytes.len() != 32 {
         return Err(Error::FileTransfer(format!(
-            "invalid icon size {} (limit {max_bytes})",
-            info.size
+            "invalid avatar UID decoded length {} (expected 20 or 32 bytes)",
+            bytes.len()
         )));
     }
-    let mut data = Vec::new();
-    crate::transfer::download_file_data(host, &info, &mut data).await?;
-    Ok(data)
+    let mut name = String::with_capacity("/avatar_".len() + bytes.len() * 2);
+    name.push_str("/avatar_");
+    for byte in bytes {
+        name.push((b'a' + (byte >> 4)) as char);
+        name.push((b'a' + (byte & 0x0f)) as char);
+    }
+    Ok(name)
+}
+
+/// 下载头像；调用者提供目标主机、客户端 UID 和允许的最大字节数。
+pub async fn download_avatar(
+    client: &Client,
+    host: &str,
+    uid: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Error> {
+    let file_name = avatar_file_name(uid)?;
+    download_channel_zero_file(client, host, &file_name, "avatar", max_bytes).await
 }
 
 #[cfg(test)]
@@ -359,5 +406,37 @@ mod icon_tests {
     fn icon_file_names_use_unsigned_decimal_ids() {
         assert_eq!(icon_file_name(3009859579), "/icon_3009859579");
         assert_eq!(icon_file_name(u32::MAX), "/icon_4294967295");
+    }
+
+    #[test]
+    fn avatar_file_names_support_ts3_20_bytes_and_ts6_32_bytes() {
+        assert_eq!(
+            avatar_file_name("KqXRNkJgnzjGFbp0GTCPJN1ODJY=").expect("TS3 UID"),
+            "/avatar_ckkfnbdgecgajpdimgbflkhebjdaipcenneoamjg"
+        );
+        assert_eq!(
+            avatar_file_name("HYqkXu981igdjfxleVv2aYOmdkdumh2pFrkTSLRHG5k=").expect("TS6 UID"),
+            "/avatar_bnikkefoophmngcibninpmgfhjflpggjidkghgehgojkbnkjbgljbdeileehbljj"
+        );
+    }
+
+    #[test]
+    fn avatar_file_names_reject_invalid_base64_and_invalid_lengths() {
+        for invalid_b64 in ["", "not base64!", "====", "KqXRNkJgnzjGFbp0GTCPJN1ODJY"] {
+            let err = avatar_file_name(invalid_b64).expect_err("invalid base64 should fail");
+            assert!(
+                matches!(err, Error::FileTransfer(_)),
+                "unexpected error for {invalid_b64:?}: {err}"
+            );
+        }
+
+        // Valid base64 decoding to 4 bytes and 16 bytes (neither 20 nor 32).
+        for wrong_len in ["YWJjZA==", "AAAAAAAAAAAAAAAAAAAAAA=="] {
+            let err = avatar_file_name(wrong_len).expect_err("wrong byte length should fail");
+            assert!(
+                matches!(err, Error::FileTransfer(ref msg) if msg.contains("decoded length")),
+                "unexpected error for {wrong_len:?}: {err}"
+            );
+        }
     }
 }
