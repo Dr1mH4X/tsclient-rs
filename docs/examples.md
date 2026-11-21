@@ -324,38 +324,45 @@ cargo run --example channel_icons
 
 ## TS6 屏幕共享控制面（`stream` feature）
 
+库负责控制命令与 SDP/ICE 透传，媒体由调用方的 WebRTC 栈处理。仓库提供两个可运行示例，使用 `webrtc` crate 并需要 `stream-example` feature：
+
+- [`examples/stream_publish.rs`](../examples/stream_publish.rs)：VP8 IVF 发布端，处理观看申请、answer、ICE 与断流。
+- [`examples/stream_watch.rs`](../examples/stream_watch.rs)：观看端，打印轨道与 RTP 包计数。
+
+```sh
+ffmpeg -f avfoundation -framerate 30 -i "1:none" -t 30 \
+  -c:v libvpx -b:v 5M -f ivf /tmp/screen.ivf
+STREAM_IVF=/tmp/screen.ivf TEAMSPEAK_ADDR=127.0.0.1:9987 \
+  cargo run --example stream_publish --features stream-example
+TEAMSPEAK_ADDR=127.0.0.1:9987 \
+  cargo run --example stream_watch --features stream-example
+```
+
+发布端先生成 offer 再接受申请，视频 MID 0、音频 MID 1，且始终保留 `m=audio`：
+
 ```rust
-use tsclient_rs::stream::{
-    PublishOptions, PublishedStreamEvent, Streams, StreamsEvent, StreamsOptions, WatchOptions,
-};
-use tsclient_rs::*;
+use tsclient_rs::stream::{PeerEvent, PublishOptions, PublishedStreamEvent};
 
-# async fn demo(client: Client) -> Result<(), tsclient_rs::stream::StreamError> {
-let streams = Streams::new(&client, StreamsOptions { remember_denied: true });
-let mut events = streams.subscribe();
-
-if streams.supported() {
-    let published = streams.publish(PublishOptions::new("Desktop")).await?;
-    let mut pub_events = published.subscribe();
-    if let Some(PublishedStreamEvent::Request(req)) = pub_events.recv().await {
-        let peer = req.accept("v=0\r\nm=audio 9 ...\r\nm=video 9 ...", "").await?;
-        peer.close().await?;
-    }
-    published.stop(0).await?;
-}
-
-if let Some(info) = streams.list().first() {
-    let view = streams.watch(info, WatchOptions::default()).await?;
-    view.answer("v=0\r\nm=audio 9 ...").await?;
-    view.leave().await?;
-}
-
-while let Ok(ev) = events.try_recv() {
-    if let StreamsEvent::Warning(w) = ev {
-        println!("warning: {}", w.message);
+# async fn demo(streams: tsclient_rs::stream::Streams, offer_sdp: String)
+#     -> Result<(), tsclient_rs::stream::StreamError> {
+let published = streams.publish(PublishOptions::new("Desktop")).await?;
+let mut requests = published.subscribe();
+if let Some(PublishedStreamEvent::Request(request)) = requests.recv().await {
+    let peer = request.accept(&offer_sdp, "join").await?;
+    let mut events = peer.subscribe();
+    while let Some(event) = events.recv().await {
+        match event {
+            PeerEvent::Answer(sdp) => { /* set_remote_description */ }
+            PeerEvent::Candidate(candidate) => { /* add_ice_candidate */ }
+            PeerEvent::Closed(_) => break,
+            _ => {}
+        }
     }
 }
-streams.dispose();
 # Ok(())
 # }
 ```
+
+观看端的初始 offer 用 `view.offer()` 读取，answer 生成后交给 `view.answer()`，本地 ICE 在 answer 发出后再 trickle。
+
+发送前按转义后 UTF-8 字节检查 9 150 字节上限，超出返回 `StreamPayloadTooLargeError`；缺少 `m=audio` 时发出 `OfferWithoutAudio` 警告但仍发送。`client_is_streaming` 清除后等待 2 秒 `notifystreamstopped`，期间到达的新流会取消清理；本端 `clid` 与本地发布流不清。完整契约与媒体层约束见 [TS6 屏幕共享](stream.md)。

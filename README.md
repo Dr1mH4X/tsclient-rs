@@ -31,15 +31,21 @@ Compatible with TeamSpeak 3, 5 & 6. Ported from [teamspeak-js](https://github.co
 - **Middleware** — Pluggable command and event middleware chains
 - **Built-in rate limiter** — Token-bucket throttling to prevent server-side flood kicks
 - **OpenProtocol (`open-protocol` feature)** — Optional typed identity & bot slash command discovery with rate limiting and wire-budget checks
+- **TS6 screen sharing (`stream` feature)** — Publish and watch TeamSpeak 6 P2P screen, window, or camera streams through the control-plane API; SDP/ICE signaling is passed through with no bundled WebRTC or media dependency. The `stream-example` feature builds runnable `webrtc`-based publisher and viewer examples
 - **Identity management** — Generate, import/export identities
 - **Zero unsafe code** — Pure safe Rust, no `unsafe` blocks
 - **Async-native** — Built on `tokio` with proper async cancellation and graceful shutdown
+
+Optional features are off by default: `open-protocol` adds typed bot discovery, `stream` adds the TeamSpeak 6 screen-share control plane, and `stream-example` adds `webrtc` / `rtc` for the runnable stream examples. The library itself has no WebRTC code.
 
 ## Documentation
 
 - [API Reference](docs/api.md)
 - [Examples](docs/examples.md)
+- [TS6 Screen Sharing](docs/stream.md)
 - [OpenProtocol Specification](docs/open-protocol.md)
+
+Runnable screen-share examples live in `examples/stream_publish.rs` and `examples/stream_watch.rs`; build them with `--features stream-example`. The guide includes the `ffmpeg` capture command.
 
 ## Known Dead Code
 

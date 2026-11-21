@@ -146,6 +146,8 @@ so consumers can safely teardown and reconnect.
 
 ## TS6 屏幕共享控制面（可选 feature `stream` 及核心补齐）
 
+完整流程、线缆约束与生命周期说明见 [TS6 屏幕共享](stream.md)。
+
 ### 核心层常驻能力（无需额外 feature）
 
 - **`ClientInfo.is_streaming: Option<bool>`**：在目录解析、欢迎行、`clientlist`（`list_clients`）、`notifycliententerview` 与 `notifyclientupdated` 中解析 `client_is_streaming`，区分字段缺失（`None`）与显式 `0`（`Some(false)`）。
@@ -154,8 +156,10 @@ so consumers can safely teardown and reconnect.
 
 ### `tsclient_rs::stream`（`features = ["stream"]`）
 
-对齐 `@honeybbq/teamspeak/stream` 控制面与信令透传，不引入任何 WebRTC 或媒体依赖：
+对齐 `@honeybbq/teamspeak/stream` 控制面与信令透传，不引入任何 WebRTC 或媒体依赖。可运行的发布/观看示例通过 `stream-example` feature 使用 webrtc-rs，见 [TS6 屏幕共享](stream.md)：
 
 - **入口与挂载**：`Streams::new(&client, StreamsOptions { remember_denied })` 独立挂载至 `Client`，提供 `supported()`、`list()`、`get(id)`、`refresh_client(client_id)`、`subscribe()`（`StreamsEvent::{Started, Updated, Stopped, ViewerJoined, ViewerLeft, Error, Warning}`）、`publish(PublishOptions)`、`watch(WatchTarget, WatchOptions)` 与 `dispose()`。
-- **句柄类型**：`PublishedStream`（`id`、`info`、`ended`、`viewers()`、`stop(reason)` 即使在非 5635 错误下也清理本地流状态、`subscribe()` 接收 `PublishedStreamEvent::{Request, Ended}`）、`JoinRequest`（`accept(offer, message) -> ViewerPeer`、`deny(reason)`）、`ViewerPeer`（`send_offer`、`send_candidate`、`send_signal`、`close` 纯本地关闭、`kick(reason)` 发送 `removeclientfromstream` 并忽略非致命错误后关闭）与 `StreamView`（`offer`、`answer(sdp)`、`send_candidate`、`send_signal`、`leave`）。
-- **协议校验与发现**：全部通过带 `return_code` 与限流重试的 `exec_command` 通道发送，发送前按转义后 UTF-8 字节检查 `MAX_COMMAND_LINE_BYTES = 9_150`；使用 `has_audio_section(sdp)` 在缺失 `m=audio` 时发出 `StreamWarningCode::OfferWithoutAudio` 警告；覆盖构造已连接扫描、`DirectorySnapshot`、`ClientEnter`/`ClientUpdated` 及 `NotificationOverflow` 自动发现，并在 `client_is_streaming` 清除后经 2s（`GONE_GRACE_MS = 2000`）宽限期未收到 `notifystreamstopped` 时按 `StreamEndCause::Gone` 清理。
+- **句柄类型**：`PublishedStream`（`id`、`info`、`ended`、`viewers()`、`stop(reason)` 即使在非 5635 错误下也清理本地流状态、`subscribe()` 接收 `PublishedStreamEvent::{Request, Ended}`）、`JoinRequest`（`viewer()`、`message()`、`state()`、`accept(offer, message) -> ViewerPeer`、`deny(reason)`、`subscribe()`）、`ViewerPeer`（`send_offer`、`send_candidate`、`send_signal`、`close` 纯本地关闭、`kick(reason)` 发送 `removeclientfromstream` 并忽略非致命错误后关闭、`subscribe()` / `closed()` / `stream_id()` / `client_id()`）与 `StreamView`（`offer()`、`answer(sdp)`、`send_candidate`、`send_signal`、`leave`、`subscribe()` / `closed()`）。
+- **数据结构**：`StreamInfo`（`id`、`client_id`、`name`、`source`、`audio`、`bitrate`、`accessibility`、`transport`、`viewer_limit`、`viewers`）、`ViewerIdentity`、`IceCandidate`、`RawSignal`，以及 `PublishOptions` / `WatchOptions` / `StreamsOptions` / `WatchTarget`。对端信令经 `PeerEvent::{Offer, Answer, Candidate, Signal, Closed}` 派发；`StreamEndCause`、`PeerCloseCause` 与 `JoinRequestCloseCause` 分别标注流、信令对端与观看申请的关闭原因。
+- **协议校验与发现**：全部通过带 `return_code` 与限流重试的 `exec_command` 通道发送，发送前按转义后 UTF-8 字节检查 `MAX_COMMAND_LINE_BYTES = 9_150`；使用 `has_audio_section(sdp)` 在缺失 `m=audio` 时发出 `StreamWarningCode::OfferWithoutAudio` 警告；覆盖构造已连接扫描、`DirectorySnapshot`、`ClientEnter`/`ClientUpdated` 及 `NotificationOverflow` 自动发现。`client_is_streaming` 清除后进入 2s（`GONE_GRACE_MS = 2000`）宽限：收到 `notifystreamstopped` 按 `StreamEndCause::Server` 立即结束，超时未收到才按 `Gone` 清理；本端 `clid` 与本地正在发布的流不受 `Gone` 清理。`parse_signal` 宽松接受 `answer` / `sdp`、字符串或对象形式的 offer，以及数字或数字字符串形式的 `mid` / `mLine`，无法识别的载荷以 `RawSignal` 透传；发送 candidate 时省略为 `None` 的 `sdp_mid` / `sdp_m_line_index`。
+- **错误**：`StreamError::{Unsupported, JoinDenied, PayloadTooLarge, Ended, TransportUnsupported, NotConnected, Disposed, Aborted, InvalidOption, Client}`；`server_error_code()` 与 `is_server_error_code(ErrorCode)` 用于匹配服务端数字错误码。
