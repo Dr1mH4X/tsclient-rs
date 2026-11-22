@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
-use crate::command::build_command;
+use crate::command::{build_command, escape};
 use crate::types::*;
 
 #[derive(Debug, Clone)]
@@ -115,10 +115,19 @@ pub async fn upload_file_data<R: AsyncRead + Unpin>(
             .map_err(|_| crate::Error::FileTransfer("upload write timeout".into()))?
             .map_err(|e| crate::Error::FileTransfer(format!("write failed: {e}")))?;
     }
-    stream
-        .shutdown()
-        .await
-        .map_err(|e| crate::Error::FileTransfer(format!("shutdown failed: {e}")))
+    // 上传由服务器决定何时结束：它收到声明字节后会关闭连接。
+    // 客户端先 half-close 会让部分服务器把文件按 0 字节落盘。
+    let mut sink = [0u8; 1];
+    loop {
+        let length = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut sink))
+            .await
+            .map_err(|_| crate::Error::FileTransfer("upload close timeout".into()))?
+            .map_err(|e| crate::Error::FileTransfer(format!("upload close failed: {e}")))?;
+        if length == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// 通过明文 TCP 发送 ftkey，接收准确的声明字节数并等待服务器关闭连接。
@@ -162,6 +171,22 @@ pub async fn download_file_data<W: AsyncWrite + Unpin>(
         .map_err(|e| crate::Error::FileTransfer(format!("flush failed: {e}")))
 }
 
+/// Build `ftdeletefile` for one or more paths.
+///
+/// TeamSpeak 的多路径删除按行编码：`cid` 与 `cpw` 只在第一行出现，
+/// 每个后续行各自带一个 `name=`，行之间用字面量 `|` 分隔。
+pub fn build_ft_delete_file(channel_id: u64, paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let names = paths
+        .iter()
+        .map(|path| format!("name={}", escape(path).0))
+        .collect::<Vec<_>>()
+        .join("|");
+    Some(format!("ftdeletefile cid={channel_id} cpw= {names}"))
+}
+
 pub fn build_ft_init_upload(
     channel_id: u64,
     path: &str,
@@ -186,6 +211,7 @@ pub fn build_ft_init_upload(
         if overwrite { "1" } else { "0" }.to_string(),
     );
     params.insert("resume".to_string(), "0".to_string());
+    params.insert("proto".to_string(), "0".to_string());
     build_command("ftinitupload", params)
 }
 
@@ -201,6 +227,7 @@ pub fn build_ft_init_download(channel_id: u64, path: &str, password: &str, cftid
     params.insert("cpw".to_string(), password.to_string());
     params.insert("clientftfid".to_string(), cftid.to_string());
     params.insert("seekpos".to_string(), "0".to_string());
+    params.insert("proto".to_string(), "0".to_string());
     build_command("ftinitdownload", params)
 }
 
@@ -272,9 +299,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut data = Vec::new();
-            socket.read_to_end(&mut data).await.unwrap();
-            data
+            let mut data = [0u8; 22];
+            socket.read_exact(&mut data).await.unwrap();
+            data.to_vec()
         });
         let info = FileUploadInfo {
             file_transfer_key: "test-key".into(),
@@ -287,6 +314,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.await.unwrap(), b"test-keyunaligned-file");
+    }
+
+    #[test]
+    fn delete_file_encodes_one_name_row_per_path() {
+        let single = build_ft_delete_file(0, &["/a".to_string()]).expect("single path");
+        assert_eq!(single, "ftdeletefile cid=0 cpw= name=\\/a");
+
+        let multiple = build_ft_delete_file(
+            3,
+            &["/a".to_string(), "/b c".to_string(), "/d|e".to_string()],
+        )
+        .expect("multiple paths");
+        assert_eq!(
+            multiple,
+            "ftdeletefile cid=3 cpw= name=\\/a|name=\\/b\\sc|name=\\/d\\pe"
+        );
+        assert!(build_ft_delete_file(0, &[]).is_none());
+    }
+
+    #[test]
+    fn negotiation_commands_request_proto_zero() {
+        let upload = build_ft_init_upload(0, "/avatar_test", "", 3, 1, true);
+        assert!(upload.starts_with("ftinitupload "));
+        assert!(upload.contains("proto=0"));
+        assert!(upload.contains("overwrite=1"));
+        assert!(upload.contains("resume=0"));
+
+        let download = build_ft_init_download(0, "/avatar_test", "", 1);
+        assert!(download.starts_with("ftinitdownload "));
+        assert!(download.contains("proto=0"));
     }
 
     #[tokio::test]

@@ -91,15 +91,16 @@ pub use server_info::{STREAM_P2P_EXTENSION, parse_capability_extensions};
 pub use api::{
     avatar_file_name, avatar_file_name as avatarFileName, ban_client as banClient,
     client_kick as clientKick, client_move as clientMove, client_update as clientUpdate,
-    download_avatar, download_avatar as downloadAvatar, download_icon,
-    download_icon as downloadIcon, file_transfer_delete_file as fileTransferDeleteFile,
-    get_channel_description, get_channel_description as getChannelDescription, get_channel_info,
+    delete_avatar, delete_avatar as deleteAvatar, download_avatar,
+    download_avatar as downloadAvatar, download_icon, download_icon as downloadIcon,
+    file_transfer_delete_file as fileTransferDeleteFile, get_channel_description,
+    get_channel_description as getChannelDescription, get_channel_info,
     get_channel_info as getChannelInfo, get_client_info as getClientInfo, get_server_info,
     get_server_info as getServerInfo, get_server_variables,
     get_server_variables as getServerVariables, icon_file_name, icon_file_name as iconFileName,
     list_channels as listChannels, list_clients as listClients, poke, send_plugin_command,
     send_plugin_command as sendPluginCommand, send_raw_command, send_raw_command as sendRawCommand,
-    send_text_message as sendTextMessage,
+    send_text_message as sendTextMessage, upload_avatar, upload_avatar as uploadAvatar,
 };
 
 pub use command::escape;

@@ -18,6 +18,7 @@ pub enum ErrorCode {
     FileInvalidSize = 0x0809,
     FileTransferServerQuotaExceeded = 0x0814,
     FileTransferClientQuotaExceeded = 0x0815,
+    PermissionInvalidSize = 0x0a05,
     PermissionsClientInsufficient = 0x0a08,
     Permissions = 0x0a0c,
     StreamNotFound = 0x1603,
@@ -47,6 +48,7 @@ impl ErrorCode {
             0x0809 => Some(Self::FileInvalidSize),
             0x0814 => Some(Self::FileTransferServerQuotaExceeded),
             0x0815 => Some(Self::FileTransferClientQuotaExceeded),
+            0x0a05 => Some(Self::PermissionInvalidSize),
             0x0a08 => Some(Self::PermissionsClientInsufficient),
             0x0a0c => Some(Self::Permissions),
             0x1603 => Some(Self::StreamNotFound),
@@ -457,6 +459,7 @@ mod tests {
             (ErrorCode::FileInvalidSize, 0x0809, "2057"),
             (ErrorCode::FileTransferServerQuotaExceeded, 0x0814, "2068"),
             (ErrorCode::FileTransferClientQuotaExceeded, 0x0815, "2069"),
+            (ErrorCode::PermissionInvalidSize, 0x0a05, "2565"),
             (ErrorCode::PermissionsClientInsufficient, 0x0a08, "2568"),
             (ErrorCode::Permissions, 0x0a0c, "2572"),
         ];

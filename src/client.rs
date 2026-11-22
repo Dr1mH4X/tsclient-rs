@@ -2012,6 +2012,16 @@ impl Client {
         crate::api::download_avatar(self, host, uid, max_bytes).await
     }
 
+    /// 上传并设置本端头像，返回上传字节的小写十六进制 MD5。
+    pub async fn upload_avatar(&self, host: &str, uid: &str, data: &[u8]) -> Result<String, Error> {
+        crate::api::upload_avatar(self, host, uid, data).await
+    }
+
+    /// 删除本端头像；服务器上本来没有头像时返回 `Ok(false)`。
+    pub async fn delete_avatar(&self) -> Result<bool, Error> {
+        crate::api::delete_avatar(self).await
+    }
+
     // ---- Internal (package-visible) -------------------------------------------
 
     /// Called by handshake when the server acknowledges our connection.

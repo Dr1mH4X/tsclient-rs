@@ -89,11 +89,13 @@ so consumers can safely teardown and reconnect.
 
 | Function                                  | Description                       |
 | ----------------------------------------- | --------------------------------- |
-| `client.file_transfer_init_upload(...)`   | Initialize a file upload          |
-| `client.file_transfer_init_download(...)` | Initialize a file download        |
-| `fileTransferDeleteFile(client, ...)`     | Delete files on the server        |
+| `client.file_transfer_init_upload(...)`   | Initialize a file upload; sends `proto=0` |
+| `client.file_transfer_init_download(...)` | Initialize a file download; sends `proto=0` |
+| `fileTransferDeleteFile(client, ...)`     | Delete one or more files; each path is a separate `name=` row (`name=/a|name=/b`) |
 | `uploadFileData(host, info, reader)`      | Transfer file data to the server  |
 | `downloadFileData(host, info, writer)`    | Receive file data from the server |
+
+内部封装 `get_file_info(...)` 通过 `ftgetfileinfo` 解析 `notifyfileinfo` 的存储大小，`verify_stored_file(...)` 在其上校验声明大小；`stop_file_transfer(...)` 发送 `ftstop serverftfid=<id>`，用于数据阶段失败后的尽力清理。
 
 ## 服务器信息与图标
 
@@ -117,6 +119,8 @@ so consumers can safely teardown and reconnect.
 | `avatar_file_name(uid)` / `avatarFileName(uid)` | 将 base64 解码后为 20 字节（TS3）或 32 字节（TS6）的客户端 UID 映射为 `/avatar_<a-p nibbles>`，非法输入返回 `Error::FileTransfer` |
 | `client.download_avatar(host, uid, max_bytes)` | 下载客户端头像，拒绝空文件和超过限制的声明长度，服务端错误透传为 `Error::ServerError` |
 | `download_avatar(&client, host, uid, max_bytes)` / `downloadAvatar(...)` | 上一接口的独立函数形式 |
+| `client.upload_avatar(host, uid, data)` / `upload_avatar(...)` | 以 `/avatar_<md5>` 上传，校验服务器保存的 `/avatar_<uid>` 大小后设置 `client_flag_avatar`，返回小写十六进制 MD5；数据阶段失败时在 5 秒内尽力 `ftstop` |
+| `client.delete_avatar()` / `delete_avatar(...)` | 通过 `ftdeletefile cid=0 name=/avatar_` 删除本端头像，本来没有头像（2051 / 2054）时返回 `Ok(false)` |
 
 需要控制协议请求与 TCP 传输时，可先调用 `client.file_transfer_init_download(0, &icon_file_name(id), "")`，校验返回的 `size` 后调用 `downloadFileData(host, &info, writer)`。`host` 由调用者提供，不取第三方主机；应用自身负责访问策略和缓存。
 

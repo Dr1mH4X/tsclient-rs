@@ -1,12 +1,14 @@
 //! High-level API — mirrors `teamspeak-js/src/api.ts`
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use base64::Engine as _;
+use md5::{Digest, Md5};
 
 use crate::Client;
 use crate::Error;
-use crate::command::{build_command, build_command_ordered, unescape};
+use crate::command::{build_command_ordered, unescape};
 use crate::directory::{parse_avatar_hash, parse_bool, parse_channel, parse_channel_info};
 use crate::helpers;
 use crate::types::*;
@@ -313,15 +315,9 @@ pub async fn file_transfer_delete_file(
     channel_id: u64,
     paths: &[String],
 ) -> Result<(), Error> {
-    if paths.is_empty() {
+    let Some(cmd) = crate::transfer::build_ft_delete_file(channel_id, paths) else {
         return Ok(());
-    }
-    let path_str = paths.join("|");
-    let mut params = HashMap::new();
-    params.insert("cid".to_string(), channel_id.to_string());
-    params.insert("cpw".to_string(), String::new());
-    params.insert("name".to_string(), path_str);
-    let cmd = build_command("ftdeletefile", params);
+    };
     client.exec_command(&cmd, CMD_TIMEOUT_MS).await
 }
 
@@ -398,6 +394,129 @@ pub async fn download_avatar(
     download_channel_zero_file(client, host, &file_name, "avatar", max_bytes).await
 }
 
+fn md5_hex(data: &[u8]) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+fn stored_file_size(rows: &[HashMap<String, String>], path: &str) -> Option<u64> {
+    rows.iter()
+        .find(|row| row.get("name").is_some_and(|name| name == path))
+        .or_else(|| rows.first())
+        .and_then(|row| row.get("size"))
+        .and_then(|size| size.parse::<u64>().ok())
+}
+
+/// Internal `ftgetfileinfo` wrapper: read the stored size of one path.
+pub(crate) async fn get_file_info(
+    client: &Client,
+    channel_id: u64,
+    path: &str,
+) -> Result<Option<u64>, Error> {
+    let cid = channel_id.to_string();
+    let cmd = build_command_ordered(
+        "ftgetfileinfo",
+        &[("cid", cid.as_str()), ("cpw", ""), ("name", path)],
+    );
+    let rows = client
+        .exec_command_with_response(&cmd, QUERY_TIMEOUT_MS)
+        .await?;
+    Ok(stored_file_size(&rows, path))
+}
+
+/// Internal verification built on [`get_file_info`].
+pub(crate) async fn verify_stored_file(
+    client: &Client,
+    channel_id: u64,
+    path: &str,
+    expected_size: u64,
+) -> Result<(), Error> {
+    let stored = match get_file_info(client, channel_id, path).await {
+        Ok(size) => size,
+        Err(err) if err.is_server_error_code(crate::ErrorCode::PermissionsClientInsufficient) => {
+            return Ok(());
+        }
+        Err(err)
+            if err.is_server_error_code(crate::ErrorCode::FileNotFound)
+                || err.is_server_error_code(crate::ErrorCode::FileIOError)
+                || err.is_server_error_code(crate::ErrorCode::FileInvalidPath)
+                || err.is_server_error_code(crate::ErrorCode::FileNoFilesAvailable) =>
+        {
+            return Err(Error::FileTransfer(format!(
+                "the server closed the upload but has no file {path}"
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+    match stored {
+        Some(size) if size == expected_size => Ok(()),
+        Some(size) => Err(Error::FileTransfer(format!(
+            "the server closed the upload but holds {size} of the {expected_size} bytes of {path}"
+        ))),
+        None => Err(Error::FileTransfer(format!(
+            "the server did not report the stored size of {path}"
+        ))),
+    }
+}
+
+/// Internal `ftstop` wrapper: best-effort cleanup of a negotiated transfer.
+pub(crate) async fn stop_file_transfer(
+    client: &Client,
+    server_file_transfer_id: i32,
+) -> Result<(), Error> {
+    let id = server_file_transfer_id.to_string();
+    let cmd = build_command_ordered("ftstop", &[("serverftfid", id.as_str())]);
+    client.exec_command(&cmd, CMD_TIMEOUT_MS).await
+}
+
+fn is_missing_avatar_error(err: &Error) -> bool {
+    err.is_server_error_code(crate::ErrorCode::FileInvalidPath)
+        || err.is_server_error_code(crate::ErrorCode::FileNotFound)
+}
+
+/// 上传并设置本端头像，返回上传字节的小写十六进制 MD5。
+///
+/// 上传名固定为 `/avatar_<md5>`，服务器会把它重命名为 `/avatar_<uid>`；
+/// `uid` 用于在设置 `client_flag_avatar` 前确认服务器确实保存了对应大小的文件。
+pub async fn upload_avatar(
+    client: &Client,
+    host: &str,
+    uid: &str,
+    data: &[u8],
+) -> Result<String, Error> {
+    if data.is_empty() {
+        return Err(Error::FileTransfer("avatar data must not be empty".into()));
+    }
+    let md5 = md5_hex(data);
+    let upload_name = format!("/avatar_{md5}");
+    let info = client
+        .file_transfer_init_upload(0, &upload_name, "", data.len() as u64, true)
+        .await?;
+    if let Err(error) = crate::transfer::upload_file_data(host, &info, data).await {
+        // 服务器会在约 10 秒后回收没人拨号的传输；在超时内尽力清理。
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            stop_file_transfer(client, info.server_file_transfer_id),
+        )
+        .await;
+        return Err(error);
+    }
+    let stored_name = avatar_file_name(uid)?;
+    verify_stored_file(client, 0, &stored_name, data.len() as u64).await?;
+    client_update(client, &[("client_flag_avatar", &md5)]).await?;
+    Ok(md5)
+}
+
+/// 删除本端头像；服务器上本来没有头像时返回 `Ok(false)`。
+pub async fn delete_avatar(client: &Client) -> Result<bool, Error> {
+    match file_transfer_delete_file(client, 0, &["/avatar_".to_string()]).await {
+        Ok(()) => Ok(true),
+        Err(err) if is_missing_avatar_error(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod icon_tests {
     use super::*;
@@ -418,6 +537,47 @@ mod icon_tests {
             avatar_file_name("HYqkXu981igdjfxleVv2aYOmdkdumh2pFrkTSLRHG5k=").expect("TS6 UID"),
             "/avatar_bnikkefoophmngcibninpmgfhjflpggjidkghgehgojkbnkjbgljbdeileehbljj"
         );
+    }
+
+    #[test]
+    fn avatar_md5_is_lowercase_hex() {
+        assert_eq!(md5_hex(b"hello"), "5d41402abc4b2a76b9719d911017c592");
+    }
+
+    #[test]
+    fn missing_avatar_delete_errors_are_idempotent() {
+        let error = |id: &str| Error::ServerError {
+            id: id.to_string(),
+            server_message: "refused".to_string(),
+            extra_message: None,
+        };
+        assert!(is_missing_avatar_error(&error("2054")));
+        assert!(is_missing_avatar_error(&error("2051")));
+        assert!(!is_missing_avatar_error(&error("2568")));
+    }
+
+    #[test]
+    fn stored_file_size_prefers_the_named_row_and_rejects_missing_sizes() {
+        let rows = vec![
+            HashMap::from([
+                ("name".to_string(), "/other".to_string()),
+                ("size".to_string(), "9".to_string()),
+            ]),
+            HashMap::from([
+                ("name".to_string(), "/avatar_test".to_string()),
+                ("size".to_string(), "42".to_string()),
+            ]),
+        ];
+        assert_eq!(stored_file_size(&rows, "/avatar_test"), Some(42));
+
+        let fallback = vec![HashMap::from([("size".to_string(), "7".to_string())])];
+        assert_eq!(stored_file_size(&fallback, "/avatar_test"), Some(7));
+
+        let missing = vec![HashMap::from([(
+            "name".to_string(),
+            "/avatar_test".to_string(),
+        )])];
+        assert_eq!(stored_file_size(&missing, "/avatar_test"), None);
     }
 
     #[test]
